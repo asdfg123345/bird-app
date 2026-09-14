@@ -1,0 +1,71 @@
+iNaturalist 鸟类数据采集与图像下载系统（EXE 免安装版）
+============================================
+作者签名：天咏（明月照今日，风摇过两川。）
+
+【环境要求】
+  Windows 10/11，无需安装 Python 及任何依赖（已全部打包进本程序）。
+
+【目录说明】
+  iNaturalist鸟类爬虫.exe   主程序（双击直接打开桌面控制台）
+  启动爬虫界面.bat           双击打开桌面控制台（与双击 exe 等价）
+  拖入文件自动爬取.bat       拖入文件/文件夹自动处理接口
+  data\                     运行后自动生成的数据目录
+                            （数据库、照片、投放收件箱）
+
+【运行方式】
+  1. 双击「启动爬虫界面.bat」或直接双击 iNaturalist鸟类爬虫.exe，
+     均直接打开桌面控制台（推荐）。
+     控制台内含「拖入文件爬取」标签页：可直接选择 txt/csv 处理，
+     或启动常驻监视 data/drop_inbox，放入文件即自动爬取。
+  2. 命令行用法（在 exe 所在文件夹的地址栏输入 cmd 回车后执行）：
+     iNaturalist鸟类爬虫.exe --help          （查看全部命令）
+     iNaturalist鸟类爬虫.exe batch           （批量下载 15 个鸟类科）
+     iNaturalist鸟类爬虫.exe gui             （桌面控制台）
+     iNaturalist鸟类爬虫.exe panel           （浏览器数据面板）
+     iNaturalist鸟类爬虫.exe stats           （数据库统计）
+     iNaturalist鸟类爬虫.exe init-db         （初始化数据库）
+     iNaturalist鸟类爬虫.exe drop --watch    （常驻监视投放目录）
+     iNaturalist鸟类爬虫.exe dataset --out 导出目录 （导出训练数据集）
+
+【拖入文件自动爬取】
+  1. 文本清单：将包含「类群ID 或 物种名」的 txt/csv 文件拖到
+     「拖入文件自动爬取.bat」图标上，即自动解析并爬取。
+     文件内容示例：
+         20967
+         Upupa epops
+  2. 本地图片入库：将图片文件夹（或若干图片文件）拖到同一
+     bat 图标上，按文件夹名/子文件夹名解析物种（如文件夹名
+     为「戴胜」或「20967」），图片按种类依次指纹编码入库：
+     内容 SHA-256 去重，重复图片自动跳过，源文件保留原位。
+  3. 桌面控制台「拖入文件爬取」标签页同样支持以上两种方式。
+
+【层级文件夹导入】（v1.1 新增）
+  将「纲-目-科-种」整棵层级文件夹树拖到 bat 图标上，自动下钻
+  到直接含图片的最深层文件夹并按文件夹名解析物种；种文件夹内
+  的说明文本（.txt）自动并入该种观察备注，层级路径一并记录。
+
+【数据存储】
+  照片按种类存于 data/taxon_<ID>_<名称>/photos/
+  数据库存于 data/db/（raw_data.db 原始留存 +
+  bird_observations.db 规范主库，SHA-256 指纹自动去重）
+
+【训练数据集导出】（v1.2 新增）
+  命令：iNaturalist鸟类爬虫.exe dataset --out 导出目录
+  功能：把数据库中已入库的照片一键导出为 PyTorch 可直接加载的
+  标准数据集：
+    1. train/val/test 三个目录（默认 8:1:1，按「观察」为单位
+       划分，同一观察的照片不会跨集合，防止数据泄漏）；
+    2. manifest.csv 与 manifest.jsonl 清单（含纲-目-科层级、
+       许可证、署名、图片尺寸、SHA-256 指纹等字段）；
+    3. 默认硬链接导出（同盘零拷贝，不产生磁盘占用翻倍）；
+    4. 可选参数：--label-scheme cn（按中文名建类别目录）、
+       --min-per-class、--max-per-class、--min-width、
+       --min-height、--license、--seed、--link copy 等，
+       加 --help 查看全部说明。
+  导出目录内自动生成 report.md（数据质量报告）与
+  train_example.py（PyTorch 加载示例代码）。
+
+【注意事项】
+  1. 首次运行请先运行 init-db 初始化数据库。
+  2. 数据目录 data 与本程序在同一文件夹，迁移数据时整体复制本文件夹即可。
+  3. 整个「iNaturalist鸟类爬虫」文件夹为完整发布单元，请勿单独移动 exe。

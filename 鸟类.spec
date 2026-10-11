@@ -1,9 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# ============================================================
+# 项目：鸟类 v1.3 PyInstaller 打包配置
+# 作者签名：天咏（明月照今日，风摇过两川。）
+# 说明：onedir + console 模式（中文日志与子命令交互依赖控制台）；
+#       model_trainer.py / model_library.py 不进 Analysis（torch 不打入
+#       主程序），由构建脚本以数据文件形式部署到 exe 旁。
+# ============================================================
 
 a = Analysis(
     ['打包源码/main.py'],
-    pathex=[],
+    pathex=['打包源码'],
     binaries=[],
     datas=[],
     hiddenimports=[],
@@ -21,7 +27,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='iNaturalist鸟类爬虫',
+    name='鸟类',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,5 +46,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='iNaturalist鸟类爬虫',
+    name='鸟类',
 )

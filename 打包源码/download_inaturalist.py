@@ -5,8 +5,29 @@
 # ============================================================
 
 # 天咏 2026-09-05
+"""Download iNaturalist observations, photos, and research metadata.
+
+Uses the official API (https://api.inaturalist.org/v1) rather than HTML scraping.
+Default target: taxon_id=781 (Arborophila torqueola / Hill Partridge).
+
+Example:
+    python download_inaturalist.py
+    python download_inaturalist.py --taxon-id 781 --photo-size original --workers 6
+"""
 
 from __future__ import annotations
+
+
+# ============================================================
+# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
+# ============================================================
+def _frozen_base(src_file):
+    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).resolve().parent
+    return Path(src_file).resolve().parent
+
 
 import argparse
 import csv
@@ -23,40 +44,31 @@ from urllib.parse import urlparse
 
 import requests
 
-from inaturalist_db_manager import _v8b9d65af
-
-
-def _v5e1f9a2b() -> Path:
-    # 打包为 exe 后返回 exe 所在目录，源码运行时返回本文件所在目录
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
+from inaturalist_db_manager import INaturalistDatabaseManager
 
 # Prefer IPv4 to avoid long IPv6 hangs on some networks.
-_v6ea59545 = socket.getaddrinfo
+_orig_getaddrinfo = socket.getaddrinfo
 
 
-def _vee5112dc(host, port, family=0, type=0, proto=0, flags=0):
-    records = _v6ea59545(host, port, family, type, proto, flags)
+def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    records = _orig_getaddrinfo(host, port, family, type, proto, flags)
     ipv4 = [item for item in records if item[0] == socket.AF_INET]
     return ipv4 or records
 
 
-socket.getaddrinfo = _vee5112dc
+socket.getaddrinfo = _getaddrinfo_ipv4
 
-_v9f29f78f = "https://api.inaturalist.org/v1"
-_v71e0bf7d = 781
-_va2cb0333 = (
+API_BASE = "https://api.inaturalist.org/v1"
+DEFAULT_TAXON_ID = 781
+USER_AGENT = (
     "HillPartridgeDownloader/1.0 "
     "(research; respectful rate limit; contact via local script)"
 )
-_vc56994c8 = 1.1
-_v49f80960 = 4
-_v5991102b = (10, 40)
+REQUEST_INTERVAL_SEC = 1.1
+MAX_RETRIES = 4
+PHOTO_TIMEOUT = (10, 40)
 
-_v1930c2ef = [
+PHOTO_CSV_FIELDS = [
     "observation_id",
     "photo_id",
     "position",
@@ -71,7 +83,7 @@ _v1930c2ef = [
     "download_ok",
 ]
 
-_v204697d3 = [
+OBSERVATION_CSV_FIELDS = [
     "observation_id",
     "uuid",
     "uri",
@@ -107,19 +119,19 @@ _v204697d3 = [
 ]
 
 
-def _vea44eec5(message: str) -> None:
+def log(message: str) -> None:
     print(message, flush=True)
 
 
-def _v772a86c3() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download iNaturalist observation photos and research metadata."
     )
-    parser.add_argument("--taxon-id", type=int, default=_v71e0bf7d)
+    parser.add_argument("--taxon-id", type=int, default=DEFAULT_TAXON_ID)
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=_v5e1f9a2b() / "data",
+        default=_frozen_base(__file__) / "data",
     )
     parser.add_argument(
         "--photo-size",
@@ -190,14 +202,14 @@ def _v772a86c3() -> argparse.Namespace:
     return parser.parse_args()
 
 
-class _vaac45350:
+class ApiClient:
     def __init__(self, interval: float) -> None:
         self.interval = interval
         self._last = 0.0
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "User-Agent": _va2cb0333,
+                "User-Agent": USER_AGENT,
                 "Accept": "application/json",
             }
         )
@@ -209,14 +221,14 @@ class _vaac45350:
 
     def get_json(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
-        for attempt in range(1, _v49f80960 + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             self._wait()
             try:
                 response = self.session.get(url, params=params, timeout=30)
                 self._last = time.monotonic()
                 if response.status_code == 429:
                     retry_after = float(response.headers.get("Retry-After", 5 * attempt))
-                    _vea44eec5(f"  rate-limited, waiting {retry_after:.1f}s...")
+                    log(f"  rate-limited, waiting {retry_after:.1f}s...")
                     time.sleep(retry_after)
                     continue
                 response.raise_for_status()
@@ -224,16 +236,16 @@ class _vaac45350:
             except requests.RequestException as exc:
                 last_error = exc
                 wait = min(2 ** attempt, 20)
-                _vea44eec5(f"  request failed ({exc}); retry {attempt}/{_v49f80960} in {wait}s")
+                log(f"  request failed ({exc}); retry {attempt}/{MAX_RETRIES} in {wait}s")
                 time.sleep(wait)
         raise RuntimeError(f"Failed GET {url}: {last_error}")
 
 
-def _v41467eb2(url: str, size: str) -> str:
+def photo_url_for_size(url: str, size: str) -> str:
     return re.sub(r"/(square|thumb|small|medium|large|original)\.", f"/{size}.", url)
 
 
-def _vd519606e(url: str) -> str:
+def guess_extension(url: str) -> str:
     path = urlparse(url).path.lower()
     for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
         if path.endswith(ext):
@@ -241,7 +253,7 @@ def _vd519606e(url: str) -> str:
     return ".jpg"
 
 
-def _vc590d146(preferred: str) -> list[str]:
+def size_fallbacks(preferred: str) -> list[str]:
     order = ["original", "large", "medium"]
     if preferred not in order:
         return [preferred]
@@ -249,13 +261,13 @@ def _vc590d146(preferred: str) -> list[str]:
     return order[start:]
 
 
-def _v2c962755(url: str, dest: Path) -> bool:
+def download_photo_file(url: str, dest: Path) -> bool:
     last_error: Exception | None = None
-    headers = {"User-Agent": _va2cb0333}
-    for attempt in range(1, _v49f80960 + 1):
+    headers = {"User-Agent": USER_AGENT}
+    for attempt in range(1, MAX_RETRIES + 1):
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
-            with requests.get(url, timeout=_v5991102b, stream=True, headers=headers) as response:
+            with requests.get(url, timeout=PHOTO_TIMEOUT, stream=True, headers=headers) as response:
                 if response.status_code == 429:
                     time.sleep(float(response.headers.get("Retry-After", 3 * attempt)))
                     continue
@@ -278,11 +290,11 @@ def _v2c962755(url: str, dest: Path) -> bool:
                 tmp.unlink(missing_ok=True)
             time.sleep(min(1.5 * attempt, 8))
     if last_error:
-        _vea44eec5(f"  photo failed: {url} ({last_error})")
+        log(f"  photo failed: {url} ({last_error})")
     return False
 
 
-def _vdaab8f62(
+def flatten_observation(
     obs: dict[str, Any],
     place_lookup: dict[int, str],
     local_photo_files: list[str],
@@ -340,13 +352,20 @@ def _vdaab8f62(
     }
 
 
-def _vb61371ba(
-    client: _vaac45350,
+def fetch_observations_stream(
+    client: ApiClient,
     taxon_id: int,
     per_page: int,
     max_results: int | None = None,
     quality_grade: str | None = None,
 ):
+    """流式分页生成观察记录列表。
+
+    一次只生成一页（默认 200 条），避免一次性加载全部元数据到内存。
+    参数：
+        max_results: 最多获取的观察记录数量；None 表示不限制
+        quality_grade: 质量等级过滤（如 research）
+    """
     id_above = 0
     total = None
     page = 1
@@ -368,11 +387,11 @@ def _vb61371ba(
         # 按质量等级过滤（research = 研究级，社区已确认物种）
         if quality_grade:
             params["quality_grade"] = quality_grade
-        _vea44eec5(f"Fetching observations page {page} (id_above={id_above})...")
-        payload = client.get_json(f"{_v9f29f78f}/observations", params)
+        log(f"Fetching observations page {page} (id_above={id_above})...")
+        payload = client.get_json(f"{API_BASE}/observations", params)
         if total is None:
             total = payload.get("total_results", 0)
-            _vea44eec5(f"API reports {total} observations for taxon_id={taxon_id}")
+            log(f"API reports {total} observations for taxon_id={taxon_id}")
         results = payload.get("results") or []
         if not results:
             break
@@ -380,7 +399,7 @@ def _vb61371ba(
         yielded += len(results)
         # 达到数量上限时提前停止（大类群保护机制）
         if max_results is not None and yielded >= max_results:
-            _vea44eec5(f"Reached max_results={max_results}, stopping pagination.")
+            log(f"Reached max_results={max_results}, stopping pagination.")
             break
         id_above = results[-1]["id"]
         page += 1
@@ -388,15 +407,15 @@ def _vb61371ba(
             break
 
 
-def _v5126e42a(client: _vaac45350, place_ids: list[int]) -> dict[int, str]:
+def fetch_places(client: ApiClient, place_ids: list[int]) -> dict[int, str]:
     lookup: dict[int, str] = {}
     unique_ids = sorted(set(place_ids))
     chunk_size = 50
     for i in range(0, len(unique_ids), chunk_size):
         chunk = unique_ids[i : i + chunk_size]
-        _vea44eec5(f"Fetching place names {i + 1}-{i + len(chunk)}/{len(unique_ids)}...")
+        log(f"Fetching place names {i + 1}-{i + len(chunk)}/{len(unique_ids)}...")
         payload = client.get_json(
-            f"{_v9f29f78f}/places/{','.join(str(pid) for pid in chunk)}"
+            f"{API_BASE}/places/{','.join(str(pid) for pid in chunk)}"
         )
         for place in payload.get("results") or []:
             pid = place.get("id")
@@ -406,14 +425,16 @@ def _v5126e42a(client: _vaac45350, place_ids: list[int]) -> dict[int, str]:
     return lookup
 
 
-def _vddf97523(path: Path, fieldnames: list[str]) -> None:
+def init_csv(path: Path, fieldnames: list[str]) -> None:
+    """初始化 CSV 文件（写入表头）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
 
-def _v2f7ca075(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+def append_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    """追加写入 CSV 文件；文件不存在时自动初始化表头。"""
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,7 +446,8 @@ def _v2f7ca075(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
         writer.writerows(rows)
 
 
-def _v6ffa3702(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    """覆盖写入 CSV 文件（写入表头和全部数据）。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -433,16 +455,19 @@ def _v6ffa3702(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
         writer.writerows(rows)
 
 
-def _v58595b53(text: str) -> str:
+def slugify(text: str) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
     cleaned = re.sub(r"[-\s]+", "_", cleaned).strip("_")
     return cleaned or "taxon"
 
 
-def _v7c4e19ba(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # 天咏 2026-09-15 新增：把 iNaturalist taxa API 返回结果转换为 taxon_tree 登记行
-    # 从 ancestry 字段（形如 "48460/1/2/..." 的祖先 ID 链）提取父节点；
-    # 同一节点多次出现时合并字段，中文名优先于英文名
+def tree_nodes_from_payloads(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把 iNaturalist taxa API 返回的结果列表转换为 taxon_tree 登记行。
+
+    从每个类群的 ancestry 字段（形如 "48460/1/2/..." 的祖先 ID 链）
+    提取父节点，组装为主库 taxon_tree 表的批量登记字典；
+    同一节点多次出现时合并字段，中文名优先于英文名。
+    """
     merged: dict[int, dict[str, Any]] = {}
     for taxon in payloads:
         if not isinstance(taxon, dict):
@@ -476,37 +501,40 @@ def _v7c4e19ba(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(merged.values())
 
 
-def _v2d6f83ea(
+def sync_taxon_tree(
     api_client: Any,
     taxon_payload: dict[str, Any],
     db_manager: Any,
 ) -> int:
-    # 天咏 2026-09-15 新增：登记当前类群及其全部祖先的层级链（祖先用一次批量 API 请求）
-    # 祖先请求带 locale=zh-CN 获取中文俗名；当前节点缺中文名时补一次带 locale 的详情请求
+    """登记当前类群及其全部祖先的层级链（祖先用一次批量 API 请求）。
+
+    祖先请求带 locale=zh-CN 获取中文俗名；当前节点缺中文名时
+    补一次带 locale 的详情请求。返回登记节点数。
+    """
     ancestry_ids = [
         x for x in str(taxon_payload.get("ancestry") or "").split("/") if x.strip().isdigit()
     ]
     payloads: list[dict[str, Any]] = [taxon_payload]
     if ancestry_ids:
         ancestors = api_client.get_json(
-            f"{_v9f29f78f}/taxa/{','.join(ancestry_ids)}?locale=zh-CN")
+            f"{API_BASE}/taxa/{','.join(ancestry_ids)}?locale=zh-CN")
         payloads.extend(ancestors.get("results") or [])
     # 当前节点补中文俗名（主流程 payload 默认英文 locale，目录命名不受影响）
     if not re.search(r"[\u4e00-\u9fff]",
                      taxon_payload.get("preferred_common_name") or ""):
         try:
             zh = api_client.get_json(
-                f"{_v9f29f78f}/taxa/{taxon_payload['id']}?locale=zh-CN")
+                f"{API_BASE}/taxa/{taxon_payload['id']}?locale=zh-CN")
             zh_taxon = (zh.get("results") or [{}])[0]
             if isinstance(zh_taxon, dict) and zh_taxon.get("id"):
                 payloads.insert(0, zh_taxon)
         except Exception:
             pass  # 中文名补全失败不影响层级登记
-    nodes = _v7c4e19ba(payloads)
+    nodes = tree_nodes_from_payloads(payloads)
     return db_manager.upsert_taxon_tree_bulk(nodes)
 
 
-def _veea6cd9f(
+def collect_photo_jobs(
     observations: list[dict[str, Any]],
     photo_dir: Path,
     preferred_size: str,
@@ -523,7 +551,7 @@ def _veea6cd9f(
             source_url = photo.get("url") or ""
             if not photo_id or not source_url:
                 continue
-            ext = _vd519606e(source_url)
+            ext = guess_extension(source_url)
             filename = f"obs_{obs_id}_photo_{photo_id}{ext}"
             dest = photo_dir / filename
             dims = photo.get("original_dimensions") or {}
@@ -545,7 +573,7 @@ def _veea6cd9f(
     return jobs
 
 
-def _vf6137303(job: dict[str, Any]) -> dict[str, Any]:
+def run_photo_job(job: dict[str, Any]) -> dict[str, Any]:
     dest: Path = job["dest"]
     relative = job["relative"]
     if dest.exists() and dest.stat().st_size > 0:
@@ -553,7 +581,7 @@ def _vf6137303(job: dict[str, Any]) -> dict[str, Any]:
             **{k: v for k, v in job.items() if k not in {"dest", "source_url"}},
             "requested_size": job["preferred_size"],
             "downloaded_size": "existing",
-            "original_url": _v41467eb2(job["source_url"], job["preferred_size"]),
+            "original_url": photo_url_for_size(job["source_url"], job["preferred_size"]),
             "local_path": relative,
             "download_ok": True,
             "status": "skipped",
@@ -562,10 +590,10 @@ def _vf6137303(job: dict[str, Any]) -> dict[str, Any]:
     used_size = None
     used_url = ""
     ok = False
-    for size in _vc590d146(job["preferred_size"]):
+    for size in size_fallbacks(job["preferred_size"]):
         used_size = size
-        used_url = _v41467eb2(job["source_url"], size)
-        if _v2c962755(used_url, dest):
+        used_url = photo_url_for_size(job["source_url"], size)
+        if download_photo_file(used_url, dest):
             ok = True
             break
 
@@ -580,7 +608,7 @@ def _vf6137303(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _v7ea57622(
+def download_taxon_data(
     taxon_id: int,
     out_dir: Path,
     photo_size: str = "large",
@@ -595,28 +623,34 @@ def _v7ea57622(
     main_db_path: Path | None = None,
     batch_id: int | None = None,
 ) -> dict[str, Any]:
+    """流式下载单个类群的观察元数据与图片，返回汇总信息字典。
+
+    采用分页→下载→追加 CSV 的流式模式，避免一次性加载全部观察数据，
+    适合大规模（数万条）鸟类数据下载。
+    每个类群的图片自动存放于独立文件夹：out_dir/taxon_{id}_{学名}_{俗名}/photos/
+    """
     # 解析数据库路径并初始化管理器
-    db_manager: _v8b9d65af | None = None
+    db_manager: INaturalistDatabaseManager | None = None
     db_batch_id: int | None = batch_id
     if db_enabled:
         db_dir = (out_dir / "db") if raw_db_path is None or main_db_path is None else None
         resolved_raw_db = raw_db_path or (db_dir / "raw_data.db")
         resolved_main_db = main_db_path or (db_dir / "bird_observations.db")
         try:
-            db_manager = _v8b9d65af(resolved_raw_db, resolved_main_db)
-            _vea44eec5(f"Database enabled: raw={resolved_raw_db}, main={resolved_main_db}")
+            db_manager = INaturalistDatabaseManager(resolved_raw_db, resolved_main_db)
+            log(f"Database enabled: raw={resolved_raw_db}, main={resolved_main_db}")
         except Exception as exc:
-            _vea44eec5(f"  数据库初始化失败，将继续仅输出 CSV/JSON: {exc}")
+            log(f"  数据库初始化失败，将继续仅输出 CSV/JSON: {exc}")
             db_manager = None
 
-    api_client = _vaac45350(_vc56994c8)
+    api_client = ApiClient(REQUEST_INTERVAL_SEC)
 
-    _vea44eec5("Fetching taxon info...")
-    taxon_payload = api_client.get_json(f"{_v9f29f78f}/taxa/{taxon_id}")
+    log("Fetching taxon info...")
+    taxon_payload = api_client.get_json(f"{API_BASE}/taxa/{taxon_id}")
     taxon = (taxon_payload.get("results") or [{}])[0]
     scientific = taxon.get("name") or f"taxon_{taxon_id}"
     common = taxon.get("preferred_common_name") or scientific
-    folder_name = f"taxon_{taxon_id}_{_v58595b53(scientific)}_{_v58595b53(common)}"
+    folder_name = f"taxon_{taxon_id}_{slugify(scientific)}_{slugify(common)}"
     taxon_out_dir = out_dir / folder_name
     photo_dir = taxon_out_dir / "photos"
     photo_dir.mkdir(parents=True, exist_ok=True)
@@ -627,8 +661,8 @@ def _v7ea57622(
         except OSError:
             pass
 
-    _vea44eec5(f"Taxon: {scientific} ({common})")
-    _vea44eec5(f"Output: {taxon_out_dir}")
+    log(f"Taxon: {scientific} ({common})")
+    log(f"Output: {taxon_out_dir}")
 
     # 登记类群信息；单类群运行时自动创建一条批次记录
     if db_manager is not None:
@@ -640,12 +674,12 @@ def _v7ea57622(
                 rank=taxon.get("rank", ""),
                 label_cn="",
             )
-            # 天咏 2026-09-15 新增：登记纲-目-科-种生物学层级链（祖先一次批量请求，失败不中断爬取）
+            # 登记纲-目-科-种生物学层级链（祖先一次批量请求，失败不中断爬取）
             try:
-                synced = _v2d6f83ea(api_client, taxon, db_manager)
-                _vea44eec5(f"Taxonomy tree synced: {synced} nodes")
+                synced = sync_taxon_tree(api_client, taxon, db_manager)
+                log(f"Taxonomy tree synced: {synced} nodes")
             except Exception as exc:
-                _vea44eec5(f"  类群层级登记失败（不影响爬取）: {exc}")
+                log(f"  类群层级登记失败（不影响爬取）: {exc}")
             if db_batch_id is None:
                 db_batch_id = db_manager.create_batch_run(
                     batch_time=datetime.now().isoformat(timespec="seconds"),
@@ -656,13 +690,13 @@ def _v7ea57622(
                     output_dir=str(out_dir),
                 )
         except Exception as exc:
-            _vea44eec5(f"  数据库类群/批次登记失败: {exc}")
+            log(f"  数据库类群/批次登记失败: {exc}")
 
     # 初始化 CSV 文件（空表头）
     observations_csv_path = taxon_out_dir / "observations.csv"
     photos_csv_path = taxon_out_dir / "photos.csv"
-    _vddf97523(observations_csv_path, _v204697d3)
-    _vddf97523(photos_csv_path, _v1930c2ef)
+    init_csv(observations_csv_path, OBSERVATION_CSV_FIELDS)
+    init_csv(photos_csv_path, PHOTO_CSV_FIELDS)
 
     # 如果需要保存原始 JSON，改为每页追加一行（避免生成超大 JSON）
     raw_jsonl_path = taxon_out_dir / "observations_raw.jsonl" if save_raw_json else None
@@ -682,7 +716,7 @@ def _v7ea57622(
     all_observation_rows: list[dict[str, Any]] = []
 
     for page_index, observations in enumerate(
-        _vb61371ba(
+        fetch_observations_stream(
             api_client, taxon_id, per_page,
             max_results=max_observations,
             quality_grade=quality_grade,
@@ -690,7 +724,7 @@ def _v7ea57622(
         start=1,
     ):
         total_observations += len(observations)
-        _vea44eec5(f"Processing page {page_index}: {len(observations)} observations...")
+        log(f"Processing page {page_index}: {len(observations)} observations...")
 
         # 可选：追加保存原始数据（JSONL 格式，比单个大 JSON 更省内存）
         if raw_jsonl_path is not None:
@@ -705,12 +739,12 @@ def _v7ea57622(
                 page_place_ids.extend(int(pid) for pid in (obs.get("place_ids") or []))
             new_ids = [pid for pid in set(page_place_ids) if pid not in place_lookup]
             if new_ids:
-                place_lookup.update(_v5126e42a(api_client, new_ids))
+                place_lookup.update(fetch_places(api_client, new_ids))
 
         # 下载本页照片
-        jobs = _veea6cd9f(observations, photo_dir, photo_size)
+        jobs = collect_photo_jobs(observations, photo_dir, photo_size)
         total_photos += len(jobs)
-        _vea44eec5(
+        log(
             f"Downloading {len(jobs)} photos with {workers} workers "
             f"({photo_size}, page {page_index})..."
         )
@@ -718,7 +752,7 @@ def _v7ea57622(
         photo_rows: list[dict[str, Any]] = []
         downloaded = skipped = failed = 0
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [pool.submit(_vf6137303, job) for job in jobs]
+            futures = [pool.submit(run_photo_job, job) for job in jobs]
             for done_count, future in enumerate(as_completed(futures), start=1):
                 row = future.result()
                 photo_rows.append(row)
@@ -732,7 +766,7 @@ def _v7ea57622(
                 if row.get("download_ok") and row.get("local_path"):
                     files_by_obs.setdefault(row["observation_id"], []).append(row["local_path"])
                 if done_count % 10 == 0 or done_count == len(jobs):
-                    _vea44eec5(
+                    log(
                         f"  photos {done_count}/{len(jobs)} "
                         f"(new={downloaded}, existed={skipped}, failed={failed})"
                     )
@@ -743,14 +777,14 @@ def _v7ea57622(
 
         # 追加照片 CSV
         photo_rows.sort(key=lambda r: (r.get("observation_id") or 0, r.get("position") or 0))
-        _v2f7ca075(photos_csv_path, _v1930c2ef, photo_rows)
+        append_csv(photos_csv_path, PHOTO_CSV_FIELDS, photo_rows)
 
         # 追加观察记录 CSV（先不填 local_photo_files，最后统一更新）
         observation_rows = [
-            _vdaab8f62(obs, place_lookup, []) for obs in observations
+            flatten_observation(obs, place_lookup, []) for obs in observations
         ]
         all_observation_rows.extend(observation_rows)
-        _v2f7ca075(observations_csv_path, _v204697d3, observation_rows)
+        append_csv(observations_csv_path, OBSERVATION_CSV_FIELDS, observation_rows)
 
         # 将本页数据写入数据库（失败不影响 CSV 输出）
         if db_manager is not None:
@@ -761,25 +795,25 @@ def _v7ea57622(
                     for obs_row in observation_rows:
                         db_manager.link_batch_observation(db_batch_id, obs_row["observation_id"])
             except Exception as exc:
-                _vea44eec5(f"  数据库写入失败（page {page_index}）: {exc}")
+                log(f"  数据库写入失败（page {page_index}）: {exc}")
 
     # 所有分页完成后，补全 local_photo_files 列并重写观察记录 CSV
     for row in all_observation_rows:
         row["local_photo_files"] = " | ".join(files_by_obs.get(row["observation_id"], []))
-    _v6ffa3702(observations_csv_path, _v204697d3, all_observation_rows)
+    write_csv(observations_csv_path, OBSERVATION_CSV_FIELDS, all_observation_rows)
 
     # 同步更新数据库中的本地照片文件列表
     if db_manager is not None:
         try:
             db_manager.update_observation_local_photo_files(files_by_obs)
         except Exception as exc:
-            _vea44eec5(f"  更新数据库本地照片文件列表失败: {exc}")
+            log(f"  更新数据库本地照片文件列表失败: {exc}")
 
-    _vea44eec5(f"Saved research metadata for {total_observations} observations.")
+    log(f"Saved research metadata for {total_observations} observations.")
 
     summary = {
         "source_url": f"https://www.inaturalist.org/observations?taxon_id={taxon_id}",
-        "api": f"{_v9f29f78f}/observations?taxon_id={taxon_id}",
+        "api": f"{API_BASE}/observations?taxon_id={taxon_id}",
         "taxon_id": taxon_id,
         "scientific_name": scientific,
         "common_name": common,
@@ -820,12 +854,12 @@ def _v7ea57622(
                 total_failed=total_failed,
             )
         except Exception as exc:
-            _vea44eec5(f"  数据库批次统计写入失败: {exc}")
+            log(f"  数据库批次统计写入失败: {exc}")
         finally:
             db_manager.close()
 
-    _vea44eec5("\nDone.")
-    _vea44eec5(json.dumps(summary, ensure_ascii=False, indent=2))
+    log("\nDone.")
+    log(json.dumps(summary, ensure_ascii=False, indent=2))
     summary["batch_id"] = db_batch_id
     if db_manager is not None:
         summary["raw_db_path"] = str(resolved_raw_db)
@@ -833,8 +867,8 @@ def _v7ea57622(
     return summary
 
 
-def _v9a12dab4() -> int:
-    args = _v772a86c3()
+def main() -> int:
+    args = parse_args()
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -845,7 +879,7 @@ def _v9a12dab4() -> int:
     raw_db = args.raw_db or (db_dir / "raw_data.db")
     main_db = args.main_db or (db_dir / "bird_observations.db")
 
-    summary = _v7ea57622(
+    summary = download_taxon_data(
         taxon_id=args.taxon_id,
         out_dir=args.out_dir,
         photo_size=args.photo_size,
@@ -863,4 +897,4 @@ def _v9a12dab4() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_v9a12dab4())
+    sys.exit(main())

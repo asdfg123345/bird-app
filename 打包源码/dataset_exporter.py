@@ -19,6 +19,18 @@
 
 from __future__ import annotations
 
+
+# ============================================================
+# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
+# ============================================================
+def _frozen_base(src_file):
+    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).resolve().parent
+    return Path(src_file).resolve().parent
+
+
 import argparse
 import csv
 import json
@@ -33,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 # 路径相对脚本目录解析，避免硬编码
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = _frozen_base(__file__)
 
 # 三个标准数据划分集合
 SPLIT_NAMES = ("train", "val", "test")
@@ -143,7 +155,7 @@ def _ancestor_ranks(tree: dict[int, dict[str, Any]],
 def _resolve_taxon_dir(data_dir: Path, taxon_id: int,
                        sci: str, cn: str) -> Path | None:
     """定位照片所在的 taxon_* 目录：先按命名规则精确匹配，再按前缀兜底。"""
-    from download_inaturalist import _v58595b53 as slugify  # 混淆版 slugify
+    from download_inaturalist import slugify
 
     exact = data_dir / f"taxon_{taxon_id}_{slugify(sci)}_{slugify(cn)}"
     if exact.is_dir():
@@ -222,7 +234,7 @@ def _link_or_copy(src: Path, dst: Path, mode: str) -> str:
 
 def export_dataset(args: argparse.Namespace) -> int:
     """导出主流程：查询 → 过滤 → 观察级划分 → 落盘 → 清单与报告。"""
-    from inaturalist_db_manager import _v8b9d65af as INaturalistDatabaseManager  # 混淆版数据库管理类
+    from inaturalist_db_manager import INaturalistDatabaseManager
 
     out_dir: Path = args.out
     data_dir: Path = args.data_dir
@@ -481,7 +493,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-ROOT = Path(__file__).resolve().parent
+ROOT = _frozen_base(__file__)
 
 # 方式一：ImageFolder 直接加载（train/val/test 目录即类别目录）
 # from torchvision.datasets import ImageFolder

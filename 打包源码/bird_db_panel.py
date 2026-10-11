@@ -5,8 +5,32 @@
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # ============================================================
 
+"""鸟类观察数据库交互面板（纯 Python 标准库实现，无第三方依赖）。
+
+功能：
+    - 在本地启动一个 Web 服务，用浏览器查看数据库内容；
+    - 总览统计：观察记录、照片、类群、批次数量与分布；
+    - 观察记录：关键词搜索、按类群筛选、分页浏览；
+    - 照片浏览：缩略图画廊，点击可看大图，附观察信息；
+    - 批次记录：查看历史下载批次。
+
+用法：
+    python bird_db_panel.py [--main-db 路径] [--port 8765] [--no-browser]
+"""
 
 from __future__ import annotations
+
+
+# ============================================================
+# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
+# ============================================================
+def _frozen_base(src_file):
+    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).resolve().parent
+    return Path(src_file).resolve().parent
+
 
 import argparse
 import json
@@ -18,20 +42,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-def _v5e1f9a2b() -> Path:
-    # 打包为 exe 后返回 exe 所在目录，源码运行时返回本文件所在目录
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-# 默认数据库路径：基准目录 / data / db / bird_observations.db（避免硬编码绝对路径）
-_vd4ca91d7 = _v5e1f9a2b()
-_v29bac30f = _vd4ca91d7 / "data" / "db" / "bird_observations.db"
+# 默认数据库路径：脚本所在目录 / data / db / bird_observations.db（避免硬编码绝对路径）
+BASE_DIR = _frozen_base(__file__)
+DEFAULT_MAIN_DB = BASE_DIR / "data" / "db" / "bird_observations.db"
 
 # 面板页面（单页应用：页面数据全部通过 /api/* 接口异步加载）
-_v8b538b6f = """<!DOCTYPE html>
+PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -281,16 +297,18 @@ loadStats();
 """
 
 
-class _v623a5ec1(BaseHTTPRequestHandler):
+class PanelHandler(BaseHTTPRequestHandler):
+    """面板 HTTP 请求处理器：静态页面 + JSON 接口 + 本地照片文件。"""
 
     # 数据库路径与允许读取的根目录，在启动时由 serve() 注入
-    main_db: Path = _v29bac30f
-    allow_root: Path = _vd4ca91d7
+    main_db: Path = DEFAULT_MAIN_DB
+    allow_root: Path = BASE_DIR
     # 照片文件名索引：文件名 -> 绝对路径（首次访问照片时扫描构建）
     photo_index: dict | None = None
 
     # ---------- 基础工具 ----------
     def _send(self, code: int, body: bytes, ctype: str) -> None:
+        """发送响应体。"""
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -298,6 +316,7 @@ class _v623a5ec1(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, data) -> None:
+        """发送 JSON 响应。"""
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self._send(200, body, "application/json; charset=utf-8")
 
@@ -310,7 +329,7 @@ class _v623a5ec1(BaseHTTPRequestHandler):
         route = parsed.path
         try:
             if route == "/" or route == "/index.html":
-                self._send(200, _v8b538b6f.encode("utf-8"), "text/html; charset=utf-8")
+                self._send(200, PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif route == "/favicon.ico":
                 self._send(204, b"", "image/x-icon")
             elif route == "/api/stats":
@@ -331,12 +350,14 @@ class _v623a5ec1(BaseHTTPRequestHandler):
 
     # ---------- 数据库连接 ----------
     def _connect(self) -> sqlite3.Connection:
+        """以只读方式连接主数据库，保证面板不会破坏数据。"""
         conn = sqlite3.connect(f"file:{self.main_db.as_posix()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         return conn
 
     # ---------- 接口实现 ----------
     def _api_stats(self) -> None:
+        """总览统计。"""
         with self._connect() as conn:
             one = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
             taxa_rows = conn.execute(
@@ -360,6 +381,7 @@ class _v623a5ec1(BaseHTTPRequestHandler):
         })
 
     def _api_observations(self, qs) -> None:
+        """观察记录列表：支持关键词 / 类群筛选 / 分页。"""
         q = qs.get("q", [""])[0].strip()
         taxon = qs.get("taxon_id", [""])[0].strip()
         limit = min(int(qs.get("limit", ["50"])[0]), 500)
@@ -394,6 +416,7 @@ class _v623a5ec1(BaseHTTPRequestHandler):
                     "taxa": [dict(r) for r in taxa]})
 
     def _api_photos(self, qs) -> None:
+        """照片列表：联查观察信息，供画廊展示。"""
         q = qs.get("q", [""])[0].strip()
         taxon = qs.get("taxon_id", [""])[0].strip()
         limit = min(int(qs.get("limit", ["60"])[0]), 500)
@@ -426,11 +449,17 @@ class _v623a5ec1(BaseHTTPRequestHandler):
                     "taxa": [dict(r) for r in taxa]})
 
     def _api_batches(self) -> None:
+        """批次记录列表。"""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM batch_runs ORDER BY id DESC").fetchall()
         self._json({"rows": [dict(r) for r in rows]})
 
     def _serve_photo(self, qs) -> None:
+        """按本地路径返回图片文件（仅允许访问数据目录内的文件）。
+
+        数据库中 local_path 为相对类群文件夹的路径（如 photos\\obs_xxx.jpg），
+        这里通过文件名索引在数据目录中定位实际文件。
+        """
         raw = qs.get("path", [""])[0]
         if not raw:
             self._send(400, b"missing path", "text/plain; charset=utf-8")
@@ -462,6 +491,7 @@ class _v623a5ec1(BaseHTTPRequestHandler):
 
     @classmethod
     def _lookup_by_name(cls, name: str) -> Path | None:
+        """按文件名在数据目录中查找照片（首次调用时构建索引缓存）。"""
         if not name:
             return None
         if cls.photo_index is None:
@@ -475,8 +505,9 @@ class _v623a5ec1(BaseHTTPRequestHandler):
         return cls.photo_index.get(name)
 
 
-def _v6308aa23(main_db: Path = _v29bac30f, port: int = 8765,
+def serve(main_db: Path = DEFAULT_MAIN_DB, port: int = 8765,
           open_browser: bool = True) -> None:
+    """启动面板服务（阻塞运行，Ctrl+C 退出）。"""
     main_db = Path(main_db).resolve()
     if not main_db.exists():
         print(f"[错误] 主数据库不存在：{main_db}")
@@ -484,10 +515,10 @@ def _v6308aa23(main_db: Path = _v29bac30f, port: int = 8765,
         sys.exit(1)
 
     # 允许读取的根目录 = 数据库所在目录的上一级（即 data/ 数据目录）
-    _v623a5ec1.main_db = main_db
-    _v623a5ec1.allow_root = main_db.parent.parent
+    PanelHandler.main_db = main_db
+    PanelHandler.allow_root = main_db.parent.parent
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), _v623a5ec1)
+    server = ThreadingHTTPServer(("127.0.0.1", port), PanelHandler)
     url = f"http://127.0.0.1:{port}/"
     print(f"数据库面板已启动：{url}")
     print(f"数据库文件：{main_db}")
@@ -502,16 +533,17 @@ def _v6308aa23(main_db: Path = _v29bac30f, port: int = 8765,
         server.server_close()
 
 
-def _v9a12dab4() -> int:
+def main() -> int:
+    """命令行入口。"""
     parser = argparse.ArgumentParser(description="鸟类观察数据库交互面板")
-    parser.add_argument("--main-db", type=Path, default=_v29bac30f,
+    parser.add_argument("--main-db", type=Path, default=DEFAULT_MAIN_DB,
                         help="主数据库路径（默认 data/db/bird_observations.db）")
     parser.add_argument("--port", type=int, default=8765, help="服务端口（默认 8765）")
     parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
     args = parser.parse_args()
-    _v6308aa23(main_db=args.main_db, port=args.port, open_browser=not args.no_browser)
+    serve(main_db=args.main_db, port=args.port, open_browser=not args.no_browser)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(_v9a12dab4())
+    sys.exit(main())

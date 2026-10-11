@@ -5,8 +5,25 @@
 # ============================================================
 
 # 天咏 2026-09-07
+"""iNaturalist 鸟类下载项目数据库管理模块。
+
+封装两层数据库（raw_data.db + bird_observations.db）的所有写入与查询操作，
+包括类群登记、批次创建、原始/规范化数据写入、去重与常用查询接口。
+"""
 
 from __future__ import annotations
+
+
+# ============================================================
+# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
+# ============================================================
+def _frozen_base(src_file):
+    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).resolve().parent
+    return Path(src_file).resolve().parent
+
 
 import hashlib
 import json
@@ -17,18 +34,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from inaturalist_db_initializer import _v31e07de3
+from inaturalist_db_initializer import init_all_databases
 
 
-def _v5e1f9a2b() -> Path:
-    # 打包为 exe 后返回 exe 所在目录，源码运行时返回本文件所在目录
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def _v8df7575a(text: Any) -> str:
+def _normalize_text(text: Any) -> str:
+    """文本标准化：去括号内容、去标点、转小写、去空白。"""
     if text is None:
         return ""
     text = str(text)
@@ -39,20 +49,22 @@ def _v8df7575a(text: Any) -> str:
     return text
 
 
-def _v6fef4824(obs: dict[str, Any]) -> str:
+def generate_observation_fingerprint(obs: dict[str, Any]) -> str:
+    """基于观察记录关键字段生成 SHA-256 指纹。"""
     parts = [
         str(obs.get("observation_id", "")),
-        _v8df7575a(obs.get("scientific_name", "")),
-        _v8df7575a(obs.get("observed_on", "")),
+        _normalize_text(obs.get("scientific_name", "")),
+        _normalize_text(obs.get("observed_on", "")),
         str(obs.get("latitude", "")),
         str(obs.get("longitude", "")),
-        _v8df7575a(obs.get("description", "")),
+        _normalize_text(obs.get("description", "")),
     ]
     combined = "|".join(parts)
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
-def _v8b848431(photo: dict[str, Any]) -> str:
+def generate_photo_fingerprint(photo: dict[str, Any]) -> str:
+    """基于照片关键字段生成 SHA-256 指纹。"""
     parts = [
         str(photo.get("photo_id", "")),
         str(photo.get("observation_id", "")),
@@ -63,12 +75,14 @@ def _v8b848431(photo: dict[str, Any]) -> str:
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
-def _v564558a3(obj: Any) -> str:
+def _json_fingerprint(obj: Any) -> str:
+    """对任意对象按 key 排序后生成 JSON 并计算 SHA-256。"""
     canonical = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _vd3b0a367(value: Any) -> int | None:
+def _to_int(value: Any) -> int | None:
+    """将值安全转换为整数，失败返回 None。"""
     if value is None or value == "":
         return None
     try:
@@ -77,7 +91,8 @@ def _vd3b0a367(value: Any) -> int | None:
         return None
 
 
-def _vd702f24b(value: Any) -> float | None:
+def _to_float(value: Any) -> float | None:
+    """将值安全转换为浮点数，失败返回 None。"""
     if value is None or value == "":
         return None
     try:
@@ -86,7 +101,8 @@ def _vd702f24b(value: Any) -> float | None:
         return None
 
 
-def _v127cf39d(value: Any) -> int | None:
+def _to_bool_int(value: Any) -> int | None:
+    """将布尔值或文本转换为 0/1 整数，失败返回 None。"""
     if value is None or value == "":
         return None
     if isinstance(value, bool):
@@ -100,7 +116,8 @@ def _v127cf39d(value: Any) -> int | None:
     return None
 
 
-class _v8b9d65af:
+class INaturalistDatabaseManager:
+    """iNaturalist 两层数据库管理器。"""
 
     def __init__(
         self,
@@ -108,6 +125,7 @@ class _v8b9d65af:
         main_db_path: Path | str,
         batch_uuid: str | None = None,
     ) -> None:
+        """初始化管理器，自动创建并连接两个数据库。"""
         self.raw_db_path = Path(raw_db_path)
         self.main_db_path = Path(main_db_path)
         self.batch_uuid = batch_uuid or str(uuid.uuid4())
@@ -116,21 +134,25 @@ class _v8b9d65af:
         self._main_conn: sqlite3.Connection | None = None
 
     def _ensure_databases(self) -> None:
-        _v31e07de3(self.raw_db_path, self.main_db_path)
+        """确保两个数据库已初始化。"""
+        init_all_databases(self.raw_db_path, self.main_db_path)
 
     def _get_raw_conn(self) -> sqlite3.Connection:
+        """获取原始库连接。"""
         if self._raw_conn is None:
             self._raw_conn = sqlite3.connect(self.raw_db_path)
             self._raw_conn.execute("PRAGMA foreign_keys = ON")
         return self._raw_conn
 
     def _get_main_conn(self) -> sqlite3.Connection:
+        """获取主库连接。"""
         if self._main_conn is None:
             self._main_conn = sqlite3.connect(self.main_db_path)
             self._main_conn.execute("PRAGMA foreign_keys = ON")
         return self._main_conn
 
     def close(self) -> None:
+        """关闭两个数据库连接。"""
         if self._raw_conn is not None:
             self._raw_conn.close()
             self._raw_conn = None
@@ -155,6 +177,7 @@ class _v8b9d65af:
         rank: str,
         label_cn: str = "",
     ) -> None:
+        """登记或更新类群信息。"""
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._get_main_conn()
         cursor = conn.cursor()
@@ -174,8 +197,11 @@ class _v8b9d65af:
         conn.commit()
 
     def upsert_taxon_tree_bulk(self, nodes: list[dict[str, Any]]) -> int:
-        # 天咏 2026-09-15 新增：批量登记类群生物学层级节点（来自 iNaturalist 官方 ancestry 链）
-        # 每个 node 字典需含 taxon_id/rank/name_sci/name_cn/parent_id/ancestry_ids，返回登记节点数
+        """批量登记类群生物学层级节点（来自 iNaturalist 官方 ancestry 链）。
+
+        每个 node 字典需含 taxon_id/rank/name_sci/name_cn/parent_id/ancestry_ids。
+        返回登记节点数。
+        """
         if not nodes:
             return 0
         conn = self._get_main_conn()
@@ -198,7 +224,7 @@ class _v8b9d65af:
         return len(nodes)
 
     def load_taxon_tree(self) -> dict[int, dict[str, Any]]:
-        # 天咏 2026-09-15 新增：加载全部分类层级节点，返回 {taxon_id: 节点字典}
+        """加载全部分类层级节点，返回 {taxon_id: 节点字典}。"""
         conn = self._get_main_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -232,6 +258,7 @@ class _v8b9d65af:
         total_downloaded: int = 0,
         total_failed: int = 0,
     ) -> int:
+        """创建批次运行记录，返回 batch_id。"""
         conn = self._get_main_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -269,6 +296,7 @@ class _v8b9d65af:
         total_downloaded: int | None = None,
         total_failed: int | None = None,
     ) -> None:
+        """更新批次汇总统计。"""
         conn = self._get_main_conn()
         cursor = conn.cursor()
         fields: list[str] = []
@@ -301,6 +329,7 @@ class _v8b9d65af:
         photos_downloaded: int,
         photos_failed: int,
     ) -> None:
+        """记录每批次每个类群的统计。"""
         conn = self._get_main_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -322,6 +351,7 @@ class _v8b9d65af:
         batch_id: int,
         observation_id: int,
     ) -> None:
+        """建立批次与观察记录的关联。"""
         conn = self._get_main_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -342,8 +372,9 @@ class _v8b9d65af:
         raw_json: dict[str, Any],
         crawl_time: str,
     ) -> None:
+        """写入原始观察记录（INSERT OR IGNORE）。"""
         # 原始层指纹：结合业务主键与原始 JSON，避免空 JSON 导致重复
-        fingerprint = _v564558a3(
+        fingerprint = _json_fingerprint(
             {
                 "observation_id": obs.get("observation_id"),
                 "uuid": obs.get("uuid"),
@@ -363,37 +394,37 @@ class _v8b9d65af:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _vd3b0a367(obs.get("observation_id")),
+                _to_int(obs.get("observation_id")),
                 obs.get("uuid"),
                 obs.get("uri"),
                 obs.get("quality_grade"),
                 obs.get("scientific_name"),
                 obs.get("common_name"),
-                _vd3b0a367(obs.get("taxon_id")),
+                _to_int(obs.get("taxon_id")),
                 obs.get("taxon_rank"),
                 obs.get("species_guess"),
                 obs.get("observed_on"),
                 obs.get("time_observed_at"),
                 obs.get("time_zone"),
-                _vd702f24b(obs.get("latitude")),
-                _vd702f24b(obs.get("longitude")),
+                _to_float(obs.get("latitude")),
+                _to_float(obs.get("longitude")),
                 obs.get("place_guess"),
                 obs.get("place_names"),
-                _vd3b0a367(obs.get("positional_accuracy_m")),
-                _vd3b0a367(obs.get("public_positional_accuracy_m")),
+                _to_int(obs.get("positional_accuracy_m")),
+                _to_int(obs.get("public_positional_accuracy_m")),
                 obs.get("geoprivacy"),
                 obs.get("taxon_geoprivacy"),
-                _v127cf39d(obs.get("obscured")),
-                _v127cf39d(obs.get("mappable")),
-                _v127cf39d(obs.get("captive")),
+                _to_bool_int(obs.get("obscured")),
+                _to_bool_int(obs.get("mappable")),
+                _to_bool_int(obs.get("captive")),
                 obs.get("description"),
                 obs.get("observation_license"),
-                _vd3b0a367(obs.get("observer_id")),
+                _to_int(obs.get("observer_id")),
                 obs.get("observer_login"),
                 obs.get("observer_name"),
-                _vd3b0a367(obs.get("identifications_count")),
-                _vd3b0a367(obs.get("photo_count")),
-                _vd3b0a367(obs.get("sound_count")),
+                _to_int(obs.get("identifications_count")),
+                _to_int(obs.get("photo_count")),
+                _to_int(obs.get("sound_count")),
                 obs.get("local_photo_files"),
                 json.dumps(raw_json, ensure_ascii=False, default=str),
                 crawl_time,
@@ -409,8 +440,9 @@ class _v8b9d65af:
         raw_json: dict[str, Any],
         crawl_time: str,
     ) -> None:
+        """写入原始照片（INSERT OR IGNORE）。"""
         # 原始层指纹：结合业务主键与原始 JSON，避免空 JSON 导致重复
-        fingerprint = _v564558a3(
+        fingerprint = _json_fingerprint(
             {
                 "photo_id": photo.get("photo_id"),
                 "observation_id": photo.get("observation_id"),
@@ -427,18 +459,18 @@ class _v8b9d65af:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _vd3b0a367(photo.get("observation_id")),
-                _vd3b0a367(photo.get("photo_id")),
-                _vd3b0a367(photo.get("position")),
+                _to_int(photo.get("observation_id")),
+                _to_int(photo.get("photo_id")),
+                _to_int(photo.get("position")),
                 photo.get("license_code"),
                 photo.get("attribution"),
-                _vd3b0a367(photo.get("width")),
-                _vd3b0a367(photo.get("height")),
+                _to_int(photo.get("width")),
+                _to_int(photo.get("height")),
                 photo.get("requested_size"),
                 photo.get("downloaded_size"),
                 photo.get("original_url"),
                 photo.get("local_path"),
-                _v127cf39d(photo.get("download_ok")),
+                _to_bool_int(photo.get("download_ok")),
                 json.dumps(raw_json, ensure_ascii=False, default=str),
                 crawl_time,
                 self.batch_uuid,
@@ -448,8 +480,9 @@ class _v8b9d65af:
         conn.commit()
 
     def upsert_observation(self, obs: dict[str, Any]) -> None:
+        """写入或更新规范化观察记录（upsert）。"""
         # 如果观察记录带有类群信息，先确保类群已登记
-        taxon_id = _vd3b0a367(obs.get("taxon_id"))
+        taxon_id = _to_int(obs.get("taxon_id"))
         if taxon_id is not None:
             self.ensure_taxon(
                 taxon_id=taxon_id,
@@ -458,7 +491,7 @@ class _v8b9d65af:
                 rank=obs.get("taxon_rank", ""),
                 label_cn="",
             )
-        fingerprint = _v6fef4824(obs)
+        fingerprint = generate_observation_fingerprint(obs)
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._get_main_conn()
         cursor = conn.cursor()
@@ -509,37 +542,37 @@ class _v8b9d65af:
                 updated_at = excluded.updated_at
             """,
             (
-                _vd3b0a367(obs.get("observation_id")),
+                _to_int(obs.get("observation_id")),
                 obs.get("uuid"),
                 obs.get("uri"),
                 obs.get("quality_grade"),
                 obs.get("scientific_name"),
                 obs.get("common_name"),
-                _vd3b0a367(obs.get("taxon_id")),
+                _to_int(obs.get("taxon_id")),
                 obs.get("taxon_rank"),
                 obs.get("species_guess"),
                 obs.get("observed_on"),
                 obs.get("time_observed_at"),
                 obs.get("time_zone"),
-                _vd702f24b(obs.get("latitude")),
-                _vd702f24b(obs.get("longitude")),
+                _to_float(obs.get("latitude")),
+                _to_float(obs.get("longitude")),
                 obs.get("place_guess"),
                 obs.get("place_names"),
-                _vd3b0a367(obs.get("positional_accuracy_m")),
-                _vd3b0a367(obs.get("public_positional_accuracy_m")),
+                _to_int(obs.get("positional_accuracy_m")),
+                _to_int(obs.get("public_positional_accuracy_m")),
                 obs.get("geoprivacy"),
                 obs.get("taxon_geoprivacy"),
-                _v127cf39d(obs.get("obscured")),
-                _v127cf39d(obs.get("mappable")),
-                _v127cf39d(obs.get("captive")),
+                _to_bool_int(obs.get("obscured")),
+                _to_bool_int(obs.get("mappable")),
+                _to_bool_int(obs.get("captive")),
                 obs.get("description"),
                 obs.get("observation_license"),
-                _vd3b0a367(obs.get("observer_id")),
+                _to_int(obs.get("observer_id")),
                 obs.get("observer_login"),
                 obs.get("observer_name"),
-                _vd3b0a367(obs.get("identifications_count")),
-                _vd3b0a367(obs.get("photo_count")),
-                _vd3b0a367(obs.get("sound_count")),
+                _to_int(obs.get("identifications_count")),
+                _to_int(obs.get("photo_count")),
+                _to_int(obs.get("sound_count")),
                 obs.get("local_photo_files"),
                 fingerprint,
                 now,
@@ -549,7 +582,8 @@ class _v8b9d65af:
         conn.commit()
 
     def upsert_photo(self, photo: dict[str, Any]) -> None:
-        fingerprint = _v8b848431(photo)
+        """写入或更新规范化照片（upsert）。"""
+        fingerprint = generate_photo_fingerprint(photo)
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._get_main_conn()
         cursor = conn.cursor()
@@ -576,18 +610,18 @@ class _v8b9d65af:
                 updated_at = excluded.updated_at
             """,
             (
-                _vd3b0a367(photo.get("photo_id")),
-                _vd3b0a367(photo.get("observation_id")),
-                _vd3b0a367(photo.get("position")),
+                _to_int(photo.get("photo_id")),
+                _to_int(photo.get("observation_id")),
+                _to_int(photo.get("position")),
                 photo.get("license_code"),
                 photo.get("attribution"),
-                _vd3b0a367(photo.get("width")),
-                _vd3b0a367(photo.get("height")),
+                _to_int(photo.get("width")),
+                _to_int(photo.get("height")),
                 photo.get("requested_size"),
                 photo.get("downloaded_size"),
                 photo.get("original_url"),
                 photo.get("local_path"),
-                _v127cf39d(photo.get("download_ok")),
+                _to_bool_int(photo.get("download_ok")),
                 fingerprint,
                 now,
                 now,
@@ -602,6 +636,14 @@ class _v8b9d65af:
         raw_observations: list[dict[str, Any]] | None = None,
         crawl_time: str | None = None,
     ) -> None:
+        """批量写入一页观察记录与照片到两层数据库。
+
+        参数：
+            observations: 规范化观察记录行列表
+            photo_rows: 规范化照片行列表
+            raw_observations: 原始 API observation 对象列表（可选）
+            crawl_time: 采集时间戳
+        """
         now = crawl_time or datetime.now().isoformat(timespec="seconds")
         raw_lookup: dict[int, dict[str, Any]] = {}
         if raw_observations:
@@ -624,16 +666,19 @@ class _v8b9d65af:
     # 常用查询接口
     # ------------------------------------------------------------------
     def get_observation_count(self) -> int:
+        """获取主库观察记录总数。"""
         conn = self._get_main_conn()
         row = conn.execute("SELECT COUNT(*) FROM observations").fetchone()
         return row[0] if row else 0
 
     def get_photo_count(self) -> int:
+        """获取主库照片总数。"""
         conn = self._get_main_conn()
         row = conn.execute("SELECT COUNT(*) FROM photos").fetchone()
         return row[0] if row else 0
 
     def get_taxon_stats(self) -> list[dict[str, Any]]:
+        """按类群统计观察记录数与照片数。"""
         conn = self._get_main_conn()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -651,6 +696,7 @@ class _v8b9d65af:
         return [dict(row) for row in rows]
 
     def get_failed_photos(self, limit: int = 100) -> list[dict[str, Any]]:
+        """获取下载失败的照片列表。"""
         conn = self._get_main_conn()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -660,6 +706,7 @@ class _v8b9d65af:
         return [dict(row) for row in rows]
 
     def get_batch_summary(self) -> list[dict[str, Any]]:
+        """获取所有批次运行汇总。"""
         conn = self._get_main_conn()
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM batch_runs ORDER BY created_at DESC").fetchall()
@@ -669,6 +716,11 @@ class _v8b9d65af:
         self,
         files_by_obs: dict[Any, list[str]],
     ) -> None:
+        """批量更新观察记录的本地照片文件列表。
+
+        参数：
+            files_by_obs: 键为 observation_id，值为本地照片相对路径列表
+        """
         if not files_by_obs:
             return
         conn = self._get_main_conn()
@@ -699,6 +751,11 @@ class _v8b9d65af:
         source_name: str = "",
         note: str = "",
     ) -> int:
+        """登记或复用本地导入的容器观察记录，返回本地观察 ID。
+
+        本地观察使用负数 ID（依次递减编码），与 iNaturalist 正数 ID 天然区分；
+        同一「类群 + 来源文件夹」只建一条本地观察，重复导入时自动复用。
+        """
         fingerprint = hashlib.sha256(
             f"local|{taxon_id}|{source_name}".encode("utf-8")).hexdigest()
         conn = self._get_main_conn()
@@ -756,6 +813,7 @@ class _v8b9d65af:
         return new_id
 
     def has_photo_fingerprint(self, content_sha: str) -> bool:
+        """检查照片内容指纹是否已存在于库中（跨批次内容级去重）。"""
         conn = self._get_main_conn()
         row = conn.execute(
             "SELECT 1 FROM photos WHERE fingerprint = ? LIMIT 1",
@@ -763,6 +821,7 @@ class _v8b9d65af:
         return row is not None
 
     def next_local_photo_id(self) -> int:
+        """获取下一个本地照片 ID（负数，依次递减编码）。"""
         conn = self._get_main_conn()
         row = conn.execute(
             "SELECT MIN(photo_id) FROM photos WHERE photo_id < 0").fetchone()
@@ -780,6 +839,10 @@ class _v8b9d65af:
         height: int | None = None,
         position: int = 0,
     ) -> str:
+        """登记本地导入照片，以文件内容 SHA-256 为指纹。
+
+        返回 "inserted"（新入库）或 "duplicate"（内容指纹已存在）。
+        """
         conn = self._get_main_conn()
         now = datetime.now().isoformat(timespec="seconds")
         try:
@@ -817,6 +880,7 @@ class _v8b9d65af:
         return "inserted"
 
     def refresh_local_observation_stats(self, observation_id: int) -> None:
+        """按 photos 表刷新本地观察的 photo_count 与 local_photo_files。"""
         conn = self._get_main_conn()
         rows = conn.execute(
             "SELECT local_path FROM photos "
@@ -834,8 +898,8 @@ class _v8b9d65af:
 
 if __name__ == "__main__":
     # 简单自测：初始化并打印统计
-    base = _v5e1f9a2b() / "data" / "db"
-    manager = _v8b9d65af(base / "raw_data.db", base / "bird_observations.db")
+    base = _frozen_base(__file__) / "data" / "db"
+    manager = INaturalistDatabaseManager(base / "raw_data.db", base / "bird_observations.db")
     print(f"观察记录总数: {manager.get_observation_count()}")
     print(f"照片总数: {manager.get_photo_count()}")
     manager.close()

@@ -41,6 +41,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -467,9 +468,39 @@ class BirdCrawlerGUI:
 
     # ---------- 标签页 3：模型训练 ----------
     def _build_train_tab(self) -> None:
-        """构建模型训练标签页（对接 model_trainer.py，实时显示终端进程）。"""
-        page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 模型训练 ")
+        """构建模型训练标签页（对接 model_trainer.py，实时显示终端进程）。
+
+        训练页内容较多（环境/模式/参数/划分/指标表/日志），外层套一层纵向滚动
+        容器：窗口不够高时可拖动滚动条查看全部区域，避免底部区域被裁掉。
+        """
+        outer = ttk.Frame(self.notebook)
+        self.notebook.add(outer, text=" 模型训练 ")
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 所有原有子控件继续挂在 page（= canvas 内的滚动内容框）上
+        page = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=page, anchor="nw")
+
+        def _sync_scrollregion(_event=None) -> None:
+            """内容尺寸变化时刷新滚动范围。"""
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _stretch_width(event) -> None:
+            """画布宽度变化时让内容框跟随等宽，避免横向留白。"""
+            canvas.itemconfigure(window_id, width=event.width)
+
+        page.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _stretch_width)
+
+        def _on_wheel(event) -> None:
+            """鼠标滚轮滚动训练页（仅在本页范围内生效）。"""
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
 
         # 环境行：训练用 Python 解释器 + 数据目录
         env = ttk.LabelFrame(page, text=" 训练环境与数据 ", padding=6)
@@ -497,6 +528,18 @@ class BirdCrawlerGUI:
         ttk.Button(row_data, text="扫描数据",
                    command=self._scan_train_data).pack(side=tk.LEFT, padx=6)
 
+        # 中断续训：勾选后从最近一次中断的断点继续（含断点信息提示）
+        row_resume = ttk.Frame(env); row_resume.pack(fill=tk.X, pady=2)
+        self.train_resume_var = tk.BooleanVar(value=False)
+        self.train_resume_check = ttk.Checkbutton(
+            row_resume, text="从中断处续训", variable=self.train_resume_var,
+            command=self._on_resume_toggled)
+        self.train_resume_check.pack(side=tk.LEFT)
+        self.train_resume_label = ttk.Label(row_resume, text="",
+                                            foreground="#8a95a1")
+        self.train_resume_label.pack(side=tk.LEFT, padx=8)
+        self._refresh_resume_state()
+
         # 训练模式：四个单选（预设数据来自 model_library，与训练脚本共用）
         mode = ttk.LabelFrame(page, text=" 训练模式 ", padding=6)
         mode.pack(fill=tk.X, padx=8, pady=6)
@@ -507,6 +550,28 @@ class BirdCrawlerGUI:
                 row_mode, text=ml.TRAINING_MODE_LABELS[mode_key],
                 value=mode_key, variable=self.train_mode_var,
                 command=self._on_train_mode_changed).pack(side=tk.LEFT, padx=(0, 14))
+
+        # 基础模型：训练起点下拉（内置预置 + 模型库已训练模型），选中后自动带出模型基名
+        row_foundation = ttk.Frame(mode); row_foundation.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row_foundation, text="基础模型:").pack(side=tk.LEFT)
+        self.train_base_model_var = tk.StringVar()
+        self.train_base_model_combo = ttk.Combobox(
+            row_foundation, textvariable=self.train_base_model_var,
+            state="readonly", width=52)
+        self.train_base_model_combo.pack(side=tk.LEFT, padx=4)
+        self.train_base_model_combo.bind(
+            "<<ComboboxSelected>>", self._on_base_model_selected)
+        ttk.Label(row_foundation,
+                  text="（训练起点；选模型库模型即以其权重继续微调）",
+                  foreground="#8a95a1").pack(side=tk.LEFT)
+        self._base_model_id = "resnet50"     # 当前选中的基础模型 id
+        self._refresh_base_model_options()
+
+        # 训练策略说明：随所选基础模型的架构联动刷新（只读提示）
+        self.train_strategy_label = ttk.Label(
+            mode, text="", foreground="#2f6f4f", wraplength=780, justify=tk.LEFT)
+        self.train_strategy_label.pack(anchor=tk.W, pady=(2, 0))
+        self._update_train_strategy_label()
 
         # 模型基名：用于训练产物命名（基名_月日_版本）
         row_base = ttk.Frame(mode); row_base.pack(fill=tk.X, pady=(4, 0))
@@ -558,9 +623,14 @@ class BirdCrawlerGUI:
         ttk.Label(row_custom, text="学习率:").pack(side=tk.LEFT, padx=(10, 0))
         en_lr = ttk.Entry(row_custom, textvariable=self.train_lr_var, width=8)
         en_lr.pack(side=tk.LEFT, padx=2)
+        # 混合精度（AMP）开关：仅自定义模式可手动开关，其余模式按预设固定
+        self.train_amp_var = tk.BooleanVar(value=False)
+        self.cb_amp = ttk.Checkbutton(row_custom, text="混合精度(AMP)",
+                                      variable=self.train_amp_var)
+        self.cb_amp.pack(side=tk.LEFT, padx=(10, 0))
         # 记录自定义参数控件，便于随模式切换统一启用/禁用
         self._custom_param_widgets = [sb_epochs, cb_optimizer,
-                                      sb_patience, sb_batch, en_lr]
+                                      sb_patience, sb_batch, en_lr, self.cb_amp]
 
         # 线程数（与模式无关，始终可用）
         # Windows 下多线程 DataLoader 易出问题，默认 0（主进程加载，最稳）
@@ -569,12 +639,48 @@ class BirdCrawlerGUI:
         ttk.Label(row_workers, text="线程:").pack(side=tk.LEFT)
         ttk.Spinbox(row_workers, from_=0, to=16, textvariable=self.train_workers_var,
                     width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row_workers, text="0=主进程加载(最稳)；GPU 可用时自动使用 CUDA",
+        ttk.Label(row_workers, text="0=自动(按模式推导)；1-16=固定加载进程数",
                   foreground="#8a95a1").pack(side=tk.LEFT, padx=10)
 
         # 保存位置提示：训练产物统一走模型库入库流程，不再自选输出目录
         ttk.Label(params, text=f"模型将保存至模型库：{ml.MODEL_LIBRARY_DIR}",
                   foreground="#8a95a1").pack(anchor=tk.W, pady=(2, 0))
+
+        # 数据划分与评估：4 级划分预设（含自定义）+ 最佳模型判据
+        divide = ttk.LabelFrame(page, text=" 数据划分与评估 ", padding=6)
+        divide.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        row_split = ttk.Frame(divide); row_split.pack(fill=tk.X, pady=2)
+        ttk.Label(row_split, text="划分方式:").pack(side=tk.LEFT)
+        self._split_label_to_key = {v: k for k, v in ml.SPLIT_PRESET_LABELS.items()}
+        self.train_split_var = tk.StringVar(
+            value=ml.SPLIT_PRESET_LABELS["existing"])
+        ttk.Combobox(row_split, textvariable=self.train_split_var,
+                     state="readonly", width=26,
+                     values=list(ml.SPLIT_PRESET_LABELS.values())).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Label(row_split, text="训练:验证:检测 =",
+                  foreground="#8a95a1").pack(side=tk.LEFT, padx=(6, 2))
+        self.train_split_ratio_var = tk.StringVar(value="8,1,1")
+        self.train_split_ratio_entry = ttk.Entry(
+            row_split, textvariable=self.train_split_ratio_var, width=12)
+        self.train_split_ratio_entry.pack(side=tk.LEFT)
+        ttk.Label(row_split, text="（选「使用目录既有划分」时忽略比例）",
+                  foreground="#8a95a1").pack(side=tk.LEFT, padx=6)
+        # 类别极少的场合自动保底（小类全进训练集/不进检测集），无需手工调整
+
+        row_metric = ttk.Frame(divide); row_metric.pack(fill=tk.X, pady=2)
+        ttk.Label(row_metric, text="最佳模型判据:").pack(side=tk.LEFT)
+        self._metric_label_to_key = {
+            v: k for k, v in ml.SELECT_METRIC_OPTIONS.items()}
+        self.train_metric_var = tk.StringVar(
+            value=ml.SELECT_METRIC_OPTIONS["top1_acc"])
+        ttk.Combobox(row_metric, textvariable=self.train_metric_var,
+                     state="readonly", width=24,
+                     values=list(ml.SELECT_METRIC_OPTIONS.values())).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Label(row_metric, text="（按该指标保存最佳模型并驱动早停）",
+                  foreground="#8a95a1").pack(side=tk.LEFT, padx=6)
 
         # 初始化说明文字与自定义参数可用状态
         self._on_train_mode_changed()
@@ -594,19 +700,239 @@ class BirdCrawlerGUI:
                                              command=self._open_train_out,
                                              state=tk.DISABLED)
         self.train_open_out_btn.pack(side=tk.LEFT, padx=6)
+        self.train_log_btn = ttk.Button(btns, text="打开日志文件",
+                                        command=self._open_train_log,
+                                        state=tk.DISABLED)
+        self.train_log_btn.pack(side=tk.LEFT, padx=6)
+        self._train_log_path = None   # 当前训练日志文件路径（结束后定位）
 
-        # 训练进程输出（终端日志实时显示）
+        # 每轮验证指标表：结构化展示（解析训练子进程的 [METRIC] 行，实时刷新）
+        ttk.Label(page, text="每轮验证指标（实时解析训练进程输出）",
+                  padding=(10, 6, 0, 0)).pack(anchor=tk.W)
+        metric_cols = ("epoch", "train_loss", "val_loss",
+                       "top1", "top5", "macro_f1", "best")
+        metric_heads = ("轮次", "训练损失", "验证损失", "Top-1", "Top-5", "宏F1", "最佳")
+        metric_widths = (60, 90, 90, 80, 80, 80, 60)
+        metric_wrap = ttk.Frame(page)
+        metric_wrap.pack(fill=tk.X, padx=8)
+        self.train_metric_tree = ttk.Treeview(
+            metric_wrap, columns=metric_cols, show="headings", height=6)
+        for col, head, w in zip(metric_cols, metric_heads, metric_widths):
+            self.train_metric_tree.heading(col, text=head)
+            self.train_metric_tree.column(col, width=w, anchor=tk.CENTER)
+        metric_scroll = ttk.Scrollbar(metric_wrap, orient=tk.VERTICAL,
+                                      command=self.train_metric_tree.yview)
+        self.train_metric_tree.configure(yscrollcommand=metric_scroll.set)
+        self.train_metric_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        metric_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # 最佳轮次行高亮
+        self.train_metric_tree.tag_configure("best_row", background="#eaf7ee",
+                                             foreground="#1d6b3a")
+
+        # 训练进程输出（终端日志实时显示）；在滚动容器内用固定行高保证可见
         ttk.Label(page, text="训练进程输出（实时显示终端日志）",
                   padding=(10, 6, 0, 0)).pack(anchor=tk.W)
         self.train_log = scrolledtext.ScrolledText(page, state=tk.DISABLED,
                                                    font=("Consolas", 9),
-                                                   bg="#101418", fg="#d4e2d4")
-        self.train_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+                                                   bg="#101418", fg="#d4e2d4",
+                                                   height=14)
+        self.train_log.pack(fill=tk.X, padx=8, pady=(2, 10))
 
     def _on_train_mode_changed(self) -> None:
         """训练模式切换回调：刷新说明区文字并切换自定义参数可用状态。"""
         self._update_mode_description()
         self._apply_custom_param_state()
+
+    def _refresh_base_model_options(self) -> None:
+        """重建基础模型下拉选项：内置预置在前，模型库已训练模型按时间倒序在后。
+
+        模型库读取失败时仅保留内置两项，不影响训练界面可用性。
+        调用时机：训练页初始化、训练正常结束（新模型入库后）。
+        """
+        options = [("resnet50", "ResNet50（ImageNet 预训练）[内置预置]"),
+                   ("vit_bird_525", "525类鸟类ViT（本地预置）[内置预置]")]
+        try:
+            records = ml.list_models()
+        except Exception:
+            records = []
+        for record in records:
+            name = str(record.get("name") or "")
+            if not name:
+                continue
+            # 指标文本按记录的主指标名格式化（旧记录默认 Top-1）
+            metric_text = ml.format_metric_value(record.get("metric_name"),
+                                                 record.get("accuracy"))
+            acc_text = f"（{metric_text}）" if metric_text != "—" else ""
+            # 仅入库管理的架构不能作为训练起点，直接标注避免误选
+            architecture = str(record.get("architecture") or "resnet50")
+            trainable = architecture in ("resnet50", "vit_bird_525",
+                                         "vit_hf", "resnest101")
+            suffix = "「模型库」" if trainable else "「模型库·不可作训练起点」"
+            options.append((name, f"{name} {acc_text}{suffix}"))
+        self._base_model_options = options
+        combo = getattr(self, "train_base_model_combo", None)
+        if combo is None:
+            return
+        combo["values"] = [display for _, display in options]
+        current = getattr(self, "_base_model_id", "resnet50")
+        matched = [display for model_id, display in options if model_id == current]
+        if not matched:      # 原选中项已被删除（如库内模型被删）：回退内置 ResNet50
+            current = "resnet50"
+            matched = [options[0][1]]
+        self._base_model_id = current
+        self.train_base_model_var.set(matched[0])
+        self._update_train_strategy_label()
+
+    def _on_base_model_selected(self, _event=None) -> None:
+        """基础模型选中回调：记录 id，并把模型基名自动填为其基名（用户可再手改）。"""
+        display = self.train_base_model_var.get()
+        for model_id, disp in getattr(self, "_base_model_options", []):
+            if disp == display:
+                self._base_model_id = model_id
+                break
+        else:
+            return
+        try:
+            record = ml.get_model(model_id)   # 内置条目也能查到
+        except Exception:
+            record = None
+        base_name = (record or {}).get("base_name") or ""
+        if base_name:
+            self.train_model_base_var.set(base_name)
+        self._update_train_strategy_label()
+
+    def _update_train_strategy_label(self) -> None:
+        """按所选基础模型的架构刷新「训练策略」说明文字。"""
+        label = getattr(self, "train_strategy_label", None)
+        if label is None:
+            return
+        model_id = getattr(self, "_base_model_id", "resnet50")
+        architecture = "resnet50"
+        if model_id == "vit_bird_525":
+            architecture = "vit_bird_525"
+        else:
+            try:
+                record = ml.get_model(model_id)
+            except Exception:
+                record = None
+            if record:
+                architecture = str(record.get("architecture") or "resnet50")
+        label.config(text=f"训练策略：{ml.get_strategy_summary(architecture)}")
+
+    # ---------- 中断续训 ----------
+    def _load_last_interrupted(self) -> dict | None:
+        """读取模型库目录下的中断提示文件（断点目录缺失或无效时返回 None）。"""
+        path = ml.MODEL_LIBRARY_DIR / "last_interrupted.json"
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        # 断点目录必须仍存在且含 resume_state.pth，否则视为无效记录
+        out_dir = Path(str(data.get("out_dir") or ""))
+        if not (out_dir / "resume_state.pth").is_file():
+            return None
+        return data
+
+    def _refresh_resume_state(self) -> None:
+        """刷新「从中断处续训」的可用状态与断点信息提示。"""
+        check = getattr(self, "train_resume_check", None)
+        label = getattr(self, "train_resume_label", None)
+        if check is None or label is None:
+            return
+        info = self._load_last_interrupted()
+        if info:
+            check.config(state=tk.NORMAL)
+            label.config(
+                text=f"检测到断点：{info.get('model_name') or '—'}"
+                     f"（已完成 {info.get('completed_epoch')} 轮，"
+                     f"{info.get('timestamp') or '—'}）",
+                foreground="#b06a00")
+        else:
+            check.config(state=tk.DISABLED)
+            if self.train_resume_var.get():
+                self.train_resume_var.set(False)
+            label.config(text="暂无中断记录", foreground="#8a95a1")
+
+    def _on_resume_toggled(self) -> None:
+        """续训勾选回调：展示断点信息并确认续训语义。"""
+        if not self.train_resume_var.get():
+            return
+        info = self._load_last_interrupted()
+        if not info:
+            self.train_resume_var.set(False)
+            messagebox.showinfo("提示", "无可用的中断记录（需先有一次被中断的训练）。")
+            return
+        messagebox.showinfo(
+            "续训确认",
+            f"将从断点继续训练：\n{info.get('out_dir')}\n"
+            f"已完成 {info.get('completed_epoch')} 轮，"
+            f"最佳 {info.get('metric_name')} = {info.get('best_metric')}\n\n"
+            f"续训会沿用断点中的基础模型、数据划分与随机种子，"
+            f"「轮数」表示总目标轮数。")
+
+    def _open_train_log(self) -> None:
+        """用系统默认程序打开当前训练的日志文件。"""
+        path = getattr(self, "_train_log_path", None)
+        if not path or not Path(path).is_file():
+            messagebox.showinfo("提示", "暂无训练日志文件（先启动一次训练）。")
+            return
+        try:
+            os.startfile(str(path))  # noqa: S606
+        except OSError as exc:
+            messagebox.showerror("错误", f"打开日志文件失败：{exc}")
+
+    # ---------- 每轮验证指标表 ----------
+    def _clear_metric_table(self) -> None:
+        """清空每轮验证指标表。"""
+        tree = getattr(self, "train_metric_tree", None)
+        if tree is not None:
+            tree.delete(*tree.get_children())
+
+    def _append_metric_row(self, payload: dict) -> None:
+        """把一条 [METRIC] 结构化指标追加到每轮验证指标表。"""
+        tree = getattr(self, "train_metric_tree", None)
+        if tree is None:
+            return
+
+        def fmt(key: str) -> str:
+            value = payload.get(key)
+            return f"{value:.4f}" if isinstance(value, (int, float)) else "—"
+
+        is_best = bool(payload.get("is_best"))
+        values = (payload.get("epoch", "—"), fmt("train_loss"), fmt("val_loss"),
+                  fmt("top1"), fmt("top5"), fmt("macro_f1"),
+                  "★" if is_best else "")
+        tags = ("best_row",) if is_best else ()
+        tree.insert("", tk.END, values=values, tags=tags)
+        children = tree.get_children()
+        if children:
+            tree.see(children[-1])
+
+    def _replay_metric_history(self, out_dir: Path) -> None:
+        """续训时回放断点目录中的 training_history.json 到指标表。"""
+        hist_path = out_dir / "training_history.json"
+        if not hist_path.is_file():
+            return
+        try:
+            history = json.loads(hist_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        for item in history if isinstance(history, list) else []:
+            if not isinstance(item, dict):
+                continue
+            self._append_metric_row({
+                "epoch": item.get("epoch"),
+                "train_loss": item.get("train_loss"),
+                "val_loss": item.get("val_loss"),
+                "top1": item.get("top1_acc"),
+                "top5": item.get("top5_acc"),
+                "macro_f1": item.get("macro_f1"),
+                "is_best": item.get("is_best"),
+            })
 
     def _update_mode_description(self) -> None:
         """把当前模式的预设信息（轮数/优化器/耐心值/批大小/学习率/说明）写入说明区。"""
@@ -625,12 +951,23 @@ class BirdCrawlerGUI:
             batch_text = "按设备自适应" if batch_value is None else str(batch_value)
         lr_value = preset.get("lr")
         lr_text = f"{lr_value:g}" if isinstance(lr_value, (int, float)) else "—"
+        # 混合精度显示：True=固定开启；auto=有 GPU 时自动开启；False=关闭
+        amp_value = preset.get("amp")
+        if amp_value is True:
+            amp_text = "开启"
+        elif amp_value == "auto":
+            amp_text = "有 GPU 时自动开启"
+        else:
+            amp_text = "关闭（自定义模式可勾选）" if key == "custom" else "关闭"
+        workers_text = preset.get("workers_hint", "—")
         lines = [
             f"轮数：{epochs_text}",
             f"优化器：{preset.get('optimizer', '—')}",
             f"耐心值：{patience_text}",
             f"批大小：{batch_text}",
             f"学习率：{lr_text}",
+            f"混合精度：{amp_text}",
+            f"数据加载线程：{workers_text}",
             f"说明：{preset.get('description', '')}",
         ]
         box = self.train_mode_desc
@@ -739,13 +1076,62 @@ class BirdCrawlerGUI:
             messagebox.showerror("错误", "模型基名只能包含字母、数字、下划线或连字符。")
             return
         mode = self.train_mode_var.get()
+        # 数据划分方式：既有划分（默认）或按比例自动划分（4 级预设 + 自定义）
+        split_label = self.train_split_var.get()
+        split_key = self._split_label_to_key.get(split_label, "existing")
+        ratio_text = self.train_split_ratio_var.get().strip()
+        use_auto_split = split_key != "existing"
+        if use_auto_split:
+            preset_ratio = ml.SPLIT_PRESETS.get(split_key, {}).get("ratio")
+            if split_key == "custom":
+                try:
+                    parts = [float(x) for x in ratio_text.replace("：", ":").split(",")]
+                except ValueError:
+                    messagebox.showerror("错误", "自定义比例需为三个数字，如 8,1,1。")
+                    return
+                if len(parts) != 3 or any(v < 0 for v in parts) or parts[0] <= 0 \
+                        or sum(parts) <= 0:
+                    messagebox.showerror(
+                        "错误", "自定义比例需为三个非负数且训练比例大于 0（如 8,1,1）。")
+                    return
+                ratio_arg = ",".join(f"{v:g}" for v in parts)
+            else:
+                # 预设比例：同步显示到输入框，便于用户查看/微调
+                ratio_arg = ",".join(f"{v:g}" for v in (preset_ratio or (8, 1, 1)))
+                self.train_split_ratio_var.set(ratio_arg)
+        # 最佳模型判据（默认 Top-1）
+        metric_key = self._metric_label_to_key.get(self.train_metric_var.get(), None)
+        # 续训：勾选时改用 --resume，指向断点目录（不再新开版本号）
+        resume_dir = None
+        if self.train_resume_var.get():
+            info = self._load_last_interrupted()
+            if not info:
+                messagebox.showerror("错误", "无可用的中断记录，无法续训。")
+                return
+            resume_dir = str(info.get("out_dir") or "")
+
         cmd = [self._train_python(), str(BASE_DIR / "model_trainer.py"),
                "--data-dir", data_dir,
-               "--mode", mode,
-               "--model-name", base_name,
+               "--base-model", getattr(self, "_base_model_id", "resnet50"),
                "--workers", str(self.train_workers_var.get())]
-        if mode == "custom":
-            # 自定义参数校验：轮数≥1、耐心值≥0、批大小≥1、学习率>0
+        if resume_dir:
+            # 续训：写入同一断点目录；--epochs 表示总目标轮数
+            cmd += ["--resume", resume_dir]
+            self._replay_metric_history(Path(resume_dir))
+            self._train_log_path = Path(resume_dir) / "train_log.txt"
+            if getattr(self, "train_log_btn", None) is not None:
+                self.train_log_btn.config(state=tk.NORMAL)
+        else:
+            # 全新训练：模式化入库流程（自动取号），并清空指标表
+            cmd += ["--mode", mode, "--model-name", base_name]
+            self._clear_metric_table()
+        if use_auto_split:
+            cmd += ["--auto-split", "--split-ratio", ratio_arg]
+        if metric_key:
+            cmd += ["--select-metric", metric_key]
+        if mode == "custom" or resume_dir:
+            # 自定义模式：校验并传入轮数/优化器/耐心值/批大小/学习率
+            # 续训：只传轮数（总目标轮数），其余参数从断点快照恢复
             try:
                 epochs = int(self.train_epochs_var.get())
                 patience = int(self.train_patience_var.get())
@@ -766,12 +1152,16 @@ class BirdCrawlerGUI:
             if lr <= 0:
                 messagebox.showerror("错误", "学习率必须大于 0。")
                 return
-            cmd += ["--epochs", str(epochs),
-                    "--optimizer", self.train_optimizer_var.get(),
-                    "--patience", str(patience),
-                    "--batch-size", str(batch),
-                    "--lr", str(lr)]
-        self._run_train_subprocess(cmd, label="开始训练")
+            cmd += ["--epochs", str(epochs)]
+            if not resume_dir:
+                cmd += ["--optimizer", self.train_optimizer_var.get(),
+                        "--patience", str(patience),
+                        "--batch-size", str(batch),
+                        "--lr", str(lr)]
+        # 自定义模式：勾选混合精度时显式传 --amp（其余模式按预设固定，不由 GUI 传参）
+        if mode == "custom" and self.train_amp_var.get():
+            cmd += ["--amp"]
+        self._run_train_subprocess(cmd, label="续训" if resume_dir else "开始训练")
 
     def _run_train_subprocess(self, cmd: list[str], label: str) -> None:
         """启动训练相关子进程并接管道，后台线程把输出放入队列。
@@ -813,10 +1203,19 @@ class BirdCrawlerGUI:
         self.train_queue.put(f"\n[训练进程已结束 rc={rc}]\n")
 
     def _poll_train_queue(self) -> None:
-        """主循环定时器：刷新训练日志并在进程结束后复位按钮状态。"""
+        """主循环定时器：刷新训练日志并在进程结束后复位按钮状态。
+
+        [METRIC] 前缀行是结构化指标输出（不写入文本日志区，转为核心指标表刷新）。
+        """
         try:
             while True:
                 line = self.train_queue.get_nowait()
+                if line.startswith("[METRIC] "):
+                    try:
+                        self._append_metric_row(json.loads(line[len("[METRIC] "):]))
+                    except (ValueError, TypeError):
+                        pass
+                    continue
                 self._append_train_log(line)
                 if "[训练进程已结束" in line:
                     self.train_start_btn.config(state=tk.NORMAL)
@@ -825,17 +1224,27 @@ class BirdCrawlerGUI:
                     # 训练结束后恢复模型库删除按钮
                     if getattr(self, "model_del_btn", None) is not None:
                         self.model_del_btn.config(state=tk.NORMAL)
+                    # 定位最新产物日志文件，供「打开日志文件」按钮使用
+                    self._locate_latest_train_log()
+                    # 刷新续训断点可用状态（中断后新出现断点即可勾选）
+                    self._refresh_resume_state()
                     # 返回码约定：0 正常（联动刷新模型库）/ 130 用户中断 / 其他异常高亮
                     m = re.search(r"rc=(\d+)", line)
                     if m:
                         rc = int(m.group(1))
                         if rc == 0:
-                            # 正常结束：训练完成的模型已由脚本入库，联动刷新模型库列表
+                            # 正常结束：训练完成的模型已由脚本入库，联动刷新
+                            # 模型库列表与训练页基础模型下拉（新模型可被选作微调起点）
                             try:
                                 self.refresh_models()
                             except Exception as exc:
                                 self._append_train_log(
                                     f"[提示] 刷新模型库失败：{exc}\n")
+                            try:
+                                self._refresh_base_model_options()
+                            except Exception as exc:
+                                self._append_train_log(
+                                    f"[提示] 刷新基础模型列表失败：{exc}\n")
                         elif rc != 130:
                             self._append_train_log(
                                 f"[提示] 训练进程异常退出（返回码 {rc}），"
@@ -854,6 +1263,22 @@ class BirdCrawlerGUI:
         """打开模型库根目录（训练产物统一入库，目录不存在则创建）。"""
         ml.MODEL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
         os.startfile(str(ml.MODEL_LIBRARY_DIR))  # noqa: S606
+
+    def _locate_latest_train_log(self) -> None:
+        """定位模型库中最新产物目录的 train_log.txt，供「打开日志文件」使用。"""
+        try:
+            candidates = list(ml.MODEL_LIBRARY_DIR.glob("*/train_log.txt"))
+        except OSError:
+            candidates = []
+        if not candidates:
+            return
+        try:
+            latest = max(candidates, key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return
+        self._train_log_path = latest
+        if getattr(self, "train_log_btn", None) is not None:
+            self.train_log_btn.config(state=tk.NORMAL)
 
     def _append_train_log(self, text: str) -> None:
         """向训练日志框追加文本并滚动到底部。"""
@@ -888,12 +1313,12 @@ class BirdCrawlerGUI:
         main = ttk.Frame(page)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # 列表区：模型名称/类别数/验证精度/日期版本/来源/激活标记
+        # 列表区：模型名称/类别数/架构/主指标/日期版本/来源/激活标记
         left = ttk.Frame(main)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=(0, 6))
-        columns = ("name", "classes", "accuracy", "date_ver", "source", "active")
-        headers = ("模型名称", "类别数", "验证精度", "日期版本", "来源", "激活")
-        widths = (230, 70, 90, 140, 100, 50)
+        columns = ("name", "classes", "architecture", "accuracy", "date_ver", "source", "active")
+        headers = ("模型名称", "类别数", "架构", "主指标", "日期版本", "来源", "激活")
+        widths = (210, 60, 150, 120, 120, 90, 50)
         self.model_tree = ttk.Treeview(left, columns=columns, show="headings",
                                        height=20)
         for col, head, w in zip(columns, headers, widths):
@@ -941,32 +1366,38 @@ class BirdCrawlerGUI:
         selected = self._selected_model_name()
         tree.delete(*tree.get_children())
         try:
-            models = ml.list_models()
+            models = ml.list_models(include_builtin=True)
             active_record = ml.get_active_species_model()
         except Exception as exc:
             messagebox.showerror("错误", f"读取模型注册表失败：{exc}")
             return
         active_name = active_record.get("name") if active_record else None
         if not models:
-            tree.insert("", tk.END, values=("（模型库为空）", "—", "—", "—", "—", ""),
+            tree.insert("", tk.END,
+                        values=("（模型库为空）", "—", "—", "—", "—", "—", ""),
                         tags=())
         for record in models:
             name = str(record.get("name") or "")
             classes = record.get("class_count")
             accuracy = record.get("accuracy")
-            if isinstance(accuracy, (int, float)):
-                accuracy_text = f"{accuracy * 100:.2f}%"
+            # 主指标显示：按记录里的 metric_name 格式化（旧记录默认 Top-1）
+            accuracy_text = ml.format_metric_value(record.get("metric_name"), accuracy)
+            # 架构显示名（旧记录缺字段按 resnet50 兜底，经 get_architecture_info 归一）
+            arch_text = ml.get_architecture_info(
+                record.get("architecture")).get("display_name", "—")
+            if record.get("builtin"):
+                # 内置预置条目：无日期版本，激活列恒空
+                date_ver = "—"
             else:
-                accuracy_text = "—"
-            try:
-                version_text = f"v{int(record.get('version')):03d}"
-            except (TypeError, ValueError):
-                version_text = "—"
-            date_ver = f"{record.get('date_str') or '—'} {version_text}"
+                try:
+                    version_text = f"v{int(record.get('version')):03d}"
+                except (TypeError, ValueError):
+                    version_text = "—"
+                date_ver = f"{record.get('date_str') or '—'} {version_text}"
             is_active = bool(name) and name == active_name
             values = (name,
                       classes if classes is not None else "—",
-                      accuracy_text, date_ver,
+                      arch_text, accuracy_text, date_ver,
                       record.get("source") or "—",
                       "★" if is_active else "")
             tags = ("active_row",) if is_active else ()
@@ -980,6 +1411,8 @@ class BirdCrawlerGUI:
                     break
             else:
                 self._clear_model_preview()
+        # 模型库变化需同步到训练页「基础模型」下拉（导入/删除后立即生效，无需重启）
+        self._refresh_base_model_options()
 
     def _selected_model_name(self) -> str | None:
         """取列表当前选中行的模型名称；未选中返回 None。"""
@@ -1013,13 +1446,27 @@ class BirdCrawlerGUI:
         if record:
             mode_key = record.get("mode")
             mode_text = ml.TRAINING_MODE_LABELS.get(mode_key, mode_key or "—")
+            arch_info = ml.get_architecture_info(record.get("architecture"))
+            detect_text = "可推理" if arch_info.get("inference_supported") else "仅管理"
             lines = [
                 f"名称：{record.get('name') or '—'}",
+                f"架构：{arch_info.get('display_name', '—')}（{detect_text}）",
+                f"任务：{record.get('task_type') or arch_info.get('task_type', '—')}",
+                f"类别数：{record.get('class_count', '—')}",
+                f"主指标：{ml.format_metric_value(record.get('metric_name'), record.get('accuracy'))}",
                 f"模式：{mode_text}",
                 f"注册时间：{record.get('trained_at') or '—'}",
                 f"来源：{record.get('source') or '—'}",
                 f"路径：{record.get('path') or '—'}",
             ]
+            # 全部评估指标（若有）逐项列出，便于对比不同判据下的表现
+            metrics = record.get("metrics")
+            if isinstance(metrics, dict) and metrics:
+                metric_text = "，".join(
+                    ml.format_metric_value(k, v) for k, v in metrics.items())
+                lines.append(f"全部指标：{metric_text}")
+            if record.get("builtin") and record.get("note"):
+                lines.append(f"说明：{record['note']}")
             self.model_info_label.config(text="\n".join(lines))
         else:
             self.model_info_label.config(text="")
@@ -1066,6 +1513,9 @@ class BirdCrawlerGUI:
             messagebox.showinfo("提示", "请先在列表中选择要删除的模型。")
             return
         record = ml.get_model(name)
+        if record and record.get("builtin"):
+            messagebox.showinfo("提示", "「内置预置」模型随软件提供，不可删除。")
+            return
         model_path = record.get("path") if record else None
         if model_path:
             message = f"确定删除模型「{name}」吗？\n将同时删除模型目录：\n{model_path}"
@@ -1105,6 +1555,9 @@ class BirdCrawlerGUI:
             messagebox.showinfo("提示", "请先在列表中选择模型。")
             return
         record = ml.get_model(name)
+        if record and record.get("builtin") and not (record.get("path") or "").strip():
+            messagebox.showinfo("提示", "「内置预置」模型无独立目录（权重随程序提供）。")
+            return
         model_path = record.get("path") if record else None
         if model_path and Path(model_path).is_dir():
             os.startfile(str(model_path))  # noqa: S606
@@ -1112,64 +1565,234 @@ class BirdCrawlerGUI:
             messagebox.showerror("错误", "模型目录不存在或已被移动。")
 
     def _import_external_model(self) -> None:
-        """导入外部模型目录：选目录 → 校验必需文件 → 填类别数 → 注册入库。"""
+        """导入外部模型：选目录或单文件 → 探测架构/标签 → 确认后注册入库。
+
+        支持三类来源（任一即可）：
+          ① 训练产物目录（含 best_model.pt / last_model.pt）；
+          ② HuggingFace 模型目录（config.json + 权重文件）；
+          ③ 任意 .pt/.pth/.safetensors/.bin 权重文件（自动在模型库建目录归档）。
+        识别出的架构可在确认对话框中手动改选；不支持的架构仅入库管理。
+        """
         src = filedialog.askdirectory(
-            title="选择外部模型目录（需含 best_model.pt 或 last_model.pt 与 labels.json）")
+            title="选择外部模型目录（支持训练产物 / HuggingFace目录 / 含权重文件的目录）")
         if not src:
             return
         src_dir = Path(src)
-        # 校验 1：目录内需存在权重文件 best_model.pt 或 last_model.pt
-        if not any((src_dir / n).is_file() for n in ("best_model.pt", "last_model.pt")):
-            messagebox.showerror(
-                "错误", "所选目录中未找到 best_model.pt 或 last_model.pt，无法导入。")
+        ok, note, candidates = ml.validate_import_source(src_dir)
+        if not ok:
+            # 目录内无可识别权重：引导用户改为选择单个权重文件
+            if not messagebox.askyesno(
+                    "未找到权重文件",
+                    f"{note}\n\n是否改为选择单个权重文件（.pt / .pth / .safetensors）？"):
+                return
+            picked = filedialog.askopenfilename(
+                title="选择模型权重文件",
+                filetypes=[("模型权重", "*.pt *.pth *.safetensors *.bin"),
+                           ("所有文件", "*.*")])
+            if not picked:
+                return
+            staged = self._stage_weight_file(Path(picked))
+            if staged is None:
+                return
+            src_dir = staged
+            ok, note, candidates = ml.validate_import_source(src_dir)
+            if not ok:
+                messagebox.showerror("错误", f"导入失败：{note}")
+                return
+        # 目录内含多个权重且无单一模型标识（best/last/HF 配置）时，让用户指定具体文件
+        has_single_marker = any((src_dir / n).is_file()
+                                for n in ("best_model.pt", "last_model.pt")) \
+            or ml.has_hf_config(src_dir)
+        if not has_single_marker and len(candidates) > 1:
+            picked = filedialog.askopenfilename(
+                title="该目录含多个权重文件，请选择要导入的一个",
+                initialdir=str(src_dir),
+                filetypes=[("模型权重", "*.pt *.pth *.safetensors *.bin"),
+                           ("所有文件", "*.*")])
+            if not picked:
+                return
+            staged = self._stage_weight_file(Path(picked))
+            if staged is None:
+                return
+            src_dir = staged
+            ok, note, candidates = ml.validate_import_source(src_dir)
+            if not ok:
+                messagebox.showerror("错误", f"导入失败：{note}")
+                return
+        # 探测架构（尽力而为；无 torch 时按目录特征启发，用户可在对话框改选）
+        weight_path = candidates[0] if candidates else None
+        arch_key, arch_note = self._probe_architecture(src_dir, weight_path)
+        # 自动生成类别标签（labels.json 已存在时不覆盖）
+        labels = ml.build_labels_auto(src_dir)
+        class_count = len(labels) if labels else None
+        # 弹确认对话框：架构下拉 + 类别数
+        confirmed = self._ask_import_confirm(src_dir, arch_key, arch_note, class_count)
+        if confirmed is None:
             return
-        # 校验 2：目录内需存在类别标签文件 labels.json
+        arch_key, class_count = confirmed
+        # 落盘 labels.json（目录内已有则保留原文件）
         if not (src_dir / "labels.json").is_file():
-            messagebox.showerror(
-                "错误", "所选目录中未找到 labels.json（类别标签文件），无法导入。")
-            return
-        # 询问类别数（尽量从 labels.json 预填）
-        class_count = self._ask_model_class_count(src_dir)
-        if class_count is None:
-            return  # 用户取消
-        # 注册进模型库（来源标记为「外部注册」）
+            generated = ml.build_labels_auto(src_dir, class_count=class_count)
+            if generated:
+                try:
+                    (src_dir / "labels.json").write_text(
+                        json.dumps(generated, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                except OSError as exc:
+                    messagebox.showerror("错误", f"写入 labels.json 失败：{exc}")
+                    return
+        # 注册进模型库
         try:
             record = ml.register_model(src_dir, class_count=class_count,
-                                       source="外部注册")
+                                       source="外部注册", architecture=arch_key)
         except (ValueError, OSError) as exc:
             messagebox.showerror("错误", f"导入失败：{exc}")
             return
         self.refresh_models()
-        messagebox.showinfo("导入成功", f"已注册外部模型：{record.get('name')}")
+        info = ml.get_architecture_info(arch_key)
+        extra = "" if info.get("inference_supported") \
+            else "\n注意：该架构仅入库管理，视觉分析页不可调用。"
+        messagebox.showinfo("导入成功",
+                            f"已注册外部模型：{record.get('name')}\n"
+                            f"架构：{info['display_name']}{extra}")
 
-    def _ask_model_class_count(self, model_dir: Path) -> int | None:
-        """弹出模态对话框询问外部模型的类别数；取消或关闭返回 None。
+    def _stage_weight_file(self, picked: Path) -> Path | None:
+        """把单个权重文件归档到模型库新建目录，返回目录路径（失败返回 None）。
 
-        尝试从 labels.json 预填类别数（列表长度或字典键数）。
+        目录名按 基名_M月D日_NNN 规则取号；.safetensors 保持标准名
+        model.safetensors，其余统一复制为 best_model.pt，便于视觉系统按既有
+        约定（best_model.pt / model.safetensors）定位权重。
+        同时复制同目录下的标签/配置旁路文件（labels.json、label_mapping.txt、
+        config.json 等），以便自动生成类别映射。
         """
-        prefill = ""
+        if not picked.is_file():
+            messagebox.showerror("错误", f"权重文件不存在：{picked}")
+            return None
+        base = re.sub(r"[^A-Za-z0-9_\-]", "_", picked.stem) or "external_model"
+        dir_name, _date_str, _ver = ml.next_model_name(base)
+        target_dir = ml.MODEL_LIBRARY_DIR / dir_name
         try:
-            with open(model_dir / "labels.json", "r", encoding="utf-8") as f:
-                labels = json.load(f)
-            if isinstance(labels, (list, dict)):
-                prefill = str(len(labels))
-        except (OSError, ValueError):
-            prefill = ""
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if picked.suffix.lower() == ".safetensors":
+                dest = target_dir / "model.safetensors"
+            else:
+                dest = target_dir / "best_model.pt"
+            shutil.copy2(picked, dest)
+            # 归档旁路文件：标签映射与 HF 配置，供类别数/类别名自动推断
+            for name in ("labels.json", "label_mapping.txt", "labels.txt",
+                         "classes.txt", "class_names.json", "config.json",
+                         "preprocessor_config.json"):
+                side = picked.parent / name
+                if side.is_file() and not (target_dir / name).exists():
+                    try:
+                        shutil.copy2(side, target_dir / name)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            messagebox.showerror("错误", f"归档权重文件失败：{exc}")
+            return None
+        return target_dir
+
+    def _probe_architecture(self, src_dir: Path, weight_path) -> tuple:
+        """尽力探测模型架构，返回 (架构键, 说明文本)。
+
+        优先按权重键名精确识别（safetensors 无需 torch；.pt/.pth 需 torch）；
+        GUI 进程通常无 torch，此时退化为目录特征启发式。
+        """
+        # 1. safetensors：safe_open 可直接读键名，不依赖 torch
+        if weight_path is not None and str(weight_path).lower().endswith(".safetensors"):
+            try:
+                from safetensors import safe_open  # type: ignore
+                with safe_open(str(weight_path), framework="pt") as handle:
+                    keys = list(handle.keys())
+                return ml.detect_architecture(keys), "按 safetensors 键名识别"
+            except Exception:
+                pass
+        # 2. torch 可用时读取权重键名精确识别
+        try:
+            import torch  # type: ignore
+            if weight_path is not None and Path(weight_path).suffix.lower() in (".pt", ".pth", ".bin"):
+                try:
+                    ckpt = torch.load(str(weight_path), map_location="cpu",
+                                      weights_only=True)
+                except Exception:
+                    ckpt = torch.load(str(weight_path), map_location="cpu",
+                                      weights_only=False)
+                for key in ("state_dict", "model_state_dict", "model_state",
+                            "model", "weights"):
+                    if isinstance(ckpt, dict) and isinstance(ckpt.get(key), dict):
+                        ckpt = ckpt[key]
+                        break
+                if isinstance(ckpt, dict) and ckpt:
+                    return ml.detect_architecture(ckpt), "按权重键名识别"
+        except Exception:
+            pass
+        # 3. 目录特征启发式（无 torch 时的兜底）
+        if ml.has_hf_config(src_dir):
+            return "vit_hf", "按 HuggingFace 目录结构推断（可手动改选）"
+        return "resnet50", "未能读取权重，按默认 ResNet50 处理（可手动改选）"
+
+    def _ask_import_confirm(self, model_dir: Path, arch_key: str,
+                            arch_note: str, class_count) -> tuple | None:
+        """导入确认对话框：架构下拉 + 类别数输入；取消或关闭返回 None。
+
+        返回 (架构键, 类别数)。
+        """
+        keys = list(ml.ARCHITECTURE_REGISTRY.keys())
+        display_to_key = {ml.ARCHITECTURE_REGISTRY[k]["display_name"]: k for k in keys}
+        names = [ml.ARCHITECTURE_REGISTRY[k]["display_name"] for k in keys]
+        default_display = ml.ARCHITECTURE_REGISTRY.get(
+            arch_key, ml.ARCHITECTURE_REGISTRY["generic"])["display_name"]
 
         dialog = tk.Toplevel(self.root)
         dialog.title("导入外部模型")
         dialog.resizable(False, False)
-        ttk.Label(dialog, text=f"模型目录：{model_dir.name}\n"
-                               f"请输入该模型的类别数（正整数）：",
-                  padding=(16, 12)).pack()
-        count_var = tk.StringVar(value=prefill)
-        entry = ttk.Entry(dialog, textvariable=count_var, width=12)
-        entry.pack(padx=16, pady=(0, 10))
+        ttk.Label(dialog, text=f"模型目录：{model_dir.name}",
+                  padding=(16, 12), justify=tk.LEFT).pack(anchor=tk.W)
+        ttk.Label(dialog, text=f"识别说明：{arch_note}",
+                  padding=(16, 0), foreground="#8a95a1").pack(anchor=tk.W)
+
+        # 架构下拉
+        row1 = ttk.Frame(dialog)
+        row1.pack(fill=tk.X, padx=16, pady=(10, 0))
+        ttk.Label(row1, text="模型架构：").pack(side=tk.LEFT)
+        arch_var = tk.StringVar(value=default_display)
+        ttk.Combobox(row1, textvariable=arch_var, values=names,
+                     state="readonly", width=32).pack(side=tk.LEFT)
+
+        # 任务类型 / 可推理性提示（随下拉联动刷新）
+        tip_var = tk.StringVar()
+        ttk.Label(dialog, textvariable=tip_var, padding=(16, 6),
+                  foreground="#b06a00", wraplength=360,
+                  justify=tk.LEFT).pack(anchor=tk.W)
+
+        def _update_tip(*_args) -> None:
+            """按当前所选架构刷新提示文本。"""
+            info = ml.ARCHITECTURE_REGISTRY.get(
+                display_to_key.get(arch_var.get(), "generic"), {})
+            if info.get("inference_supported"):
+                tip_var.set(f"任务类型：{info.get('task_type')}；"
+                            f"可在视觉分析页调用推理。")
+            else:
+                tip_var.set(f"任务类型：{info.get('task_type')}；"
+                            f"该架构仅入库管理，视觉分析页不可调用。")
+
+        arch_var.trace_add("write", _update_tip)
+        _update_tip()
+
+        # 类别数（预填自动推断值）
+        row2 = ttk.Frame(dialog)
+        row2.pack(fill=tk.X, padx=16, pady=(4, 0))
+        ttk.Label(row2, text="类别数：").pack(side=tk.LEFT)
+        count_var = tk.StringVar(value=str(class_count) if class_count else "")
+        entry = ttk.Entry(row2, textvariable=count_var, width=12)
+        entry.pack(side=tk.LEFT)
         entry.focus_set()
+
         result: dict = {"value": None}
 
         def _confirm() -> None:
-            """确定：校验为正整数后关闭对话框。"""
+            """确定：校验类别数为正整数后关闭对话框。"""
             try:
                 value = int(count_var.get().strip())
             except ValueError:
@@ -1178,11 +1801,11 @@ class BirdCrawlerGUI:
             if value < 1:
                 messagebox.showerror("错误", "类别数必须 ≥ 1。", parent=dialog)
                 return
-            result["value"] = value
+            result["value"] = (display_to_key.get(arch_var.get(), "generic"), value)
             dialog.destroy()
 
         btns = ttk.Frame(dialog)
-        btns.pack(pady=(0, 14))
+        btns.pack(pady=(12, 14))
         ttk.Button(btns, text="确定", style="Accent.TButton",
                    command=_confirm).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="取消",

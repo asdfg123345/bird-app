@@ -316,11 +316,23 @@ def _get_species_registry() -> dict:
     return _REGISTRY_CACHE["SPECIES_MODELS"]
 
 
+def _get_part_registry() -> dict:
+    """获取出厂部位模型注册表（惰性构建并缓存，供本模块内函数复用）。"""
+    if "PART_MODELS" not in _REGISTRY_CACHE:
+        _get_species_registry()   # 一次构建同时填充两张表
+    return _REGISTRY_CACHE["PART_MODELS"]
+
+
 def __getattr__(name):
-    """惰性返回模型注册表（首次访问时构建并缓存）。"""
-    if name in ("SPECIES_MODELS", "PART_MODELS"):
-        _get_species_registry()
-        return _REGISTRY_CACHE[name]
+    """惰性返回模型注册表（出厂预置 + 共享模型库合并视图）。
+
+    说明：物种/部位两张表都走合并视图，保证控制台模型库中登记的模型在
+    GUI 下拉、qa_server 服务与 part_locator 解析三处都能被识别。
+    """
+    if name == "SPECIES_MODELS":
+        return get_all_species_models()
+    if name == "PART_MODELS":
+        return get_all_part_models()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # 回退顺序：激活模型不可用时按列表顺序依次尝试，全部不可用则中文报错
@@ -432,22 +444,35 @@ def _load_shared_registry_records(root=None) -> list:
 def get_shared_species_models(root=None) -> dict:
     """读取共享模型库中的物种分类模型，转为与 SPECIES_MODELS 同构的 dict。
 
-    合格条目判定（物种分类模型）：模型目录下存在 best_model.pt 或
-    last_model.pt（权重优先 best，退 last），且存在 labels.json。
-    条目 id 与出厂注册表重名时自动追加后缀"（共享库）"避让
-    （共享条目 id 天然带日期版本号，一般不冲突）。
+    合格条目判定：模型目录下存在可用权重文件（best_model.pt / last_model.pt /
+    model.safetensors / 其余 .pt/.pth/.safetensors/.bin），且记录的架构属于
+    可推理架构（见下方 arch_adapters 映射）。仅入库管理的架构（分割、LLM/RNN、
+    mmpretrain ViT 等）会被跳过，不进入推理候选。
 
-    参数：
-        root  共享模型库根目录；None 时自动探测（find_shared_model_library）
-    返回：
-        {id: {"adapter": 适配器类, "params": {...}, "display_name": str}}，
-        库缺失/损坏/无合格条目时返回 {}（绝不抛异常）。
+    条目 id 与出厂注册表重名时自动追加后缀"（共享库）"避让。
+    参数 root 为共享模型库根目录；None 时自动探测（find_shared_model_library）。
+    库缺失/损坏/无合格条目时返回 {}（绝不抛异常）。
     """
     records = _load_shared_registry_records(root)
     if not records:
         return {}
     # 惰性导入适配器（与 _build_registries 一致，规避循环引用）
-    from model_adapters import ResNet50_200Adapter
+    from model_adapters import (
+        ResNeSt101Adapter,
+        ResNet50_200Adapter,
+        VitHFAdapter,
+    )
+
+    # 架构 → 适配器类；未登记或值为 None 的架构视为「仅入库管理」，不接入推理
+    arch_adapters = {
+        "resnet50": ResNet50_200Adapter,
+        "vit_bird_525": VitHFAdapter,
+        "vit_hf": VitHFAdapter,
+        "resnest101": ResNeSt101Adapter,
+    }
+    # ViT 系列按目录加载（transformers 需要 config.json），其余按权重文件加载
+    dir_based = ("vit_bird_525", "vit_hf")
+    weight_suffixes = (".pt", ".pth", ".safetensors", ".bin")
 
     factory_ids = set(_get_species_registry().keys())  # 出厂条目 id，用于重名避让
     shared: dict = {}
@@ -458,31 +483,56 @@ def get_shared_species_models(root=None) -> dict:
         model_dir = Path(str(record.get("path") or ""))
         if not name or not model_dir.is_dir():
             continue  # 记录缺名字或目录不存在，跳过
-        # 权重文件：优先 best_model.pt，退 last_model.pt
-        weights_path = model_dir / "best_model.pt"
-        if not weights_path.is_file():
-            weights_path = model_dir / "last_model.pt"
-        if not weights_path.is_file():
-            continue  # 无可用权重文件，非合格物种模型
+        arch = str(record.get("architecture") or "resnet50").strip() or "resnet50"
+        adapter_cls = arch_adapters.get(arch)
+        if adapter_cls is None:
+            continue  # 仅入库管理的架构（分割/LLM 等）不接入推理
+        # 权重文件：best_model.pt → last_model.pt → model.safetensors → 其余候选
+        weights_path = None
+        for cand_name in ("best_model.pt", "last_model.pt", "model.safetensors"):
+            cand = model_dir / cand_name
+            if cand.is_file():
+                weights_path = cand
+                break
+        if weights_path is None:
+            try:
+                for item in sorted(model_dir.iterdir()):
+                    if item.is_file() and item.suffix.lower() in weight_suffixes:
+                        weights_path = item
+                        break
+            except OSError:
+                weights_path = None
+        if weights_path is None:
+            continue  # 无可用权重文件，非合格条目
         labels_path = model_dir / "labels.json"
-        if not labels_path.is_file():
-            continue  # 缺类别映射，无法还原中文类别名
         # 条目 id：与出厂条目或已登记共享条目重名时追加后缀
         entry_id = name if name not in factory_ids and name not in shared \
             else f"{name}（共享库）"
         if entry_id in factory_ids or entry_id in shared:
             continue  # 后缀仍冲突（极端情况）时跳过，宁缺毋滥
-        # 显示名：模型名 + 可选验证精度（如 resnet50_10月11日_001（val 86.2%））
+        # 显示名：模型名 + 主指标（如 resnet50_10月11日_001（Top-1 86.2%））
         display_name = name
-        accuracy = record.get("accuracy")
-        if isinstance(accuracy, (int, float)) and 0 < accuracy <= 1:
-            display_name = f"{name}（val {accuracy * 100:.1f}%）"
+        value = record.get("accuracy")
+        if isinstance(value, (int, float)) and 0 < value <= 1:
+            metric_name = str(record.get("metric_name") or "val_acc")
+            label = {"val_acc": "Top-1", "top1_acc": "Top-1", "top5_acc": "Top-5",
+                     "macro_f1": "宏F1"}.get(metric_name)
+            if metric_name == "val_loss":
+                display_name = f"{name}（loss {value:.4f}）"
+            elif label:
+                display_name = f"{name}（{label} {value * 100:.1f}%）"
+            else:
+                display_name = f"{name}（{metric_name} {value:.4f}）"
+        # 构造参数：ViT 系列传目录；其余传权重文件；labels.json 可选
+        if arch in dir_based:
+            params = {"model_dir": str(model_dir)}
+        else:
+            params = {"weights_path": str(weights_path)}
+        if labels_path.is_file():
+            params["labels_path"] = str(labels_path)
         shared[entry_id] = {
-            "adapter": ResNet50_200Adapter,      # 与 resnet50_200 相同的适配器
-            "params": {
-                "weights_path": str(weights_path),  # 实例级权重路径覆盖
-                "labels_path": str(labels_path),    # 实例级类别映射路径
-            },
+            "adapter": adapter_cls,
+            "params": params,
             "display_name": display_name,
         }
     return shared
@@ -496,6 +546,89 @@ def get_all_species_models(root=None) -> dict:
     """
     merged = dict(_get_species_registry())  # 出厂条目（含惰性构建）
     for entry_id, entry in get_shared_species_models(root).items():
+        if entry_id not in merged:  # 出厂条目优先，共享条目只做增量补充
+            merged[entry_id] = entry
+    return merged
+
+
+def get_shared_part_models(root=None) -> dict:
+    """读取共享模型库中的部位检测模型，转为与 PART_MODELS 同构的 dict。
+
+    合格条目判定：记录的架构为 faster_rcnn（检测类），且模型目录下存在可用
+    权重文件（best_detector.pth / last_detector.pth / best_model.pt / 其余
+    .pt/.pth）。分类或分割等其它架构不属于部位检测器，一律跳过。
+
+    部位名称沿用本系统 config.PART_TO_DETECTOR_IDX 约定的 15 部位索引，
+    因此共享库条目应为同一套部位标注体系训练的检测器（管线 B 产物）。
+    库缺失/损坏/无合格条目时返回 {}（绝不抛异常）。
+    """
+    records = _load_shared_registry_records(root)
+    if not records:
+        return {}
+    # 惰性导入适配器（与 _build_registries 一致，规避循环引用）
+    from model_adapters import TrainedFrcnnAdapter
+
+    shared: dict = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        # 仅接入检测类架构；其余架构（分类/分割/通用）不属于部位检测器
+        if str(record.get("architecture") or "").strip() != "faster_rcnn":
+            continue
+        name = str(record.get("name") or "").strip()
+        model_dir = Path(str(record.get("path") or ""))
+        if not name or not model_dir.is_dir():
+            continue  # 记录缺名字或目录不存在，跳过
+        # 权重文件：检测器产物优先，兼容分类式命名与其余候选
+        weights_path = None
+        for cand_name in ("best_detector.pth", "last_detector.pth",
+                          "best_model.pt", "last_model.pt"):
+            cand = model_dir / cand_name
+            if cand.is_file():
+                weights_path = cand
+                break
+        if weights_path is None:
+            try:
+                for item in sorted(model_dir.iterdir()):
+                    if item.is_file() and item.suffix.lower() in (".pt", ".pth"):
+                        weights_path = item
+                        break
+            except OSError:
+                weights_path = None
+        if weights_path is None:
+            continue  # 无可用权重文件，非合格条目
+        # 条目 id：与已登记共享条目重名时追加后缀（出厂条目 id 无需避让，
+        # 因为检测类条目与出厂 owlvit/trained_frcnn 不会同名）
+        entry_id = name if name not in shared else f"{name}（共享库）"
+        if entry_id in shared:
+            continue
+        # 显示名：模型名 + 主指标（部位检测默认 mAP@0.5）
+        display_name = name
+        value = record.get("accuracy")
+        if isinstance(value, (int, float)) and 0 < value <= 1:
+            metric_name = str(record.get("metric_name") or "map50")
+            label = {"map50": "mAP@0.5", "map": "mAP",
+                     "mAP": "mAP"}.get(metric_name, metric_name)
+            display_name = f"{name}（{label} {value * 100:.1f}%）"
+        params = {"weights_path": str(weights_path)}   # 实例级权重路径覆盖
+        if record.get("class_count"):
+            params["num_classes"] = int(record["class_count"])
+        shared[entry_id] = {
+            "adapter": TrainedFrcnnAdapter,
+            "params": params,
+            "display_name": display_name,
+        }
+    return shared
+
+
+def get_all_part_models(root=None) -> dict:
+    """出厂 PART_MODELS 与共享模型库部位检测器的合并视图。
+
+    出厂条目在前、共享条目在后；id 重名时共享条目不覆盖出厂条目。
+    参数 root 含义同 get_shared_part_models。
+    """
+    merged = dict(_get_part_registry())  # 出厂条目（含惰性构建）
+    for entry_id, entry in get_shared_part_models(root).items():
         if entry_id not in merged:  # 出厂条目优先，共享条目只做增量补充
             merged[entry_id] = entry
     return merged

@@ -77,20 +77,453 @@ _NAME_PATTERN = re.compile(r"^(?P<base>.+)_(?P<month>\d{1,2})月(?P<day>\d{1,2})
 TRAINING_MODE_PRESETS = {
     "adaptive": {"label": "适应模式（ad）", "epochs": 30, "optimizer": "adamw",
                  "patience": 10, "batch": None, "lr": 1e-3, "amp": "auto",
+                 "workers_hint": "自动（按CPU核数2~8）",
                  "description": "读取设备配置（GPU显存/内存/磁盘），在安全限制内自适应配置；安全优先，效果优先，允许以时间换效果"},
     "low":      {"label": "低速模式", "epochs": 20, "optimizer": "adamw",
-                 "patience": 6, "batch": 8, "lr": 1e-3, "amp": False,
-                 "description": "低资源占用，训练慢但稳定，适合配置较低或需后台轻度训练"},
+                 "patience": 6, "batch": 8, "lr": 1e-3, "amp": True,
+                 "workers_hint": "2（低占用后台加载）",
+                 "description": "低资源占用，训练慢但稳定，适合配置较低或需后台轻度训练；混合精度降低显存占用"},
     "high":     {"label": "高速模式", "epochs": 10, "optimizer": "adamw",
                  "patience": 4, "batch": None, "lr": 1e-3, "amp": True,
+                 "workers_hint": "自动（按CPU核数4~12）",
                  "description": "大批量+混合精度，快速出结果，资源占用较高"},
     "custom":   {"label": "自定义模式", "epochs": None, "optimizer": "adamw",
                  "patience": None, "batch": None, "lr": 1e-3, "amp": False,
-                 "description": "用户自行设置轮数/优化器/耐心值/批大小/学习率"},
+                 "workers_hint": "随线程设置（0=自动）",
+                 "description": "用户自行设置轮数/优化器/耐心值/批大小/学习率/混合精度"},
 }
 
 # 训练模式key到界面显示名的映射（方便 GUI 下拉框直接使用）
 TRAINING_MODE_LABELS = {key: value["label"] for key, value in TRAINING_MODE_PRESETS.items()}
+
+# ============================================================
+# 架构注册表与模型识别（多架构模型库支持）
+# 说明：
+#   task_type           模型任务类型（classification/segmentation/other）；
+#   inference_supported 能否接入鸟类视觉分析系统的物种分类推理管线，
+#                       False 表示仅作入库管理（界面标注「仅管理」）；
+#   adapter             视觉系统侧适配器标识（None 表示无可用适配器）。
+# ============================================================
+ARCHITECTURE_REGISTRY = {
+    "resnet50": {
+        "display_name": "ResNet50（torchvision）",
+        "task_type": "classification",
+        "inference_supported": True,
+        "adapter": "resnet50",
+    },
+    "vit_bird_525": {
+        "display_name": "ViT 525类鸟类（HuggingFace）",
+        "task_type": "classification",
+        "inference_supported": True,
+        "adapter": "vit_hf",
+    },
+    "vit_hf": {
+        "display_name": "ViT（HuggingFace格式）",
+        "task_type": "classification",
+        "inference_supported": True,
+        "adapter": "vit_hf",
+    },
+    "resnest101": {
+        "display_name": "ResNeSt101（timm）",
+        "task_type": "classification",
+        "inference_supported": True,
+        "adapter": "resnest101",
+    },
+    "faster_rcnn": {
+        "display_name": "Faster R-CNN 部位检测器",
+        "task_type": "detection",
+        "inference_supported": True,
+        "adapter": "faster_rcnn",
+    },
+    "vit_mmpretrain": {
+        "display_name": "ViT（mmpretrain格式，仅管理）",
+        "task_type": "classification",
+        "inference_supported": False,
+        "adapter": None,
+    },
+    "segformer_seg": {
+        "display_name": "SegFormer（语义分割，仅管理）",
+        "task_type": "segmentation",
+        "inference_supported": False,
+        "adapter": None,
+    },
+    "generic": {
+        "display_name": "通用模型（LLM/RNN等，仅管理）",
+        "task_type": "other",
+        "inference_supported": False,
+        "adapter": None,
+    },
+}
+
+# 候选权重文件的后缀（外部模型导入扫描用）
+WEIGHT_SUFFIXES = (".pt", ".pth", ".safetensors", ".bin")
+
+
+def get_architecture_info(architecture) -> dict:
+    """查询架构元信息，未登记的架构按 generic 兜底（保持向后兼容）。"""
+    return ARCHITECTURE_REGISTRY.get(str(architecture or ""), ARCHITECTURE_REGISTRY["generic"])
+
+
+def _normalize_weight_keys(weights) -> list:
+    """把 dict/list/set 形式的权重归一化为键名列表，并去掉 module. 前缀。
+
+    兼容 DataParallel 保存的权重（键名带 module. 前缀）。
+    """
+    if isinstance(weights, dict):
+        keys = [str(k) for k in weights.keys()]
+    else:
+        keys = [str(k) for k in weights]
+    return [k[7:] if k.startswith("module.") else k for k in keys]
+
+
+def detect_architecture(weights) -> str:
+    """按权重键名特征识别模型架构，返回 ARCHITECTURE_REGISTRY 的键名。
+
+    识别规则（从特殊到一般依次判定）：
+        - segformer.*                        → segformer_seg（语义分割）
+        - 含 roi_heads.box_predictor         → faster_rcnn（目标检测）
+        - backbone.*.attn.qkv.*              → vit_mmpretrain（mmpretrain 融合QKV）
+        - *.conv2.fc1.*（SplitAttention）    → resnest101
+        - vit.* 与 classifier.* 同时存在     → vit_hf（HuggingFace ViT）
+        - 含 fc.weight 的卷积网络            → resnet50
+        - 无法识别                           → generic
+
+    参数 weights 可为权重字典、键名列表或集合。
+    """
+    keys = _normalize_weight_keys(weights)
+    if not keys:
+        return "generic"
+    # 语义分割优先（键名特征最显著）
+    if any(k.startswith("segformer.") for k in keys):
+        return "segformer_seg"
+    # 目标检测（torchvision Faster R-CNN：RPN + RoI 头 + 框预测器）
+    if any("roi_heads.box_predictor" in k for k in keys):
+        return "faster_rcnn"
+    # mmpretrain ViT：backbone 下的融合 QKV
+    if any(k.startswith("backbone.") and ".attn.qkv." in k for k in keys):
+        return "vit_mmpretrain"
+    # ResNeSt 的 SplitAttention：conv2.fc1 / conv2.fc2（ResNet 无此结构）
+    if any(re.search(r"\.conv2\.fc[12]\.(weight|bias)$", k) for k in keys):
+        return "resnest101"
+    # HuggingFace ViT：vit. 骨干 + classifier. 分类头
+    if any(k.startswith("vit.") for k in keys) and any(k.startswith("classifier.") for k in keys):
+        return "vit_hf"
+    # torchvision 风格卷积网络（ResNet 等）
+    if any(k.endswith("fc.weight") for k in keys):
+        return "resnet50"
+    return "generic"
+
+
+def unwrap_state_dict(ckpt) -> dict:
+    """从常见检查点包装中取出纯权重字典（无包装时原样返回）。
+
+    兼容的包装键：state_dict / model_state_dict / model_state / model / weights。
+    """
+    if isinstance(ckpt, dict):
+        for key in ("state_dict", "model_state_dict", "model_state",
+                    "model", "weights"):
+            inner = ckpt.get(key)
+            if isinstance(inner, dict) and inner:
+                return inner
+    return ckpt
+
+
+def find_candidate_weights(model_dir) -> list:
+    """列出模型目录中的候选权重文件（按优先级排序，返回绝对路径列表）。
+
+    优先级：best_model.pt > last_model.pt > best_detector.pth >
+    last_detector.pth > model.safetensors > 其余权重文件
+    （仅扫描目录一层，不递归，避免误拾无关权重）。
+    """
+    model_dir = Path(model_dir)
+    if not model_dir.is_dir():
+        return []
+    ordered_names = ("best_model.pt", "last_model.pt", "best_detector.pth",
+                     "last_detector.pth", "model.safetensors")
+    found: list = []
+    for name in ordered_names:
+        candidate = model_dir / name
+        if candidate.is_file():
+            found.append(candidate)
+    for item in sorted(model_dir.iterdir()):
+        if not item.is_file() or item.suffix.lower() not in WEIGHT_SUFFIXES:
+            continue
+        if item.name in ordered_names or item.name.endswith(".tmp"):
+            continue
+        found.append(item)
+    return found
+
+
+def has_hf_config(model_dir) -> bool:
+    """判断目录是否为 HuggingFace 模型目录（含 config.json 与权重文件）。"""
+    model_dir = Path(model_dir)
+    if not (model_dir / "config.json").is_file():
+        return False
+    return (model_dir / "model.safetensors").is_file() or \
+        bool(list(model_dir.glob("*.bin")))
+
+
+def read_label_mapping_txt(path) -> dict:
+    """读取 TSV 类别映射文件（第 1 列为序号、第 2 列为类别名），返回 {类名: 序号}。
+
+    文件格式示例（cv_resnest101 的 label_mapping.txt）：
+        0\t中文名\t图片\t属性JSON\t描述
+    解析失败返回 {}。
+    """
+    mapping: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n\r")
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    parts = line.split(",")
+                    if len(parts) < 2:
+                        continue
+                idx_text, name = parts[0].strip(), parts[1].strip()
+                if not name:
+                    continue
+                try:
+                    mapping[name] = int(idx_text)
+                except ValueError:
+                    continue
+    except OSError:
+        return {}
+    return mapping
+
+
+def build_labels_auto(model_dir, class_count=None) -> dict:
+    """为模型目录自动生成类别标签映射 {类名: 序号}（供外部模型导入使用）。
+
+    来源优先级：
+        1. 目录内已有 labels.json（原样返回，避免覆盖用户定义）；
+        2. config.json 的 id2label（HuggingFace 格式，{序号: 名称}）；
+        3. class_names.json / classes.json（列表格式，序号即下标）；
+        4. label_mapping.txt（TSV，第 1 列序号 + 第 2 列类别名）；
+        5. 兜底：class_count 提供时生成 类别_0..类别_{n-1}，否则返回 {}。
+    """
+    model_dir = Path(model_dir)
+    # 1. 已存在的 labels.json
+    existing = model_dir / "labels.json"
+    if existing.is_file():
+        try:
+            with open(existing, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError):
+            pass
+    # 2. HuggingFace config.json 的 id2label
+    cfg_path = model_dir / "config.json"
+    if cfg_path.is_file():
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            id2label = cfg.get("id2label") if isinstance(cfg, dict) else None
+            if isinstance(id2label, dict) and id2label:
+                mapping = {}
+                for idx, name in id2label.items():
+                    try:
+                        mapping[str(name)] = int(idx)
+                    except (TypeError, ValueError):
+                        continue
+                if mapping:
+                    return mapping
+        except (OSError, ValueError):
+            pass
+    # 3. 列表格式类别文件（class_names.json / classes.json）
+    for list_name in ("class_names.json", "classes.json"):
+        list_path = model_dir / list_name
+        if list_path.is_file():
+            try:
+                with open(list_path, "r", encoding="utf-8") as f:
+                    names = json.load(f)
+                if isinstance(names, list) and names:
+                    return {str(n): i for i, n in enumerate(names)}
+            except (OSError, ValueError):
+                pass
+    # 4. label_mapping.txt（TSV）
+    for txt_name in ("label_mapping.txt", "labels.txt", "classes.txt"):
+        txt_path = model_dir / txt_name
+        if txt_path.is_file():
+            mapping = read_label_mapping_txt(txt_path)
+            if mapping:
+                return mapping
+    # 5. 兜底占位
+    if class_count and int(class_count) > 0:
+        return {f"类别_{i}": i for i in range(int(class_count))}
+    return {}
+
+
+def infer_class_count(weights, labels=None) -> int | None:
+    """从权重末层形状或标签映射推断类别数，失败返回 None。
+
+    分类模型看 classifier.weight / fc.weight；检测模型看
+    roi_heads.box_predictor.cls_score.weight（含背景类的类别数）。
+    """
+    if isinstance(labels, dict) and labels:
+        return len(labels)
+    if isinstance(weights, dict):
+        for key in ("classifier.weight", "fc.weight",
+                    "roi_heads.box_predictor.cls_score.weight"):
+            for k, v in weights.items():
+                if str(k).endswith(key) and hasattr(v, "shape") and len(v.shape) >= 1:
+                    return int(v.shape[0])
+    return None
+
+
+def validate_import_source(model_dir) -> tuple:
+    """校验外部模型目录是否可导入，返回 (是否通过, 提示文本, 候选权重列表)。
+
+    通过条件（任一即可）：
+        ① 含 best_model.pt / last_model.pt；
+        ② 含 HuggingFace 目录结构（config.json + 权重文件）；
+        ③ 含任一 .pt/.pth/.safetensors/.bin 权重文件。
+    """
+    model_dir = Path(model_dir)
+    if not model_dir.is_dir():
+        return False, f"模型目录不存在：{model_dir}", []
+    if any((model_dir / n).is_file() for n in ("best_model.pt", "last_model.pt")):
+        return True, "检测到训练产物格式（best_model.pt / last_model.pt）", \
+            find_candidate_weights(model_dir)
+    if has_hf_config(model_dir):
+        return True, "检测到 HuggingFace 模型目录（config.json + 权重文件）", \
+            find_candidate_weights(model_dir)
+    candidates = find_candidate_weights(model_dir)
+    if candidates:
+        return True, f"检测到权重文件：{candidates[0].name}", candidates
+    return False, "所选目录中未找到可识别的权重文件（.pt/.pth/.safetensors/.bin）", []
+
+
+# 评估指标显示名（模型库列表与详情展示用）
+METRIC_DISPLAY_NAMES = {
+    "top1_acc": "Top-1",
+    "val_acc": "Top-1",       # 旧记录字段名，语义等同 Top-1 准确率
+    "top5_acc": "Top-5",
+    "macro_f1": "宏F1",
+    "val_loss": "验证损失",
+    "miou": "mIoU",
+    "map50": "mAP@0.5",
+    "map": "mAP",
+    "mAP": "mAP",
+}
+
+
+def format_metric_value(metric_name, value) -> str:
+    """把指标数值格式化为界面显示文本（比例值转百分比，损失保留小数）。
+
+    无法格式化时返回「—」。
+    """
+    if not isinstance(value, (int, float)):
+        return "—"
+    name = metric_name or "val_acc"
+    label = METRIC_DISPLAY_NAMES.get(name, name)
+    if name in ("val_loss", "loss"):
+        return f"{label} {value:.4f}"
+    return f"{label} {value * 100:.2f}%"
+
+
+# ============================================================
+# 数据集划分预设与判据选项（GUI 与训练脚本共用的纯数据常量）
+# 说明：GUI 只读这些常量做下拉与提示；训练脚本 model_trainer.py 内有同名
+#       权威实现（SPLIT_PRESETS / EVAL_METRIC_REGISTRY），两者需保持同步。
+# ============================================================
+SPLIT_PRESETS = {
+    "existing":    {"label": "使用目录既有划分（默认）", "ratio": None},
+    "balanced":    {"label": "均衡标准级 8:1:1", "ratio": [8.0, 1.0, 1.0]},
+    "train_first": {"label": "训练优先级 9:0.5:0.5", "ratio": [9.0, 0.5, 0.5]},
+    "val_heavy":   {"label": "验证强化级 7:1.5:1.5", "ratio": [7.0, 1.5, 1.5]},
+    "custom":      {"label": "自定义比例", "ratio": None},
+}
+SPLIT_PRESET_LABELS = {key: value["label"] for key, value in SPLIT_PRESETS.items()}
+
+# 最佳模型判据选项（键 → 中文名），供 GUI 下拉使用
+SELECT_METRIC_OPTIONS = {
+    "top1_acc": "Top-1 准确率（默认）",
+    "top5_acc": "Top-5 准确率",
+    "macro_f1": "宏平均 F1",
+    "val_loss": "验证损失（越小越好）",
+}
+
+# 架构 → 训练策略摘要（与训练脚本 ARCH_TRAINING_STRATEGY 保持一致的展示文案）
+ARCH_STRATEGY_SUMMARY = {
+    "resnet50": "ResNet50 标准策略：等学习率 + 余弦退火（与原训练行为一致）",
+    "vit_bird_525": "ViT 迁移策略：骨干0.1×差异化学习率 + 2轮升温 + 余弦退火 + 标签平滑0.1",
+    "vit_hf": "ViT 迁移策略：骨干0.1×差异化学习率 + 2轮升温 + 余弦退火 + 标签平滑0.1",
+    "resnest101": "ResNeSt101 策略：SGD(动量0.9) + 差异化学习率 + 1轮升温 + 余弦退火",
+}
+
+
+def get_strategy_summary(architecture) -> str:
+    """按架构取训练策略摘要文本（未登记架构按 ResNet50 策略兜底）。"""
+    return ARCH_STRATEGY_SUMMARY.get(str(architecture or "resnet50"),
+                                     ARCH_STRATEGY_SUMMARY["resnet50"])
+
+# ============================================================
+# 内置预置物种模型（不进注册表，只读展示；供模型库列表与训练基础模型选择）
+# 说明：内置条目不参与删除/激活，path 对 ViT 指向权重目录（可不存在，
+#       由训练/视觉侧按同名常量再探测）；architecture 供训练脚本重建网络。
+# ============================================================
+# 525 类鸟类 ViT 权重目录解析（按优先级）：
+#   1. 环境变量 BIRD_VIT_525_DIR；2. 脚本上两级目录下的 bird_species_image_detection
+#      （源码运行即项目根 d:\鸟类\bird_species_image_detection，不硬编码盘符）
+VIT_525_ENV_VAR = "BIRD_VIT_525_DIR"
+
+
+def resolve_vit_bird_525_dir() -> Path:
+    """解析 525 类鸟类 ViT 权重目录（含 model.safetensors 的目录）。"""
+    env_value = os.environ.get(VIT_525_ENV_VAR, "").strip()
+    if env_value:
+        return Path(env_value)
+    return BASE_DIR.parent.parent / "bird_species_image_detection"
+
+
+def list_builtin_models() -> list:
+    """返回内置预置物种模型记录列表（每条带 builtin=True 标记，均为新字典副本）。"""
+    return [
+        {
+            "name": "resnet50_imagenet",
+            "base_name": "resnet50",
+            "date_str": "—",
+            "version": 0,
+            "path": "",
+            "class_count": 1000,
+            "accuracy": None,
+            "trained_at": "",
+            "mode": None,
+            "source": "内置预置",
+            "preview_path": None,
+            "architecture": "resnet50",
+            "note": "ResNet50（ImageNet 预训练权重），从零训练即微调 ImageNet",
+            "builtin": True,
+        },
+        {
+            "name": "vit_bird_525",
+            "base_name": "vit_bird_525",
+            "date_str": "—",
+            "version": 0,
+            "path": str(resolve_vit_bird_525_dir()),
+            "class_count": 525,
+            "accuracy": None,
+            "trained_at": "",
+            "mode": None,
+            "source": "内置预置",
+            "preview_path": None,
+            "architecture": "vit_bird_525",
+            "note": "525 类鸟类 ViT（本地预置权重），鸟类专域起点，迁移效果通常优于 ImageNet",
+            "builtin": True,
+        },
+    ]
+
+
+def get_builtin_model(name, root=None):
+    """按名称查内置预置模型记录；不存在返回 None。"""
+    for record in list_builtin_models():
+        if record.get("name") == name:
+            return record
+    return None
 
 
 # ============================================================
@@ -251,7 +684,9 @@ def next_model_name(base_name, date=None, root=None):
 
 
 def register_model(path, class_count, accuracy=None, mode=None,
-                   source="本机训练", preview_path=None, root=None) -> dict:
+                   source="本机训练", preview_path=None, architecture="resnet50",
+                   root=None, metric_name="val_acc", metrics=None,
+                   task_type=None) -> dict:
     """把一个已存在的模型目录登记进注册表，返回该模型的记录字典。
 
     会自动从目录名解析 base_name/日期/版本号；目录名不符合
@@ -260,15 +695,22 @@ def register_model(path, class_count, accuracy=None, mode=None,
     参数：
         path:        已存在的模型目录路径（不存在时抛 ValueError）
         class_count: 模型类别数
-        accuracy:    验证集准确率（0~1，可为 None）
+        accuracy:    主评估指标数值（0~1 的比例值，可为 None）
         mode:        训练模式 key（见 TRAINING_MODE_PRESETS）
         source:      模型来源，默认「本机训练」
         preview_path: 预览图路径（可为 None）
+        architecture: 网络架构标识（见 ARCHITECTURE_REGISTRY），旧记录缺省按 resnet50
         root:        模型库根目录；None 表示用内置模型库目录
+        metric_name: 主评估指标名（top1_acc/val_acc/top5_acc/macro_f1/val_loss），默认 val_acc
+        metrics:     全部评估指标字典（可为 None，如 {"top1_acc":0.86,"macro_f1":0.84}）
+        task_type:   任务类型；None 时按架构注册表自动推导
     """
     model_dir = Path(path)
     if not model_dir.is_dir():
         raise ValueError(f"模型目录不存在，无法注册：{model_dir}")
+
+    arch_key = architecture or "resnet50"
+    arch_info = get_architecture_info(arch_key)
 
     dir_name = model_dir.name
     matched = _NAME_PATTERN.match(dir_name)
@@ -299,6 +741,11 @@ def register_model(path, class_count, accuracy=None, mode=None,
         "mode": mode,
         "source": source,
         "preview_path": str(preview_path) if preview_path else None,
+        "architecture": arch_key,
+        "metric_name": metric_name or "val_acc",
+        "metrics": dict(metrics) if isinstance(metrics, dict) else None,
+        "task_type": task_type or arch_info.get("task_type", "classification"),
+        "inference_supported": bool(arch_info.get("inference_supported", False)),
     }
 
     reg = load_registry(root)
@@ -316,21 +763,27 @@ def register_model(path, class_count, accuracy=None, mode=None,
 # ============================================================
 # 查询 / 删除 / 激活
 # ============================================================
-def list_models(root=None) -> list:
-    """列出注册表中的全部模型记录（按训练时间倒序，最新的在前）。"""
+def list_models(root=None, include_builtin=False) -> list:
+    """列出注册表中的全部模型记录（按训练时间倒序，最新的在前）。
+
+    include_builtin=True 时在最前面附加内置预置模型条目（builtin=True，
+    仅供展示与训练选择，不参与删除/激活）。
+    """
     reg = load_registry(root)
     models = [item for item in reg.get("models", []) if isinstance(item, dict)]
     models.sort(key=lambda item: item.get("trained_at") or "", reverse=True)
+    if include_builtin:
+        return list_builtin_models() + models
     return models
 
 
 def get_model(name, root=None):
-    """按名称查询模型记录；找不到返回 None。"""
+    """按名称查询模型记录（先查注册表，再查内置预置）；找不到返回 None。"""
     reg = load_registry(root)
     for item in reg.get("models", []):
         if isinstance(item, dict) and item.get("name") == name:
             return item
-    return None
+    return get_builtin_model(name, root)
 
 
 def remove_model(name, root=None) -> bool:
@@ -364,10 +817,13 @@ def remove_model(name, root=None) -> bool:
 def set_active_species_model(name, root=None) -> bool:
     """把指定模型设为「激活物种模型」（视觉系统默认加载它）。
 
-    模型不存在时抛 ValueError（中文消息）。成功返回 True。
+    模型不存在或为内置预置模型时抛 ValueError（中文消息）。成功返回 True。
     """
-    if get_model(name, root) is None:
+    record = get_model(name, root)
+    if record is None:
         raise ValueError(f"模型不存在，无法设为激活模型：{name}")
+    if record.get("builtin"):
+        raise ValueError("内置预置模型不可设为激活模型（请在「视觉分析」页直接选择使用）。")
     reg = load_registry(root)
     reg["active_species_model"] = name
     save_registry(reg, root)

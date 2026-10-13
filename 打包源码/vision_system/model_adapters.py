@@ -70,14 +70,19 @@ def species_en_to_cn(label_en: str) -> str:
 
 
 def _load_torch_checkpoint(path: Path) -> dict:
-    """加载训练 checkpoint，兼容裸 state_dict 与常见包装字段。"""
+    """加载训练 checkpoint，兼容裸 state_dict 与常见包装字段。
+
+    包装键兼容 state_dict / model_state_dict / model_state（管线 B 检测器
+    产物的键名）/ model / weights。
+    """
     try:
         ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     except Exception:
         # 旧版 torch 保存格式（含非张量对象）回退
         ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict):
-        for key in ("state_dict", "model_state_dict", "model"):
+        for key in ("state_dict", "model_state_dict", "model_state",
+                    "model", "weights"):
             if key in ckpt and isinstance(ckpt[key], dict):
                 return ckpt[key]
     return ckpt
@@ -313,6 +318,288 @@ class ResNet50_200Adapter(SpeciesBackend):
         return results
 
 
+class VitHFAdapter(SpeciesBackend):
+    """通用 HuggingFace ViT 图像分类适配器（本地目录，离线加载）。
+
+    兼容两种权重形态：
+      ① 标准 HuggingFace 目录（config.json + model.safetensors）——直接
+         from_pretrained 加载；
+      ② 本机训练产物目录（config.json + best_model.pt/last_model.pt，权重为
+         ViTForImageClassification.state_dict）——按 config 重建网络后载入，
+         按当前分类头形状过滤形状不匹配的键（避免类别数不同导致 RuntimeError）。
+
+    构造参数 model_dir 必填（由注册表 params 传入）；labels_path 可选
+    （共享库 labels.json，{类名: 序号}，用于给出可读类别名）。
+    """
+
+    def __init__(self, model_dir: Optional[str] = None,
+                 labels_path: Optional[str] = None,
+                 class_names: Optional[List[str]] = None, **kwargs):
+        super().__init__()
+        self.model_dir = Path(model_dir) if model_dir else None
+        self._labels_path = Path(labels_path) if labels_path else None
+        self._class_names = list(class_names) if class_names else None
+        self._model = None
+        self._processor = None
+        self._names: List[str] = []
+
+    def is_available(self) -> bool:
+        if self.model_dir is None or not self.model_dir.is_dir():
+            return False
+        if not (self.model_dir / "config.json").is_file():
+            return False  # 无 config 无法重建 HF ViT 结构
+        return (self.model_dir / "model.safetensors").is_file() \
+            or bool(list(self.model_dir.glob("*.bin"))) \
+            or (self.model_dir / "best_model.pt").is_file() \
+            or (self.model_dir / "last_model.pt").is_file()
+
+    def _resolve_pt_weight(self) -> Optional[Path]:
+        """定位本机训练产物权重文件（best_model.pt 优先，退 last_model.pt）。"""
+        for name in ("best_model.pt", "last_model.pt"):
+            candidate = self.model_dir / name
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _names_from_labels(self, num_classes: int) -> List[str]:
+        """按 labels.json（{类名: 序号}）反转为 序号→类名 列表；失败返回空表。"""
+        if self._class_names and len(self._class_names) == num_classes:
+            return self._class_names
+        candidates = []
+        if self._labels_path is not None:
+            candidates.append(self._labels_path)
+        candidates.append(self.model_dir / "labels.json")
+        for path in candidates:
+            try:
+                import json
+                mapping = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            names: List[Optional[str]] = [None] * num_classes
+            for label, idx in mapping.items():
+                try:
+                    pos = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= pos < num_classes:
+                    names[pos] = str(label)
+            if all(n is not None for n in names):
+                return [str(n) for n in names]
+        return []
+
+    def load(self) -> None:
+        if not self.is_available():
+            raise ModelLoadError(
+                f"HuggingFace ViT 模型文件缺失：{self.model_dir}"
+                "（需含 config.json 与 model.safetensors / best_model.pt）")
+        try:
+            from transformers import (
+                AutoConfig,
+                AutoImageProcessor,
+                ViTForImageClassification,
+            )
+
+            cfg = AutoConfig.from_pretrained(str(self.model_dir),
+                                             local_files_only=True)
+            # 处理器：优先目录自带 preprocessor_config.json，缺失时用默认 ViT 处理器
+            try:
+                self._processor = AutoImageProcessor.from_pretrained(
+                    str(self.model_dir), local_files_only=True)
+            except Exception:
+                from transformers import ViTImageProcessor
+                self._processor = ViTImageProcessor()
+
+            hf_weights = self.model_dir / "model.safetensors"
+            has_bin = bool(list(self.model_dir.glob("*.bin")))
+            if hf_weights.is_file() or has_bin:
+                self._model = ViTForImageClassification.from_pretrained(
+                    str(self.model_dir), local_files_only=True)
+                num_classes = int(getattr(self._model.config, "num_labels", 0)) or None
+            else:
+                # 本机训练产物：按 config 重建网络，再按形状过滤后载入权重
+                weight_path = self._resolve_pt_weight()
+                if weight_path is None:
+                    raise ModelLoadError(f"未找到可用权重文件：{self.model_dir}")
+                state = _load_torch_checkpoint(weight_path)
+                cls_key = next((k for k in state if k.endswith("classifier.weight")), None)
+                if cls_key is None:
+                    raise ModelLoadError("checkpoint 中未找到 classifier 权重，无法推断类别数")
+                num_classes = int(state[cls_key].shape[0])
+                cfg.num_labels = num_classes
+                self._model = ViTForImageClassification(cfg)
+                reference = self._model.state_dict()
+                filtered = {k: v for k, v in state.items()
+                            if k in reference and tuple(v.shape) == tuple(reference[k].shape)}
+                self._model.load_state_dict(filtered, strict=False)
+
+            self._model.eval().to(get_device())
+            # 类别名：labels.json 优先，其次模型 config 的 id2label，最后占位
+            self._names = []
+            if num_classes:
+                self._names = self._names_from_labels(num_classes)
+            if not self._names:
+                id2label = dict(getattr(self._model.config, "id2label", {}) or {})
+                if id2label:
+                    total = max(int(k) for k in id2label) + 1
+                    self._names = [str(id2label.get(i, f"CLASS_{i}")) for i in range(total)]
+            if not self._names and num_classes:
+                self._names = [f"类别_{i}" for i in range(num_classes)]
+        except ModelLoadError:
+            raise
+        except Exception as exc:
+            raise ModelLoadError(f"HuggingFace ViT 加载失败：{exc}")
+        self._loaded = True
+
+    @torch.no_grad()
+    def predict(self, pil_image: Image.Image, top_k: int = 3) -> List[SpeciesPrediction]:
+        if not self._loaded:
+            self.load()
+        inputs = self._processor(images=pil_image.convert("RGB"), return_tensors="pt")
+        inputs = {k: v.to(get_device()) for k, v in inputs.items()}
+        logits = self._model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)[0]
+        k = min(top_k, probs.shape[0])
+        values, indices = torch.topk(probs, k)
+        results = []
+        for v, i in zip(values.tolist(), indices.tolist()):
+            name = self._names[i] if i < len(self._names) else f"CLASS_{i}"
+            # 内置鸟类对照表命中时给出中文名，否则中英文同名显示
+            results.append(SpeciesPrediction(
+                label_en=name,
+                label_cn=species_en_to_cn(name),
+                confidence=round(float(v), 4),
+            ))
+        return results
+
+
+class ResNeSt101Adapter(SpeciesBackend):
+    """ResNeSt101 分类适配器（timm 结构重建 + checkpoint 加载，软依赖）。
+
+    权重路径：注册表 params 的 weights_path（共享模型库条目走此通道）；
+    支持 DataParallel 保存的权重（自动去除 module. 前缀）。
+    类别名来源：显式 labels_path（共享库 labels.json，{类名: 序号}）→
+    权重同目录 labels.json → 兜底 类别_i。
+
+    timm 为可选依赖：未安装时 is_available() 返回 False，注册表加载失败会
+    自动回退到其他物种模型（不影响系统启动，也不影响其余功能）。
+    """
+
+    # timm 中的 ResNeSt101 模型名（含 Split-Attention 结构）
+    MODEL_NAME = "resnest101e"
+
+    def __init__(self, weights_path: Optional[str] = None,
+                 labels_path: Optional[str] = None,
+                 class_names: Optional[List[str]] = None,
+                 model_name: Optional[str] = None, **kwargs):
+        super().__init__()
+        self.weights_path = Path(weights_path) if weights_path else None
+        self._labels_path = Path(labels_path) if labels_path else None
+        self._class_names = list(class_names) if class_names else None
+        self.model_name = model_name or self.MODEL_NAME
+        self._model = None
+        self._names: List[str] = []
+
+    @staticmethod
+    def _timm_available() -> bool:
+        """timm 是否可导入（软依赖探测）。"""
+        try:
+            import timm  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def is_available(self) -> bool:
+        return bool(self.weights_path and self.weights_path.is_file()) \
+            and self._timm_available()
+
+    def _resolve_names(self, num_classes: int) -> List[str]:
+        """解析类别名（labels.json 反转 → 占位）。"""
+        if self._class_names and len(self._class_names) == num_classes:
+            return self._class_names
+        candidates = []
+        if self._labels_path is not None:
+            candidates.append(self._labels_path)
+        if self.weights_path is not None:
+            candidates.append(self.weights_path.parent / "labels.json")
+        for path in candidates:
+            try:
+                import json
+                mapping = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            names: List[Optional[str]] = [None] * num_classes
+            for label, idx in mapping.items():
+                try:
+                    pos = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= pos < num_classes:
+                    names[pos] = str(label)
+            if all(n is not None for n in names):
+                return [str(n) for n in names]
+        return [f"类别_{i}" for i in range(num_classes)]
+
+    def load(self) -> None:
+        if not self._timm_available():
+            raise ModelLoadError(
+                "ResNeSt101 需要 timm 库，请先安装：pip install timm")
+        if not (self.weights_path and self.weights_path.is_file()):
+            raise ModelLoadError(f"ResNeSt101 权重文件缺失：{self.weights_path}")
+        try:
+            import timm
+
+            state = _load_torch_checkpoint(self.weights_path)
+            # 去除 DataParallel 的 module. 前缀，便于与 timm 裸网络键名对齐
+            state = {k[7:] if str(k).startswith("module.") else str(k): v
+                     for k, v in state.items()}
+            fc_key = next((k for k in state if k.endswith("fc.weight")), None)
+            if fc_key is None:
+                raise ModelLoadError("checkpoint 中未找到 fc 权重，无法推断类别数")
+            num_classes = int(state[fc_key].shape[0])
+            self._model = timm.create_model(self.model_name, pretrained=False,
+                                            num_classes=num_classes)
+            reference = self._model.state_dict()
+            filtered = {k: v for k, v in state.items()
+                        if k in reference and tuple(v.shape) == tuple(reference[k].shape)}
+            missing, _unexpected = self._model.load_state_dict(filtered, strict=False)
+            # 匹配率过低说明结构不符，视为加载失败（避免静默使用随机权重）
+            if len(reference) and len(missing) > max(10, int(len(reference) * 0.1)):
+                raise ModelLoadError(
+                    f"权重与 timm {self.model_name} 结构匹配度过低"
+                    f"（缺失 {len(missing)}/{len(reference)} 个键）")
+            self._model.eval().to(get_device())
+            self._names = self._resolve_names(num_classes)
+        except ModelLoadError:
+            raise
+        except Exception as exc:
+            raise ModelLoadError(f"ResNeSt101 加载失败：{exc}")
+        self._loaded = True
+
+    @torch.no_grad()
+    def predict(self, pil_image: Image.Image, top_k: int = 3) -> List[SpeciesPrediction]:
+        if not self._loaded:
+            self.load()
+        import timm
+
+        data_cfg = timm.data.resolve_data_config({}, model=self._model)
+        transform = timm.data.create_transform(**data_cfg, is_training=False)
+        tensor = transform(pil_image.convert("RGB")).unsqueeze(0).to(get_device())
+        logits = self._model(tensor)
+        probs = torch.softmax(logits, dim=-1)[0]
+        k = min(top_k, probs.shape[0])
+        values, indices = torch.topk(probs, k)
+        results = []
+        for v, i in zip(values.tolist(), indices.tolist()):
+            name = self._names[i] if i < len(self._names) else f"类别_{i}"
+            results.append(SpeciesPrediction(
+                label_en=name, label_cn=name, confidence=round(float(v), 4)))
+        return results
+
+
 class OwlViTAdapter(PartDetectorBackend):
     """OWL-ViT 开放词汇零样本检测（部位定位默认项，解决部位数据无框标注问题）。"""
 
@@ -390,13 +677,24 @@ class OwlViTAdapter(PartDetectorBackend):
 
 
 class TrainedFrcnnAdapter(PartDetectorBackend):
-    """管线 B 产物：Faster R-CNN 15 部位检测器（无需提示词，直接检测）。"""
+    """Faster R-CNN 部位检测器（管线 B 产物；共享模型库条目亦走此适配器）。
+
+    权重路径：注册表 params 的 weights_path（共享模型库条目）优先于旧参数
+    checkpoint_path；均未传时读 config.DETECTOR_OUTPUT_DIR/best_detector.pth。
+    类别数：显式 num_classes 参数 > 从权重 cls_score 形状推断 > config 常量
+    （共享库条目由注册表 class_count 传入，保证与训练产物一致）。
+    部位名称沿用 config.PART_TO_DETECTOR_IDX 约定的 15 部位索引（与管线 B 一致）。
+    """
 
     def __init__(self, checkpoint_path: Optional[str] = None,
+                 weights_path: Optional[str] = None,
+                 num_classes: Optional[int] = None,
                  score_threshold: Optional[float] = None, **kwargs):
         super().__init__()
-        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path \
+        resolved = weights_path or checkpoint_path
+        self.checkpoint_path = Path(resolved) if resolved \
             else config.DETECTOR_OUTPUT_DIR / "best_detector.pth"
+        self.num_classes = int(num_classes) if num_classes else None
         self.score_threshold = score_threshold if score_threshold is not None \
             else config.TRAIN_DETECTOR["score_threshold"]
         self._model = None
@@ -413,11 +711,23 @@ class TrainedFrcnnAdapter(PartDetectorBackend):
             from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2
             from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
+            state = _load_torch_checkpoint(self.checkpoint_path)
+            # 兼容 DataParallel 保存的权重（module. 前缀）
+            state = {str(k)[7:] if str(k).startswith("module.") else str(k): v
+                     for k, v in state.items()}
+            # 类别数：显式参数 > 权重推断 > 配置常量
+            num_classes = self.num_classes
+            if not num_classes:
+                cls_key = next((k for k in state
+                                if k.endswith("roi_heads.box_predictor.cls_score.weight")), None)
+                if cls_key is not None:
+                    num_classes = int(state[cls_key].shape[0])
+            if not num_classes:
+                num_classes = config.NUM_DETECTOR_CLASSES
             self._model = fasterrcnn_resnet50_fpn_v2(weights=None)
             in_features = self._model.roi_heads.box_predictor.cls_score.in_features
             self._model.roi_heads.box_predictor = FastRCNNPredictor(
-                in_features, config.NUM_DETECTOR_CLASSES)
-            state = _load_torch_checkpoint(self.checkpoint_path)
+                in_features, num_classes)
             self._model.load_state_dict(state)
             self._model.eval().to(get_device())
         except ModelLoadError:

@@ -66,6 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", type=Path, required=True,
                         help="导出目标目录（数据集根目录）")
+    parser.add_argument("--taxon-ids", type=str, default="",
+                        help="仅导出指定类群（逗号分隔的类群 ID，空=全部；"
+                             "GUI「训练数据集」页签按勾选类群导出时使用）")
     parser.add_argument("--data-dir", type=Path, default=BASE_DIR / "data",
                         help="照片数据根目录（含 taxon_* 目录，默认脚本目录下的 data）")
     parser.add_argument("--main-db", type=Path, default=BASE_DIR / "data" / "db" / "bird_observations.db",
@@ -256,6 +259,16 @@ def export_dataset(args: argparse.Namespace) -> int:
 
     license_allow = {x.strip().lower() for x in str(args.license).split(",")
                      if x.strip()}
+    # 类群白名单（空=全部）：GUI「训练数据集」页签按勾选类群导出时传入
+    raw_ids = str(getattr(args, "taxon_ids", "") or "").strip()
+    taxon_allow: set[int] = set()
+    if raw_ids:
+        for part in raw_ids.split(","):
+            part = part.strip()
+            if not part.isdigit():
+                print(f"--taxon-ids 含非法值: {part}（应为逗号分隔的数字类群 ID）")
+                return 1
+            taxon_allow.add(int(part))
     rng = random.Random(args.seed)
 
     manager = INaturalistDatabaseManager(
@@ -273,13 +286,17 @@ def export_dataset(args: argparse.Namespace) -> int:
     # photos_by_taxon[taxon_id] = {observation_id: [记录, ...]}
     photos_by_taxon: dict[int, dict[int, list[dict[str, Any]]]] = {}
     meta_by_taxon: dict[int, dict[str, str]] = {}
-    skip_no_file = skip_license = skip_size = 0
+    skip_no_file = skip_license = skip_size = skip_taxon = 0
     for row in candidates:
         taxon_id = row["taxon_id"]
         if taxon_id is None:
             skip_no_file += 1
             continue
         taxon_id = int(taxon_id)
+        # 类群白名单过滤（白名单为空 = 不过滤，保持原有 CLI 行为不变）
+        if taxon_allow and taxon_id not in taxon_allow:
+            skip_taxon += 1
+            continue
         # 许可证白名单过滤（白名单为空 = 不过滤）
         if license_allow and row["license_code"].lower() not in license_allow:
             skip_license += 1
@@ -473,6 +490,9 @@ def export_dataset(args: argparse.Namespace) -> int:
     # 控制台摘要
     split_counter = Counter(r["split"] for r in manifest_rows)
     print("导出完成:")
+    if taxon_allow:
+        print(f"  类群过滤: 仅导出勾选的 {len(taxon_allow)} 个类群"
+              f"（跳过非勾选记录 {skip_taxon} 条）")
     print(f"  类别数: {len({r['taxon_id'] for r in manifest_rows})}")
     print(f"  照片数: {stats['exported']} "
           f"(train {split_counter.get('train', 0)} / "

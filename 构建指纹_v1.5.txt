@@ -1,0 +1,3 @@
+watermark_id=TYWM-BIRD-v1.5-D05AE2B7C154DBB9
+fingerprint=D05AE2B7C154DBB9
+build_time=2026-10-15 08:37:20

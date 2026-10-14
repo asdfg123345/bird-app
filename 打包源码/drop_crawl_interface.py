@@ -88,6 +88,35 @@ TEXT_SUFFIXES = {".txt"}
 # 常驻监视模式中文件夹处理完成后的标记文件名
 IMPORT_MARKER = "_已导入_指纹编码完成.txt"
 
+# 数据集常见分割/功能目录名黑名单：这类名字不是物种名，禁止参与类群解析，
+# 避免「train」「test」等被 iNaturalist 接口模糊匹配到无关类群
+# （实测「train」曾被误匹配到真菌 Trainwrecker，2026-10-14 用户反馈）
+FALLBACK_NAME_BLACKLIST = {
+    "train", "val", "valid", "validation", "test", "eval",
+    "images", "image", "imgs", "photos", "photo", "pictures",
+    "labels", "label", "annotations", "dataset", "data", "raw",
+}
+
+
+def _open_json_with_retry(api: str, timeout: int = 15,
+                          attempts: int = 3) -> dict:
+    """请求 JSON 接口，网络瞬断时自动重试（指数退避 1s/2s）。
+
+    大批量拖入时 iNaturalist 接口偶发 Remote end closed / SSL EOF，
+    单次请求失败即跳过种类会白白损失图片入库机会，故加入重试。
+    只重试网络异常；「未找到结果」属正常响应，由调用方处理。
+    """
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(api, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s 退避
+    raise last_exc  # 重试耗尽，抛给调用方按原有流程记录
+
 
 def resolve_taxon_id(token: str, timeout: int = 15) -> tuple[int | None, str]:
     """将一行内容解析为类群 ID。
@@ -104,14 +133,13 @@ def resolve_taxon_id(token: str, timeout: int = 15) -> tuple[int | None, str]:
     api = ("https://api.inaturalist.org/v1/taxa/autocomplete?q="
            + urllib.parse.quote(token))
     try:
-        with urllib.request.urlopen(api, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = _open_json_with_retry(api, timeout=timeout)
         results = data.get("results") or []
         if not results:
             return None, f"未找到与「{token}」匹配的类群"
         first = results[0]
         return int(first["id"]), f"「{token}」→ {first.get('name')} (rank={first.get('rank')})"
-    except Exception as exc:  # 网络异常时不中断整体流程
+    except Exception as exc:  # 重试后仍失败才放弃，不中断整体流程
         return None, f"解析「{token}」失败: {exc}"
 
 
@@ -130,8 +158,7 @@ def resolve_taxon_info(token: str, timeout: int = 15) -> tuple[int | None, str, 
         api = ("https://api.inaturalist.org/v1/taxa/autocomplete?q="
                + urllib.parse.quote(token))
     try:
-        with urllib.request.urlopen(api, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = _open_json_with_retry(api, timeout=timeout)
         results = data.get("results") or []
         if not results:
             return None, "", "", f"未找到与「{token}」匹配的类群"
@@ -142,8 +169,37 @@ def resolve_taxon_info(token: str, timeout: int = 15) -> tuple[int | None, str, 
         rank = first.get("rank") or ""
         note = f"「{token}」→ {sci} / {common} (id={taxon_id}, rank={rank})"
         return taxon_id, sci, common, note
-    except Exception as exc:  # 网络异常时不中断整体流程
+    except Exception as exc:  # 重试后仍失败才放弃，不中断整体流程
         return None, "", "", f"解析「{token}」失败: {exc}"
+
+
+def _taxon_name_candidates(kind_name: str, rel_path: str) -> list[str]:
+    """构造叶名未命中时的回退候选类群名序列（自近及远）。
+
+    顺序：叶名按下划线拆分 → 层级路径上层文件夹名自近及远，每个名字先整名、
+    再按下划线拆分（如「青藏喜鹊_Pica bottanensis」→ 青藏喜鹊、Pica bottanensis）。
+    自动剔除空白、含盘符冒号与重复的候选；叶名整名已试过故不重复列入。
+    """
+    candidates: list[str] = []
+
+    def _push(text: str) -> None:
+        text = text.strip()
+        # 黑名单内的目录名（train/val/test 等）不是物种名，不得作为回退候选
+        if (text and ":" not in text and text not in candidates
+                and text.lower() not in FALLBACK_NAME_BLACKLIST):
+            candidates.append(text)
+
+    for part in (p.strip() for p in kind_name.split("_")):
+        if part and part != kind_name:
+            _push(part)
+    segments = [s.strip() for s in rel_path.split("/") if s.strip()]
+    # 最后一段即叶名本身，已试过；从父级起自近及远回退
+    for seg in reversed(segments[:-1] if len(segments) > 1 else []):
+        _push(seg)
+        for part in (p.strip() for p in seg.split("_")):
+            if part != seg:
+                _push(part)
+    return candidates
 
 
 def fetch_taxon_tree_nodes(taxon_id: int, timeout: int = 15) -> list[dict]:
@@ -311,18 +367,55 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
                             seen_in_session: set[str],
                             report_lines: list[str],
                             rel_path: str = "",
-                            texts: str = "") -> tuple[int, int, int]:
+                            texts: str = "",
+                            progress_base: int = 0,
+                            progress_total: int = 0) -> tuple[int, int, int, int]:
     """将一个种类的图片依次指纹编码入库（种类内部复用一条本地观察）。
 
     rel_path 为纲-目-科层级路径，texts 为种文件夹内的说明文本，
-    二者并入该种观察记录的备注。返回 (新导入数, 重复跳过数, 失败数)。
+    二者并入该种观察记录的备注。progress_base/progress_total 用于向
+    stdout 输出全局照片级进度行（[进度] 照片 i/n），供 GUI 进度条消费。
+    返回 (新导入数, 重复跳过数, 失败数, 跳过数)。
+    注意：跳过（分割目录名/未匹配类群，图片未处理）与失败（处理出错）
+    分开统计，避免用户把大量正常跳过误读为导入故障。
     """
-    taxon_id, sci, common, note = resolve_taxon_info(kind_name)
+    # 叶名本身是数据集分割目录名（train/val/test 等）时直接视为未匹配，
+    # 不调用接口解析，防止被模糊匹配到无关类群
+    if kind_name.strip().lower() in FALLBACK_NAME_BLACKLIST:
+        taxon_id, sci, common, note = None, "", "", (
+            f"  种类名「{kind_name}」为数据集分割目录名，不参与类群解析")
+    else:
+        # 「xx同属（英文名：XXX）」格式：整名无法解析，但括号内为具体
+        # 物种英文名，提取后直接解析（一个文件夹对应一个物种）
+        m_en = re.search(r"同属（英文名：(.+?)）", kind_name)
+        if m_en:
+            en_name = m_en.group(1).strip()
+            taxon_id, sci, common, note = resolve_taxon_info(en_name)
+            if taxon_id is not None:
+                # 解析成功：报告同时记录原始文件夹名与英文名
+                report_lines.append(
+                    f"  「{kind_name}」按英文名「{en_name}」解析")
+        else:
+            taxon_id, sci, common, note = resolve_taxon_info(kind_name)
     report_lines.append(f"  {note}")
     if rel_path and rel_path != kind_name:
         report_lines.append(f"  层级: {rel_path}")
     if taxon_id is None:
-        return 0, 0, 0
+        # 叶名（直接含图片的最深层文件夹名）未命中时按层级回退解析，
+        # 适应「物种_学名/来源子文件夹/图片」等以来源命名叶层的组织方式
+        for cand in _taxon_name_candidates(kind_name, rel_path):
+            tid, s2, c2, n2 = resolve_taxon_info(cand)
+            if tid is not None:
+                taxon_id, sci, common = tid, s2, c2
+                report_lines.append(f"  回退层级名「{cand}」命中: {n2}")
+                break
+    if taxon_id is None:
+        # 明确报告未匹配并跳过，绝不静默归入错误类群；
+        # 此类数据集建议改用「训练数据集」页签按物种清单映射导入
+        report_lines.append(
+            f"  !! 「{kind_name}」未匹配到类群，跳过本种类"
+            f"（{len(images)} 张图片未入库，不计入失败）")
+        return 0, 0, 0, len(images)
 
     # 目录命名与主爬虫完全一致，保证与爬取数据合并存储
     from download_inaturalist import slugify
@@ -351,6 +444,10 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
 
     new = dup = fail = 0
     for position, img in enumerate(images, 1):
+        # 全局照片级进度行：GUI 进度条按此刷新（种类内也保持细粒度反馈）
+        if progress_total > 0:
+            print(f"[进度] 照片 {progress_base + position}/{progress_total}",
+                  flush=True)
         sha = _sha256_of_file(img)
         seen_in_session.add(sha)
         if manager.has_photo_fingerprint(sha):
@@ -394,7 +491,7 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
     report_lines.append(
         f"  小计 {folder_name}: 新入库 {new}, 重复 {dup}, 失败 {fail}, "
         f"本地观察ID {obs_id}")
-    return new, dup, fail
+    return new, dup, fail, 0
 
 
 def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
@@ -442,15 +539,23 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
         output_dir=str(out_dir))
     try:
         seen: set[str] = set()
-        total_new = total_dup = total_fail = 0
+        total_new = total_dup = total_fail = total_skip = 0
+        # 全局照片总数：进度条的照片级分母（所有种类图片数之和）
+        total_photos = sum(len(imgs) for _, imgs, _, _ in kinds)
+        photo_base = 0
         for k, (kind_name, images, rel_path, texts) in enumerate(kinds, 1):
+            # 种类级进度行：GUI 进度条标签按此刷新
+            print(f"[进度] 种类 {k}/{len(kinds)}「{kind_name}」", flush=True)
             report_lines.append(f"[{k}/{len(kinds)}] 种类「{kind_name}」共 {len(images)} 张")
-            new, dup, fail = _import_images_for_kind(
+            new, dup, fail, skip = _import_images_for_kind(
                 kind_name, images, manager, batch_id, out_dir, seen, report_lines,
-                rel_path=rel_path, texts=texts)
+                rel_path=rel_path, texts=texts,
+                progress_base=photo_base, progress_total=total_photos)
+            photo_base += len(images)
             total_new += new
             total_dup += dup
             total_fail += fail
+            total_skip += skip
         manager.update_batch_run(
             batch_id, taxa_succeeded=len(kinds),
             total_photos=total_new + total_dup,
@@ -459,8 +564,15 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
         manager.close()
 
     report_lines.append("-" * 56)
-    report_lines.append(
-        f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, 失败 {total_fail} 张。")
+    if total_skip:
+        report_lines.append(
+            f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, "
+            f"跳过 {total_skip} 张（分割目录/未匹配类群，未处理非故障）, "
+            f"失败 {total_fail} 张。")
+    else:
+        report_lines.append(
+            f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, "
+            f"失败 {total_fail} 张。")
     report_lines.append("源文件夹保持原位未动；照片已按种类存入对应 taxon_ 文件夹。")
     return "\n".join(report_lines)
 
@@ -498,15 +610,23 @@ def process_drop_images(paths: list[Path], out_dir: Path, db_dir: Path,
         output_dir=str(out_dir))
     try:
         seen: set[str] = set()
-        total_new = total_dup = total_fail = 0
+        total_new = total_dup = total_fail = total_skip = 0
+        # 全局照片总数：进度条的照片级分母（所有种类图片数之和）
+        total_photos = sum(len(imgs) for _, imgs, _, _ in kinds)
+        photo_base = 0
         for k, (kind_name, images, rel_path, texts) in enumerate(kinds, 1):
+            # 种类级进度行：GUI 进度条标签按此刷新
+            print(f"[进度] 种类 {k}/{len(kinds)}「{kind_name}」", flush=True)
             report_lines.append(f"[{k}/{len(kinds)}] 种类「{kind_name}」共 {len(images)} 张")
-            new, dup, fail = _import_images_for_kind(
+            new, dup, fail, skip = _import_images_for_kind(
                 kind_name, images, manager, batch_id, out_dir, seen, report_lines,
-                rel_path=rel_path, texts=texts)
+                rel_path=rel_path, texts=texts,
+                progress_base=photo_base, progress_total=total_photos)
+            photo_base += len(images)
             total_new += new
             total_dup += dup
             total_fail += fail
+            total_skip += skip
         manager.update_batch_run(
             batch_id, taxa_succeeded=len(kinds),
             total_photos=total_new + total_dup,
@@ -515,8 +635,15 @@ def process_drop_images(paths: list[Path], out_dir: Path, db_dir: Path,
         manager.close()
 
     report_lines.append("-" * 56)
-    report_lines.append(
-        f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, 失败 {total_fail} 张。")
+    if total_skip:
+        report_lines.append(
+            f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, "
+            f"跳过 {total_skip} 张（分割目录/未匹配类群，未处理非故障）, "
+            f"失败 {total_fail} 张。")
+    else:
+        report_lines.append(
+            f"导入完成: 新入库 {total_new} 张, 重复跳过 {total_dup} 张, "
+            f"失败 {total_fail} 张。")
     report_lines.append("源图片保持原位未动。")
     return "\n".join(report_lines)
 
@@ -544,6 +671,8 @@ def process_drop_file(path: Path, max_per_taxon: int, workers: int,
         return "\n".join(report_lines)
 
     for i, row in enumerate(rows, 1):
+        # 种类级进度行：GUI 进度条按此刷新（爬取模式无照片级进度）
+        print(f"[进度] 种类 {i}/{len(rows)}「{row}」", flush=True)
         taxon_id, note = resolve_taxon_id(row)
         report_lines.append(f"[{i}/{len(rows)}] {note}")
         if taxon_id is None:
@@ -657,24 +786,65 @@ def handle_images(paths: list[Path], args: argparse.Namespace,
     print("<<< 处理结束，等待下一个文件...\n")
 
 
+def _dir_snapshot(folder: Path) -> tuple[int, int]:
+    """递归统计文件夹的条目数与总字节数，用于判断复制是否仍在进行。"""
+    count = 0
+    total = 0
+    try:
+        for item in folder.rglob("*"):
+            count += 1
+            if item.is_file():
+                total += item.stat().st_size
+    except OSError:
+        pass  # 复制过程中个别文件暂不可访问属正常，跳过即可
+    return count, total
+
+
 def watch_inbox(args: argparse.Namespace) -> None:
-    """常驻监视投放目录，自动处理新增的文本文件、图片与文件夹。"""
+    """常驻监视投放目录，自动处理新增的文本文件、图片与文件夹。
+
+    文件夹采用「快照稳定」判定：连续 3 轮扫描（约 6 秒）条目数与总大小
+    都不变，才认为复制已完成并开始处理，避免大文件夹复制中途被抢跑
+    （2026-10-14 用户实测：200 类群数据集复制中途被处理，仅入库一小部分）。
+    """
     inbox = Path(args.inbox)
     inbox.mkdir(parents=True, exist_ok=True)
     print(f"拖入监视已启动: {inbox}")
     print("将 txt/csv 清单、图片或图片文件夹放入该目录即可自动处理。按 Ctrl+C 退出。\n")
+    # 记录每个待定文件夹的 (快照, 连续稳定轮数)
+    stable_marks: dict[Path, tuple[tuple[int, int], int]] = {}
     while True:
+        seen_now: set[Path] = set()
         for item in sorted(inbox.iterdir()):
+            # 跳过已处理归档目录本身：它常驻监视目录内且无导入完成标记，
+            # 不排除会被每轮当作新输入处理，移动到自己内部报错
+            # （Cannot move a directory ... into itself，2026-10-14 用户实测）
+            if item.name == PROCESSED_DIRNAME:
+                continue
+            seen_now.add(item)
             if item.is_dir():
                 # 文件夹：跳过已写入完成标记的
-                if not (item / IMPORT_MARKER).exists():
-                    handle_folder(item, args, write_marker=True,
-                                  move_to_processed=True)
+                if (item / IMPORT_MARKER).exists():
+                    continue
+                snap = _dir_snapshot(item)
+                prev = stable_marks.get(item)
+                rounds = prev[1] + 1 if prev and prev[0] == snap else 1
+                stable_marks[item] = (snap, rounds)
+                # 连续 3 轮快照不变（约 6 秒无变化）才开始处理
+                if rounds < 3:
+                    continue
+                print(f"    （{item.name} 快照已稳定 {rounds} 轮，开始处理）")
+                handle_folder(item, args, write_marker=True,
+                              move_to_processed=True)
+                stable_marks.pop(item, None)
             elif item.is_file():
                 if item.suffix.lower() in SUPPORTED_SUFFIXES:
                     handle_file(item, args)
                 elif item.suffix.lower() in IMG_SUFFIXES:
                     handle_images([item], args, move_to_processed=True)
+        # 清理已消失（被处理/移走/删除）条目的稳定计数，防止字典膨胀
+        for gone in [k for k in stable_marks if k not in seen_now]:
+            stable_marks.pop(gone, None)
         time.sleep(2)
 
 

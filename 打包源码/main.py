@@ -47,6 +47,38 @@ from download_inaturalist import download_taxon_data
 from inaturalist_db_initializer import init_all_databases
 from inaturalist_db_manager import INaturalistDatabaseManager
 
+# ============================================================
+# 数字水印与版权信息（程序权属标识，受保护内容，请勿移除）
+# ============================================================
+APP_VERSION = "1.5"
+APP_AUTHOR = "天咏"
+APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
+# 控制台输出的版权行不含 © 字符（Windows 控制台默认 GBK 代码页无法
+# 编码该字符）；PE 版本资源中的版权行由版本信息文件独立定义（含 ©）。
+APP_COPYRIGHT = "2026 天咏 版权所有（明月照今日，风摇过两川。）"
+# 以下两项为打包占位符：打包准备脚本构建时自动替换为源码指纹与构建时间；
+# 源码直接运行时保留占位说明文本，不影响任何功能。
+APP_BUILD_FINGERPRINT = "D05AE2B7C154DBB9"
+APP_BUILD_TIME = "2026-10-15 08:37:20"
+# 数字水印标识：TYWM（天咏水印）+ 产品代号 + 版本 + 源码指纹
+APP_WATERMARK_ID = f"TYWM-BIRD-v{APP_VERSION}-{APP_BUILD_FINGERPRINT}"
+
+
+def watermark_banner() -> str:
+    """组装程序权属水印文本（copyright 子命令与版本输出共用）。"""
+    lines = [
+        "程序名称：鸟类（iNaturalist 鸟类数据采集与图像下载系统）",
+        f"程序版本：v{APP_VERSION}",
+        f"作者署名：{APP_AUTHOR}（{APP_AUTHOR_SIGNATURE}）",
+        f"版权声明：{APP_COPYRIGHT}",
+        f"数字水印：{APP_WATERMARK_ID}",
+        f"构建指纹：{APP_BUILD_FINGERPRINT}",
+        f"构建时间：{APP_BUILD_TIME}",
+        "权属说明：本程序及其安装包内嵌数字水印与源码构建指纹，",
+        "        用以标识著作权归属；未经授权不得去除或篡改。",
+    ]
+    return "\n".join(lines)
+
 
 def _resolve_db_paths(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]:
     """根据命令行参数解析数据库路径。"""
@@ -230,6 +262,7 @@ def cmd_dataset(args: argparse.Namespace) -> int:
     # 映射为导出模块的参数命名空间
     export_args = argparse.Namespace(
         out=args.out,
+        taxon_ids=getattr(args, "taxon_ids", ""),
         data_dir=args.out_dir,
         main_db=main_db,
         splits=args.splits,
@@ -246,11 +279,24 @@ def cmd_dataset(args: argparse.Namespace) -> int:
     return dataset_run(export_args)
 
 
+def cmd_copyright(args: argparse.Namespace) -> int:
+    """版权与数字水印查询子命令：输出程序权属标识信息。"""
+    print(watermark_banner())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行解析器。"""
     parser = argparse.ArgumentParser(
         description="iNaturalist 鸟类下载项目统一入口",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # 顶层 --version：输出版本、版权与数字水印（GBK 安全文本，控制台直接输出）
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"鸟类 v{APP_VERSION}（2026 {APP_AUTHOR} 版权所有） 数字水印 {APP_WATERMARK_ID}",
+        help="输出版本、版权与数字水印信息",
     )
     subparsers = parser.add_subparsers(dest="command", required=True, help="子命令")
 
@@ -419,6 +465,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--out", type=Path, required=True,
         help="数据集导出目标目录")
     dataset_parser.add_argument(
+        "--taxon-ids", type=str, default="",
+        help="仅导出指定类群（逗号分隔的类群 ID，空=全部；"
+             "GUI「训练数据集」页签按勾选类群导出时使用）")
+    dataset_parser.add_argument(
         "--splits", type=str, default="8:1:1",
         help="train:val:test 比例（默认 8:1:1，按观察划分）")
     dataset_parser.add_argument(
@@ -449,6 +499,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-verify", action="store_true",
         help="跳过图片完整性校验（PIL 未安装时自动跳过）")
 
+    # copyright 子命令（版权与数字水印查询：输出权属标识信息）
+    subparsers.add_parser("copyright", help="查看版权与数字水印信息")
+
     return parser
 
 
@@ -460,7 +513,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """项目统一入口主函数。"""
     try:
-        sys.stdout.reconfigure(line_buffering=True)
+        # 行缓冲即时输出；errors=replace 保证极端代码页下不可编码字符不致崩溃
+        sys.stdout.reconfigure(line_buffering=True, errors="replace")
     except Exception:
         pass
 
@@ -485,6 +539,7 @@ def main() -> int:
         "gui": cmd_gui,
         "drop": cmd_drop,
         "dataset": cmd_dataset,
+        "copyright": cmd_copyright,
     }
     handler = command_map[args.command]
     return handler(args)

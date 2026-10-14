@@ -54,6 +54,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 # 同目录共享模型库模块（注册表/训练模式预设/预览图；无 torch 依赖，可安全导入）
 import model_library as ml
+# 同目录训练数据集注册表模块（纯文件读写，无重依赖，可安全导入）
+import dataset_registry
 
 # 路径均相对脚本目录解析，避免硬编码
 BASE_DIR = _frozen_base(__file__)
@@ -85,6 +87,44 @@ DEFAULT_TAXA = [
     (12704, "鹟科"), (15977, "鸫科"), (4929, "鹭科"), (4342, "鸥科"),
     (3835, "鹬科"), (154, "秧鸡科"), (20967, "戴胜科"),
 ]
+
+# ============================================================
+# 子进程命令构造（源码形态与 exe 打包形态双适配，2026-10-14 回归修复）
+# ============================================================
+# 脚本文件 → 主程序内置子命令的映射：打包为 exe 后，GUI 不能再以
+# 「解释器 + 脚本路径」方式拉起子进程——exe 形态下 sys.executable
+# 是主程序自身，脚本路径会被主程序 argparse 判为非法子命令
+# （invalid choice 错误），必须改走主程序内置的同名子命令。
+_SCRIPT_TO_SUBCOMMAND = {
+    "drop_crawl_interface.py": "drop",
+    "dataset_exporter.py": "dataset",
+    "batch_download_birds.py": "batch",
+}
+
+
+def _script_run_args(script_name: str, script_args: list[str]) -> list[str]:
+    """构造脚本运行命令：exe 打包形态走主程序子命令，源码形态用解释器加脚本。"""
+    if getattr(sys, "frozen", False):
+        # 打包形态：主程序内置同名子命令（drop/dataset/batch）
+        return [sys.executable, _SCRIPT_TO_SUBCOMMAND[script_name], *script_args]
+    # 源码形态：当前解释器直接运行脚本文件
+    return [sys.executable, str(BASE_DIR / script_name), *script_args]
+
+
+# 子进程 stdout 解码编码（2026-10-14 乱码修复）：
+# 打包形态下 PyInstaller bootloader 会清除 PYTHON* 环境变量（实测向 exe
+# 传 PYTHONIOENCODING/PYTHONUTF8 均被忽略），exe 子进程的 stdout 在管道
+# 重定向下遵循 Windows ANSI 代码页（简中系统为 GBK/cp936）；源码形态
+# 子进程经 PYTHONIOENCODING=utf-8 输出 UTF-8。读取端必须按形态取对应
+# 编码，否则打包版中文报告必现乱码。
+_SUBPROC_OUTPUT_ENCODING = "gbk" if getattr(sys, "frozen", False) else "utf-8"
+
+# 拖入子进程的进度行解析（drop_crawl_interface 以 print 输出，仅供进度条消费，
+# 不落入处理报告文本框，避免刷屏）：
+#   [进度] 种类 3/14「黑顶蛙口夜鹰」 —— 种类级：刷新进度标签，爬取模式下也驱动进度条
+#   [进度] 照片 45/3600             —— 照片级：导入模式下驱动进度条（细粒度）
+_DROP_PROGRESS_KIND_RE = re.compile(r"^\[进度\] 种类 (\d+)/(\d+)「(.+?)」")
+_DROP_PROGRESS_PHOTO_RE = re.compile(r"^\[进度\] 照片 (\d+)/(\d+)")
 
 
 # ============================================================
@@ -157,7 +197,8 @@ class BirdCrawlerGUI:
         self._obs_offset = 0                             # 观察记录分页偏移
         self._ph_offset = 0                              # 照片分页偏移
 
-        root.title("鸟类爬虫控制台 - iNaturalist 数据采集与浏览")
+        # 标题栏嵌入版本号与版权标识（程序数字水印的界面层）
+        root.title("鸟类爬虫控制台 v1.5 - iNaturalist 数据采集与浏览 | © 2026 天咏")
         root.geometry("1080x760")
         root.minsize(960, 660)
         root.option_add("*Font", ("Microsoft YaHei UI", 9))
@@ -213,6 +254,7 @@ class BirdCrawlerGUI:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self._build_download_tab()
         self._build_drop_tab()
+        self._build_dataset_tab()
         self._build_train_tab()
         self._build_models_tab()
         self._build_vision_tab()
@@ -230,7 +272,8 @@ class BirdCrawlerGUI:
         left.pack(side=tk.LEFT, fill=tk.Y)
 
         # 类群选择列表
-        group = ttk.LabelFrame(left, text=" 选择要下载的类群（按住 Ctrl 多选；不选=全部 15 科） ", padding=6)
+        # 类群选择：默认不做任何选择即代表全部 15 科尽量爬取（无需先选数据再爬取）
+        group = ttk.LabelFrame(left, text=" 选择要下载的类群（可 Ctrl 多选；不选=全部 15 科尽量爬取） ", padding=6)
         group.pack(fill=tk.BOTH, expand=True)
         self.taxon_listbox = tk.Listbox(group, selectmode=tk.EXTENDED,
                                         height=14, exportselection=False)
@@ -249,10 +292,11 @@ class BirdCrawlerGUI:
 
         row1 = ttk.Frame(params); row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="每类群观察上限:").pack(side=tk.LEFT)
-        self.max_var = tk.IntVar(value=200)
+        # 默认 0=不限：尽量爬取全部研究级观察，指纹去重保证重复运行只补增量
+        self.max_var = tk.IntVar(value=0)
         ttk.Spinbox(row1, from_=0, to=100000, textvariable=self.max_var,
                     width=8).pack(side=tk.LEFT, padx=4)
-        ttk.Label(row1, text="(0=不限)").pack(side=tk.LEFT)
+        ttk.Label(row1, text="(0=不限，默认尽量爬取)").pack(side=tk.LEFT)
 
         row2 = ttk.Frame(params); row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="图片尺寸:").pack(side=tk.LEFT)
@@ -352,6 +396,17 @@ class BirdCrawlerGUI:
                               "也可直接把文件拖到「拖入文件自动爬取.bat」图标上。",
                   foreground="#8a95a1").pack(side=tk.LEFT, padx=8)
 
+        # 导入进度条：由子进程输出的 [进度] 行驱动，用户可直观看到当前导入进展
+        prog = ttk.Frame(page, padding=(8, 2, 8, 0))
+        prog.pack(fill=tk.X)
+        self.drop_progress_var = tk.DoubleVar(value=0.0)
+        self.drop_progress_bar = ttk.Progressbar(
+            prog, variable=self.drop_progress_var, maximum=100)
+        self.drop_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.drop_progress_label = ttk.Label(prog, text="空闲",
+                                             foreground="#8a95a1")
+        self.drop_progress_label.pack(side=tk.LEFT, padx=8)
+
         # 处理报告
         ttk.Label(page, text="处理报告（每行一个类群 ID 或物种名，自动解析）",
                   padding=(10, 4, 0, 0)).pack(anchor=tk.W)
@@ -396,16 +451,23 @@ class BirdCrawlerGUI:
         if self.drop_proc and self.drop_proc.poll() is None:
             messagebox.showinfo("提示", "拖入处理进程正在运行中，请先停止。")
             return
-        cmd = [sys.executable, str(BASE_DIR / "drop_crawl_interface.py"), *extra,
-               *self._drop_common_args(), "--inbox", str(DATA_DIR / "drop_inbox")]
+        cmd = _script_run_args(
+            "drop_crawl_interface.py",
+            [*extra, *self._drop_common_args(), "--inbox", str(DATA_DIR / "drop_inbox")])
+        # 复位用户终止标志：每轮启动重新判定
+        self._drop_stop_requested = False
         # 子进程用 UTF-8 输出，避免中文报告乱码
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
         self.drop_proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", env=env, cwd=str(BASE_DIR))
-        self._append_drop_report(f"\n===== 启动拖入处理：{' '.join(cmd[2:])} =====\n")
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
+        self._append_drop_report(f"\n===== 启动拖入处理：{' '.join(cmd[1:])} =====\n")
+        # 复位进度条与标签：每轮启动重新从 0 开始
+        self.drop_progress_var.set(0.0)
+        self.drop_progress_label.config(text="准备导入…", foreground="#8a95a1")
+        self._drop_progress_photo_mode = False
         self.drop_stop_btn.config(state=tk.NORMAL)
         threading.Thread(target=self._read_drop_output, daemon=True).start()
 
@@ -429,6 +491,8 @@ class BirdCrawlerGUI:
     def _stop_drop(self) -> None:
         """终止拖入处理子进程。"""
         if self.drop_proc and self.drop_proc.poll() is None:
+            # 记录用户主动终止标志：结束时按此分支提示，不误报为异常失败
+            self._drop_stop_requested = True
             self.drop_proc.terminate()
             self._append_drop_report("[用户] 已请求终止拖入处理进程。\n")
 
@@ -439,22 +503,69 @@ class BirdCrawlerGUI:
         os.startfile(str(inbox))  # noqa: S606
 
     def _read_drop_output(self) -> None:
-        """后台线程：读取拖入处理子进程输出放入队列。"""
-        assert self.drop_proc is not None and self.drop_proc.stdout is not None
-        for line in self.drop_proc.stdout:
+        """后台线程：读取拖入处理子进程输出，结束后投递带返回码的结束标记。"""
+        proc = self.drop_proc
+        assert proc is not None and proc.stdout is not None
+        for line in proc.stdout:
             self.drop_queue.put(line)
-        self.drop_queue.put("\n[拖入处理进程已结束]\n")
+        self.drop_queue.put(f"\n[拖入处理进程已结束 rc={proc.wait()}]\n")
 
     def _poll_drop_queue(self) -> None:
         """主循环定时器：刷新处理报告并在进程结束后复位按钮状态。"""
         try:
             while True:
                 line = self.drop_queue.get_nowait()
+                # 进度行只驱动进度条，不落入报告文本框（避免逐种类/逐照片刷屏）
+                m = _DROP_PROGRESS_KIND_RE.match(line)
+                if m:
+                    cur, total = int(m.group(1)), int(m.group(2))
+                    # 照片级行尚未出现时（爬取模式或导入初期）由种类级驱动进度条
+                    if not getattr(self, "_drop_progress_photo_mode", False):
+                        self.drop_progress_var.set(
+                            cur / total * 100 if total else 0.0)
+                    self.drop_progress_label.config(
+                        text=f"种类 {cur}/{total}「{m.group(3)}」",
+                        foreground="#1d7a34")
+                    continue
+                m = _DROP_PROGRESS_PHOTO_RE.match(line)
+                if m:
+                    # 照片级行出现后接管进度条（细粒度），标签保留最近种类名
+                    self._drop_progress_photo_mode = True
+                    cur, total = int(m.group(1)), int(m.group(2))
+                    self.drop_progress_var.set(
+                        cur / total * 100 if total else 0.0)
+                    continue
                 self._append_drop_report(line)
-                if "[拖入处理进程已结束]" in line:
+                if "[拖入处理进程已结束" in line:
                     self.drop_stop_btn.config(state=tk.DISABLED)
                     self.drop_watch_btn.config(text="启动监视 data/drop_inbox")
                     self.drop_watch_state.config(text="未启动", foreground="#8a95a1")
+                    # 按返回码分支提示：0=正常入库；非 0=出错或被用户终止
+                    try:
+                        rc = int(line.rsplit("rc=", 1)[-1].strip("]\n "))
+                    except ValueError:
+                        rc = 1
+                    # 进度条收尾：正常完成打满，异常/终止保留当前值并提示
+                    if rc == 0:
+                        self.drop_progress_var.set(100.0)
+                        self.drop_progress_label.config(
+                            text="导入完成", foreground="#1d7a34")
+                    else:
+                        self.drop_progress_label.config(
+                            text="处理已结束（未完整）", foreground="#b3261e")
+                    if rc == 0:
+                        # 导入完成引导：提示到「训练数据集」页签勾选类群生成训练数据集
+                        self._append_drop_report(
+                            "提示：拖入数据已入库。可到「训练数据集」页签勾选类群，"
+                            "一键生成已划分的标准训练数据集。\n")
+                    elif getattr(self, "_drop_stop_requested", False):
+                        self._drop_stop_requested = False
+                        self._append_drop_report(
+                            "提示：拖入处理已被用户终止，本轮处理可能不完整。\n")
+                    else:
+                        self._append_drop_report(
+                            f"提示：拖入处理异常结束（返回码 {rc}），数据可能未完整入库，"
+                            "请检查上方日志排查后重试。\n")
         except queue.Empty:
             pass
         self.root.after(200, self._poll_drop_queue)
@@ -466,7 +577,424 @@ class BirdCrawlerGUI:
         self.drop_report.see(tk.END)
         self.drop_report.config(state=tk.DISABLED)
 
-    # ---------- 标签页 3：模型训练 ----------
+    # ---------- 标签页 3：训练数据集 ----------
+    def _build_dataset_tab(self) -> None:
+        """构建训练数据集标签页（库内类群勾选 → 一键生成已划分数据集）。
+
+        数据流：拖入/爬取入库的照片在左侧按类群聚合展示，勾选后经
+        dataset_exporter.py 子进程导出为 train/val/test 标准数据集，
+        登记进 data/train_datasets/registry.json，训练页下拉即可选用。
+        """
+        page = ttk.Frame(self.notebook)
+        self.notebook.add(page, text=" 训练数据集 ")
+
+        # 主体左右分栏：左侧类群勾选，右侧参数与数据集列表
+        body = ttk.Frame(page)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # ---------- 左侧：库内类群勾选列表 ----------
+        left = ttk.LabelFrame(body, text=" 库内类群（勾选参与训练的类群） ",
+                              padding=6)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        bar = ttk.Frame(left); bar.pack(fill=tk.X)
+        ttk.Label(bar, text="搜索:").pack(side=tk.LEFT)
+        self.ds_taxon_search_var = tk.StringVar()
+        search_entry = ttk.Entry(bar, textvariable=self.ds_taxon_search_var,
+                                 width=16)
+        search_entry.pack(side=tk.LEFT, padx=4)
+        search_entry.bind("<Return>", lambda e: self._load_dataset_taxa())
+        ttk.Button(bar, text="筛选",
+                   command=self._load_dataset_taxa).pack(side=tk.LEFT)
+        ttk.Button(bar, text="全选",
+                   command=lambda: self._set_all_taxa_checked(True)).pack(
+            side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="全不选",
+                   command=lambda: self._set_all_taxa_checked(False)).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="刷新",
+                   command=self._load_dataset_taxa).pack(side=tk.LEFT, padx=4)
+
+        columns = ("sel", "cn", "sci", "en", "photos", "obs")
+        headers = ("勾选", "中文名", "学名", "英文名", "照片数", "观察数")
+        widths = (44, 95, 140, 125, 56, 56)
+        self.ds_taxon_tree = ttk.Treeview(left, columns=columns,
+                                          show="headings", height=16)
+        for col, head, w in zip(columns, headers, widths):
+            self.ds_taxon_tree.heading(col, text=head)
+            self.ds_taxon_tree.column(col, width=w, anchor=tk.W)
+        ds_bar = ttk.Scrollbar(left, orient=tk.VERTICAL,
+                               command=self.ds_taxon_tree.yview)
+        self.ds_taxon_tree.configure(yscrollcommand=ds_bar.set)
+        ds_bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ds_taxon_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                                pady=(4, 0))
+        # 点击勾选列切换选中状态（tk 原生无复选列，用 ☐/☑ 文本模拟）
+        self.ds_taxon_tree.bind("<Button-1>", self._on_taxon_click)
+        # 已勾选类群集合（元素为 taxon_id 字符串，跨刷新保留）
+        self.ds_checked: set[str] = set()
+
+        # ---------- 右侧：生成参数 + 已生成数据集列表 ----------
+        right = ttk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        gen = ttk.LabelFrame(right, text=" 生成参数 ", padding=6)
+        gen.pack(fill=tk.X)
+        row1 = ttk.Frame(gen); row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="数据集名称:").pack(side=tk.LEFT)
+        self.ds_name_var = tk.StringVar()
+        ttk.Entry(row1, textvariable=self.ds_name_var, width=18).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Label(row1, text="划分比例:").pack(side=tk.LEFT, padx=(10, 0))
+        self.ds_splits_var = tk.StringVar(value="8:1:1")
+        ttk.Entry(row1, textvariable=self.ds_splits_var, width=8).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Label(row1, text="种子:").pack(side=tk.LEFT, padx=(10, 0))
+        self.ds_seed_var = tk.IntVar(value=42)
+        ttk.Spinbox(row1, from_=0, to=999999, textvariable=self.ds_seed_var,
+                    width=7).pack(side=tk.LEFT, padx=4)
+
+        row2 = ttk.Frame(gen); row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="每类最少:").pack(side=tk.LEFT)
+        self.ds_min_var = tk.IntVar(value=0)
+        ttk.Spinbox(row2, from_=0, to=100000, textvariable=self.ds_min_var,
+                    width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="每类最多:").pack(side=tk.LEFT, padx=(10, 0))
+        self.ds_max_var = tk.IntVar(value=0)
+        ttk.Spinbox(row2, from_=0, to=100000, textvariable=self.ds_max_var,
+                    width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="标签方式:").pack(side=tk.LEFT, padx=(10, 0))
+        self.ds_label_var = tk.StringVar(value="中文名")
+        ttk.Combobox(row2, textvariable=self.ds_label_var, state="readonly",
+                     width=8, values=["中文名", "学名", "类群ID"]).pack(
+            side=tk.LEFT, padx=4)
+
+        row3 = ttk.Frame(gen); row3.pack(fill=tk.X, pady=(4, 2))
+        self.ds_generate_btn = ttk.Button(
+            row3, text="生成数据集", style="Accent.TButton",
+            command=self._start_dataset_export)
+        self.ds_generate_btn.pack(side=tk.LEFT)
+        ttk.Label(row3, text="（硬链接零拷贝导出到 data/train_datasets/，"
+                             "按观察级划分防泄漏）",
+                  foreground="#8a95a1").pack(side=tk.LEFT, padx=8)
+
+        lst = ttk.LabelFrame(right, text=" 已生成数据集（双击用于训练） ",
+                             padding=6)
+        lst.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        cols2 = ("name", "classes", "images", "created")
+        heads2 = ("名称", "类群数", "图片数", "生成时间")
+        widths2 = (140, 56, 64, 126)
+        self.ds_list_tree = ttk.Treeview(lst, columns=cols2, show="headings",
+                                         height=7)
+        for col, head, w in zip(cols2, heads2, widths2):
+            self.ds_list_tree.heading(col, text=head)
+            self.ds_list_tree.column(col, width=w, anchor=tk.W)
+        self.ds_list_tree.pack(fill=tk.BOTH, expand=True)
+        self.ds_list_tree.bind(
+            "<Double-1>", lambda e: self._use_dataset_for_training())
+
+        btns = ttk.Frame(lst); btns.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(btns, text="用于训练",
+                   command=self._use_dataset_for_training).pack(side=tk.LEFT)
+        ttk.Button(btns, text="打开目录",
+                   command=self._open_dataset_dir).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="删除",
+                   command=self._delete_dataset).pack(side=tk.LEFT)
+        ttk.Button(btns, text="刷新列表",
+                   command=self._refresh_dataset_list).pack(side=tk.LEFT, padx=6)
+
+        # 生成日志：子进程输出实时滚动（与拖入页同一队列+定时器模式）
+        ttk.Label(page, text="生成日志", padding=(10, 4, 0, 0)).pack(anchor=tk.W)
+        self.ds_log = scrolledtext.ScrolledText(page, state=tk.DISABLED,
+                                                font=("Consolas", 9), height=10)
+        self.ds_log.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+
+        # 生成子进程状态（首次加载前完成初始化）
+        self.ds_export_proc: subprocess.Popen | None = None
+        self.ds_export_queue: queue.Queue = queue.Queue()
+        self._ds_export_out_dir: Path | None = None   # 本次生成目标目录
+        self._ds_export_config: dict = {}              # 本次生成参数快照
+
+        # 首次加载：类群列表 + 数据集列表
+        self._load_dataset_taxa()
+        self._refresh_dataset_list()
+        self.root.after(200, self._poll_ds_queue)
+
+    def _load_dataset_taxa(self) -> None:
+        """从主库按类群聚合本地照片数，刷新左侧勾选列表（保留勾选状态）。
+
+        只列有本地照片文件的类群（爬取与拖入的数据统一展示），
+        支持按中文名/学名/类群 ID 关键词过滤。
+        """
+        keyword = ""
+        if hasattr(self, "ds_taxon_search_var"):
+            keyword = self.ds_taxon_search_var.get().strip()
+        rows: list = []
+        try:
+            with self._connect_main() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT o.taxon_id,
+                           MAX(COALESCE(NULLIF(t.name_cn, ''),
+                                        NULLIF(o.common_name, ''))) AS cn,
+                           MAX(o.scientific_name) AS sci,
+                           MAX(o.common_name) AS en,
+                           COUNT(DISTINCT p.photo_id) AS photos,
+                           COUNT(DISTINCT p.observation_id) AS obs
+                    FROM photos p
+                    JOIN observations o ON p.observation_id = o.observation_id
+                    LEFT JOIN taxon_tree t ON t.taxon_id = o.taxon_id
+                    WHERE p.local_path != ''
+                    GROUP BY o.taxon_id
+                    ORDER BY photos DESC
+                    """
+                ).fetchall()
+        except sqlite3.Error as exc:
+            self._append_ds_log(f"[类群列表] 数据库读取失败: {exc}\n")
+            return
+        if keyword:
+            rows = [r for r in rows
+                    if keyword in (r["cn"] or "")
+                    or keyword in (r["sci"] or "")
+                    or keyword in (r["en"] or "")
+                    or keyword in str(r["taxon_id"])]
+        # 清理已消失类群的勾选残留，再重建列表
+        alive = {str(r["taxon_id"]) for r in rows}
+        self.ds_checked &= alive
+        self.ds_taxon_tree.delete(*self.ds_taxon_tree.get_children())
+        for r in rows:
+            iid = str(r["taxon_id"])
+            mark = "☑" if iid in self.ds_checked else "☐"
+            self.ds_taxon_tree.insert("", tk.END, iid=iid, values=(
+                mark, r["cn"] or "（未命名）", r["sci"] or "",
+                r["en"] or "", r["photos"], r["obs"]))
+        checked = sum(1 for r in rows if str(r["taxon_id"]) in self.ds_checked)
+        self._append_ds_log(
+            f"[类群列表] 共 {len(rows)} 个类群有本地照片，当前勾选 {checked} 个。\n")
+
+    def _on_taxon_click(self, event) -> None:
+        """点击勾选列时切换该类群的勾选状态。"""
+        if self.ds_taxon_tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.ds_taxon_tree.identify_column(event.x) != "#1":
+            return
+        iid = self.ds_taxon_tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid in self.ds_checked:
+            self.ds_checked.discard(iid)
+            mark = "☐"
+        else:
+            self.ds_checked.add(iid)
+            mark = "☑"
+        values = list(self.ds_taxon_tree.item(iid, "values"))
+        values[0] = mark
+        self.ds_taxon_tree.item(iid, values=values)
+
+    def _set_all_taxa_checked(self, checked: bool) -> None:
+        """全选/全不选当前列表中的全部类群。"""
+        for iid in self.ds_taxon_tree.get_children():
+            if checked:
+                self.ds_checked.add(iid)
+            else:
+                self.ds_checked.discard(iid)
+            values = list(self.ds_taxon_tree.item(iid, "values"))
+            values[0] = "☑" if checked else "☐"
+            self.ds_taxon_tree.item(iid, values=values)
+
+    def _start_dataset_export(self) -> None:
+        """校验参数后启动 dataset_exporter 子进程导出勾选类群。"""
+        if self.ds_export_proc and self.ds_export_proc.poll() is None:
+            messagebox.showinfo("提示", "数据集生成进程正在运行中，请稍候。")
+            return
+        name = dataset_registry.clean_name(self.ds_name_var.get())
+        if not name:
+            messagebox.showwarning(
+                "提示", "请先填写数据集名称（自动剔除 \\ / : * ? \" < > | 等非法字符）。")
+            return
+        if not self.ds_checked:
+            messagebox.showwarning("提示", "请先在左侧勾选至少一个类群。")
+            return
+        splits = self.ds_splits_var.get().strip()
+        try:
+            parts = [float(x) for x in splits.split(":")]
+            if len(parts) != 3 or sum(parts) <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("提示", "划分比例格式错误，应为如 8:1:1。")
+            return
+        # 同名覆盖：删除旧登记与旧目录后重新生成
+        if dataset_registry.dataset_exists(name):
+            if not messagebox.askyesno(
+                    "提示", f"数据集「{name}」已存在，是否覆盖重新生成？"):
+                return
+            dataset_registry.remove_dataset(name, delete_files=True)
+        out_dir = dataset_registry.DATASETS_DIR / name
+        taxon_ids = sorted(int(i) for i in self.ds_checked)
+        scheme = {"中文名": "cn", "学名": "sci", "类群ID": "id"}.get(
+            self.ds_label_var.get(), "cn")
+        self._ds_export_out_dir = out_dir
+        self._ds_export_config = {
+            "taxon_ids": taxon_ids, "splits": splits,
+            "min_per_class": self.ds_min_var.get(),
+            "max_per_class": self.ds_max_var.get(),
+            "label_scheme": scheme, "seed": self.ds_seed_var.get()}
+        cmd = _script_run_args("dataset_exporter.py", [
+            "--out", str(out_dir),
+            "--taxon-ids", ",".join(str(t) for t in taxon_ids),
+            "--splits", splits,
+            "--min-per-class", str(self.ds_min_var.get()),
+            "--max-per-class", str(self.ds_max_var.get()),
+            "--label-scheme", scheme,
+            "--seed", str(self.ds_seed_var.get())])
+        # 子进程用 UTF-8 输出，避免中文日志乱码
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        self.ds_generate_btn.config(state=tk.DISABLED)
+        self._append_ds_log(
+            f"\n===== 开始生成数据集「{name}」：勾选 {len(taxon_ids)} 个类群 =====\n")
+        self.ds_export_proc = subprocess.Popen(  # noqa: S603
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
+        threading.Thread(target=self._read_ds_output, daemon=True).start()
+
+    def _read_ds_output(self) -> None:
+        """后台线程：读取数据集生成子进程输出，结束后投递完成标记（带返回码）。"""
+        proc = self.ds_export_proc
+        assert proc is not None and proc.stdout is not None
+        for line in proc.stdout:
+            self.ds_export_queue.put(line)
+        self.ds_export_queue.put(f"__数据集生成结束__ rc={proc.wait()}\n")
+
+    def _poll_ds_queue(self) -> None:
+        """主循环定时器：刷新生成日志并处理完成/失败标记。"""
+        try:
+            while True:
+                line = self.ds_export_queue.get_nowait()
+                if line.startswith("__数据集生成结束__"):
+                    try:
+                        rc = int(line.rsplit("rc=", 1)[-1].strip() or "1")
+                    except ValueError:
+                        rc = 1
+                    self._on_ds_export_done(rc)
+                else:
+                    self._append_ds_log(line)
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_ds_queue)
+
+    def _on_ds_export_done(self, rc: int) -> None:
+        """生成子进程结束：成功登记注册表并刷新联动，失败清理半成品目录。"""
+        self.ds_generate_btn.config(state=tk.NORMAL)
+        out_dir = self._ds_export_out_dir
+        name = dataset_registry.clean_name(self.ds_name_var.get())
+        if rc == 0 and out_dir is not None and out_dir.is_dir():
+            stats = dataset_registry.scan_dataset_stats(out_dir)
+            dataset_registry.add_dataset(name, out_dir,
+                                         self._ds_export_config, stats)
+            detail = stats.get("split_detail") or {}
+            self._append_ds_log(
+                f"[完成] 数据集「{name}」生成成功：类别 {stats['classes']} 个、"
+                f"图片 {stats['images']} 张"
+                f"（train {detail.get('train', {}).get('images', 0)}"
+                f" / val {detail.get('val', {}).get('images', 0)}"
+                f" / test {detail.get('test', {}).get('images', 0)}），"
+                f"已登记，训练页可直接选用。\n")
+            self._refresh_dataset_list()
+        else:
+            # 失败：清理半成品目录（仅清理数据集根目录内的目录，防误删）
+            if out_dir is not None:
+                try:
+                    if (out_dir.is_dir()
+                            and out_dir.resolve().parent
+                            == dataset_registry.DATASETS_DIR.resolve()):
+                        shutil.rmtree(out_dir, ignore_errors=True)
+                except OSError:
+                    pass
+            self._append_ds_log(
+                f"[失败] 数据集生成进程返回码 {rc}，已清理半成品目录，"
+                f"请检查上方日志中的错误提示。\n")
+
+    def _refresh_dataset_list(self) -> None:
+        """刷新已生成数据集列表与训练页「已生成数据集」下拉。"""
+        items = dataset_registry.list_available()
+        names = [d["name"] for d in items]
+        self.ds_list_tree.delete(*self.ds_list_tree.get_children())
+        for d in items:
+            st = d.get("stats") or {}
+            self.ds_list_tree.insert("", tk.END, iid=d["name"], values=(
+                d["name"], st.get("classes", "?"), st.get("images", "?"),
+                d.get("created_at", "")))
+        # 训练页下拉联动（训练页控件已构建时才刷新）
+        combo = getattr(self, "train_dataset_combo", None)
+        if combo is not None:
+            combo["values"] = names
+            if self.train_dataset_var.get() not in ("", *names):
+                self.train_dataset_var.set("")
+
+    def _selected_dataset(self) -> dict | None:
+        """返回数据集列表当前选中行的登记条目（未选中时提示并返回 None）。"""
+        sel = self.ds_list_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选择一个数据集。")
+            return None
+        for d in dataset_registry.list_available():
+            if d["name"] == sel[0]:
+                return d
+        messagebox.showwarning("提示", "选中数据集的登记信息已失效，请刷新列表。")
+        return None
+
+    def _use_dataset_for_training(self) -> None:
+        """把选中的数据集填入训练页数据目录并切换到训练页。"""
+        d = self._selected_dataset()
+        if d is None:
+            return
+        self.train_data_var.set(d["path"])
+        self.train_dataset_var.set(d["name"])
+        self.notebook.select(self._train_tab_frame)
+        self._append_ds_log(
+            f"[联动] 已把「{d['name']}」填入训练页数据目录，"
+            f"划分方式请选「使用目录既有划分（默认）」。\n")
+
+    def _open_dataset_dir(self) -> None:
+        """打开选中数据集的导出目录。"""
+        d = self._selected_dataset()
+        if d is None:
+            return
+        path = Path(d["path"])
+        if path.is_dir():
+            os.startfile(str(path))  # noqa: S606
+        else:
+            messagebox.showwarning(
+                "提示", "数据集目录不存在（可能已被手动移动或删除）。")
+
+    def _delete_dataset(self) -> None:
+        """删除选中的数据集（登记条目+导出目录；训练运行中禁止）。"""
+        # 训练进程运行中禁止删除，避免训练中途数据目录被移除
+        if self.train_proc and self.train_proc.poll() is None:
+            messagebox.showwarning(
+                "提示", "模型训练进程正在运行，请先停止训练再删除数据集。")
+            return
+        d = self._selected_dataset()
+        if d is None:
+            return
+        if not messagebox.askyesno(
+                "确认", f"确定删除数据集「{d['name']}」？\n"
+                        f"（仅删除导出目录与登记信息，库内原照片不受影响）"):
+            return
+        dataset_registry.remove_dataset(d["name"], delete_files=True)
+        self._refresh_dataset_list()
+        self._append_ds_log(f"[删除] 数据集「{d['name']}」已删除。\n")
+
+    def _append_ds_log(self, text: str) -> None:
+        """向生成日志框追加文本并滚动到底部。"""
+        self.ds_log.config(state=tk.NORMAL)
+        self.ds_log.insert(tk.END, text)
+        self.ds_log.see(tk.END)
+        self.ds_log.config(state=tk.DISABLED)
+
+    # ---------- 标签页 4：模型训练 ----------
     def _build_train_tab(self) -> None:
         """构建模型训练标签页（对接 model_trainer.py，实时显示终端进程）。
 
@@ -475,6 +1003,8 @@ class BirdCrawlerGUI:
         """
         outer = ttk.Frame(self.notebook)
         self.notebook.add(outer, text=" 模型训练 ")
+        # 记录训练页容器引用，供「训练数据集」页签「用于训练」按钮切换页签
+        self._train_tab_frame = outer
         canvas = tk.Canvas(outer, highlightthickness=0)
         vbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
@@ -527,6 +1057,15 @@ class BirdCrawlerGUI:
                    command=self._browse_train_data).pack(side=tk.LEFT)
         ttk.Button(row_data, text="扫描数据",
                    command=self._scan_train_data).pack(side=tk.LEFT, padx=6)
+        # 已生成数据集下拉（来自「训练数据集」页签的注册表），选中即填入路径
+        ttk.Label(row_data, text="已生成数据集:").pack(side=tk.LEFT, padx=(10, 0))
+        self.train_dataset_var = tk.StringVar()
+        self.train_dataset_combo = ttk.Combobox(
+            row_data, textvariable=self.train_dataset_var, state="readonly",
+            width=16)
+        self.train_dataset_combo.pack(side=tk.LEFT, padx=4)
+        self.train_dataset_combo.bind(
+            "<<ComboboxSelected>>", self._on_train_dataset_selected)
 
         # 中断续训：勾选后从最近一次中断的断点继续（含断点信息提示）
         row_resume = ttk.Frame(env); row_resume.pack(fill=tk.X, pady=2)
@@ -1006,16 +1545,36 @@ class BirdCrawlerGUI:
         if path:
             self.train_data_var.set(path)
 
+    def _on_train_dataset_selected(self, _event=None) -> None:
+        """下拉选中已生成数据集时，自动填入其导出路径。"""
+        name = self.train_dataset_var.get()
+        for d in dataset_registry.list_available():
+            if d["name"] == name:
+                self.train_data_var.set(d["path"])
+                break
+
     def _train_python(self) -> str:
-        """取训练解释器路径；默认不存在时回退到当前解释器。"""
+        """取训练解释器路径；默认不存在时回退到当前解释器。
+
+        打包 exe 形态下 sys.executable 是主程序自身（不能运行外部脚本），
+        若此时无可用的外部解释器则返回空串，由调用方给出中文提示。
+        """
         p = self.train_python_var.get().strip()
         if p and Path(p).exists():
             return p
-        return sys.executable
+        if not getattr(sys, "frozen", False):
+            return sys.executable
+        # 冻结形态：exe 自身无法充当训练解释器，返回空串由调用方提示
+        return ""
 
     def _check_train_deps(self) -> None:
         """检测训练依赖（torch/torchvision/PIL）是否就绪，结果显示在标签上。"""
         py = self._train_python()
+        if not py:
+            # 冻结形态下无可用外部解释器：明确提示而非执行报错
+            self.train_dep_label.config(
+                text="未配置可用的训练解释器", foreground="#b03030")
+            return
         code = (
             "import importlib.util as u\n"
             "for m in ['torch', 'torchvision', 'PIL']:\n"
@@ -1049,7 +1608,13 @@ class BirdCrawlerGUI:
         if not data_dir or not Path(data_dir).exists():
             messagebox.showinfo("提示", "请先选择有效的数据目录。")
             return
-        cmd = [self._train_python(), str(BASE_DIR / "model_trainer.py"),
+        py = self._train_python()
+        if not py:
+            messagebox.showerror(
+                "错误", "未找到可用的训练用 Python 解释器，"
+                "请在「训练解释器」中选择安装了 torch 的 python.exe。")
+            return
+        cmd = [py, str(BASE_DIR / "model_trainer.py"),
                "--data-dir", data_dir, "--list-only"]
         self._run_train_subprocess(cmd, label="扫描数据")
 
@@ -1110,7 +1675,13 @@ class BirdCrawlerGUI:
                 return
             resume_dir = str(info.get("out_dir") or "")
 
-        cmd = [self._train_python(), str(BASE_DIR / "model_trainer.py"),
+        py = self._train_python()
+        if not py:
+            messagebox.showerror(
+                "错误", "未找到可用的训练用 Python 解释器，"
+                "请在「训练解释器」中选择安装了 torch 的 python.exe。")
+            return
+        cmd = [py, str(BASE_DIR / "model_trainer.py"),
                "--data-dir", data_dir,
                "--base-model", getattr(self, "_base_model_id", "resnet50"),
                "--workers", str(self.train_workers_var.get())]
@@ -1848,13 +2419,20 @@ class BirdCrawlerGUI:
         def _worker() -> None:
             """后台线程：执行 pip 安装并把结果回投到主线程。"""
             try:
-                completed = subprocess.run(  # noqa: S603
-                    [sys.executable, "-m", "pip", "install", "Pillow"],
-                    capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=600)
-                ok = completed.returncode == 0
-                detail = ((completed.stdout or "") +
-                          (completed.stderr or ""))[-600:]
+                if getattr(sys, "frozen", False):
+                    # 打包形态：exe 无法执行 pip 安装，给出明确指引而非执行报错
+                    ok = False
+                    detail = ("打包版程序无法内置执行 pip 安装。"
+                              "请安装系统版 Python 后在命令行执行："
+                              "python -m pip install Pillow")
+                else:
+                    completed = subprocess.run(  # noqa: S603
+                        [sys.executable, "-m", "pip", "install", "Pillow"],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=600)
+                    ok = completed.returncode == 0
+                    detail = ((completed.stdout or "") +
+                              (completed.stderr or ""))[-600:]
             except Exception as exc:  # 网络异常/超时等
                 ok, detail = False, str(exc)
             self.root.after(0, lambda: self._install_pillow_done(dialog, ok, detail))
@@ -1951,8 +2529,10 @@ class BirdCrawlerGUI:
             # （qa_server.py，JSON 行协议），控制台 exe 无需内置 torch；
             # 解释器与「模型训练」页共用同一份配置
             service_cmd = None
-            if (vision_dir / "qa_server.py").is_file():
-                service_cmd = [self._train_python(), "-u",
+            _qa_py = self._train_python()
+            # 解释器可用才启用服务模式；缺失时回退本地模式（由面板给出错误说明）
+            if _qa_py and (vision_dir / "qa_server.py").is_file():
+                service_cmd = [_qa_py, "-u",
                                str(vision_dir / "qa_server.py")]
             # 实例化问答面板并铺满页签
             self._vision_panel = gui_app.BirdVqaPanel(page,
@@ -2150,10 +2730,11 @@ class BirdCrawlerGUI:
             for sel in self.taxon_listbox.curselection():
                 taxon_ids.append(int(self.taxon_listbox.get(sel).split()[0]))
 
-        cmd = [sys.executable, str(BASE_DIR / "batch_download_birds.py")]
+        # 下载参数先行组装：打包形态经主程序 batch 子命令运行，源码形态直跑脚本
+        dl_args: list[str] = []
         if taxon_ids:
-            cmd += ["--taxon-ids", *[str(t) for t in taxon_ids]]
-        cmd += [
+            dl_args += ["--taxon-ids", *[str(t) for t in taxon_ids]]
+        dl_args += [
             "--max-per-taxon", str(self.max_var.get()),
             "--photo-size", self.size_var.get(),
             "--quality-grade", self.grade_var.get(),
@@ -2161,6 +2742,7 @@ class BirdCrawlerGUI:
             "--out-dir", str(DATA_DIR),
             "--db-dir", str(DB_DIR),
         ]
+        cmd = _script_run_args("batch_download_birds.py", dl_args)
 
         # 子进程用 UTF-8 输出，避免中文日志乱码
         env = os.environ.copy()
@@ -2168,9 +2750,9 @@ class BirdCrawlerGUI:
         env["PYTHONUNBUFFERED"] = "1"
         self.proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", env=env, cwd=str(BASE_DIR))
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
 
-        self._append_log(f"\n===== 启动下载：{' '.join(cmd[2:])} =====\n")
+        self._append_log(f"\n===== 启动下载：{' '.join(cmd[1:])} =====\n")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         threading.Thread(target=self._read_proc_output, daemon=True).start()

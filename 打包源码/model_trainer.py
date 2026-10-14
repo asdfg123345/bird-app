@@ -78,6 +78,29 @@ except ImportError:
     HAS_MODEL_LIBRARY = False
 
 
+# ---- 混合精度 API 兼容层：优先 torch>=2.3 的 torch.amp 新接口，
+# 旧版环境回退 torch.cuda.amp（已弃用但仍可用），对调用方统一封装 ----
+if HAS_TORCH and hasattr(torch.amp, "autocast") and hasattr(torch.amp, "GradScaler"):
+    def _amp_autocast(enabled: bool):
+        """新版混合精度前向上下文（torch.amp.autocast）。"""
+        return torch.amp.autocast("cuda", enabled=enabled)
+
+    def _amp_grad_scaler(enabled: bool):
+        """新版梯度缩放器（torch.amp.GradScaler）。"""
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+elif HAS_TORCH and hasattr(torch.cuda, "amp"):
+    def _amp_autocast(enabled: bool):
+        """旧版混合精度前向上下文（torch.cuda.amp.autocast，已弃用兜底）。"""
+        return torch.cuda.amp.autocast(enabled=enabled)
+
+    def _amp_grad_scaler(enabled: bool):
+        """旧版梯度缩放器（torch.cuda.amp.GradScaler，已弃用兜底）。"""
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+else:
+    _amp_autocast = None
+    _amp_grad_scaler = None
+
+
 # 日志文件路径（main() 确定输出目录后设置；None 表示仅打印到标准输出）
 _LOG_FILE_PATH: Path | None = None
 
@@ -176,9 +199,8 @@ def get_disk_free_bytes(path: Path) -> int:
 def amp_supported() -> bool:
     """检查当前环境是否支持 CUDA 混合精度（autocast + GradScaler）。"""
     return bool(HAS_TORCH and torch.cuda.is_available()
-                and hasattr(torch.cuda, "amp")
-                and hasattr(torch.cuda.amp, "autocast")
-                and hasattr(torch.cuda.amp, "GradScaler"))
+                and _amp_autocast is not None
+                and _amp_grad_scaler is not None)
 
 
 def derive_auto_batch(mode: str, architecture: str = "resnet50",
@@ -187,8 +209,9 @@ def derive_auto_batch(mode: str, architecture: str = "resnet50",
 
     推导规则（安全优先）：
         - 显存预算：adaptive 用显存的 55%，high 用 80%；
-        - 每样本显存按架构区分：ResNet 系约 5MB，ViT 系约 8MB（224px 输入 +
-          混合精度实测经验值）；关闭 AMP 时按 2 倍估算（FP32 占用更高）；
+        - 每样本显存按架构区分：ResNet 系约 45MB，ViT 系约 70MB（224px 输入
+          实测校准值）；关闭 AMP 时按 2 倍估算（FP32 占用更高）；
+          估算仅作探测起点，最终由 probe_batch_size 实测兜底；
         - 结果限制：adaptive 夹在 [8, 128]，high 夹在 [16, 256]；
         - 内存约束：系统可用内存减 2GB 预留后，每样本再按 4MB 估算，取更小值；
         - 无 GPU：CPU 安全回退（batch=8），调用方应同时把 workers 置 0。
@@ -201,11 +224,13 @@ def derive_auto_batch(mode: str, architecture: str = "resnet50",
         lines.append("CPU 安全回退: batch=8, workers=0")
         return 8, lines
 
-    # 每样本显存估算按架构区分；FP32 训练时占用约为混合精度的 2 倍
+    # 每样本显存估算按架构区分；FP32 训练时占用约为混合精度的 2 倍。
+    # 实测校准（RTX 4060 / torch 2.13 / 224px）：ResNet50+AMP 峰值约 42~45MB/样本
+    # （含激活+梯度+优化器状态），ViT 注意力占用更高约 70MB/样本
     arch_key = str(architecture or "resnet50")
-    per_sample_gpu_bytes = 5 * 1024 * 1024         # ResNet 系（resnet50/resnest101）
+    per_sample_gpu_bytes = 45 * 1024 * 1024        # ResNet 系（resnet50/resnest101）
     if arch_key.startswith("vit"):
-        per_sample_gpu_bytes = 8 * 1024 * 1024     # ViT 注意力图占用更高
+        per_sample_gpu_bytes = 70 * 1024 * 1024    # ViT 注意力图占用更高
     if not amp:
         per_sample_gpu_bytes *= 2
     sample_mb = per_sample_gpu_bytes // 1024 // 1024
@@ -270,17 +295,107 @@ def derive_auto_workers(mode: str | None) -> tuple[int, list[str]]:
         note = f"适应模式：按 CPU 核数 {cpu} 的一半推导"
 
     # 内存约束：每个加载进程 import torch 约 800MB，可用内存的 60% 留给加载进程池，
-    # 防止 Windows 下多进程同时加载 torch 触发 OpenBLAS/系统内存分配失败
+    # 防止 Windows 下多进程同时加载 torch 触发 OpenBLAS/系统内存分配失败。
+    # 进程总量按三个 DataLoader 常驻池计算：训练池 w 个 + 验证/检测池各 min(w, 2) 个
+    # （评估加载器每轮仅迭代一次，worker 数上限 2，避免与训练池同规模常驻翻倍）
     mem_info = get_system_memory_bytes()
     if mem_info is not None:
         _, avail_mem = mem_info
         per_worker_bytes = 800 * 1024 * 1024
-        mem_cap = max(1, int(avail_mem * 0.6 // per_worker_bytes))
-        if workers > mem_cap:
+        total_cap = max(1, int(avail_mem * 0.6 // per_worker_bytes))
+
+        def _pool_total(w: int) -> int:
+            """三个加载器常驻进程总量：训练 w + 验证/检测各 min(w, 2)。"""
+            return w + 2 * min(w, 2)
+
+        if _pool_total(workers) > total_cap:
+            capped = workers
+            while capped > 1 and _pool_total(capped) > total_cap:
+                capped -= 1
             note += (f"；系统可用内存 {avail_mem / 1024 ** 3:.2f}GB，"
-                     f"按每进程约 800MB 限制到 {mem_cap}")
-            workers = mem_cap
-    return workers, [f"数据加载进程: {note}，得 workers={workers}"]
+                     f"按三池进程总量上限 {total_cap} 限制到 {capped}")
+            workers = capped
+    return workers, [f"数据加载进程: {note}，得 workers={workers}"
+                     f"（验证/检测池各 min(workers, 2)）"]
+
+
+# 批大小实测探测的显存预算比例：探测用启发式卷积算法（关闭 cudnn 自动寻优）
+# 测得的峰值，余量留给寻优工作区、WDDM 桌面占用、显存碎片与评估阶段
+PROBE_BUDGET_RATIO = 0.72
+
+
+def probe_batch_size(model, device, batch_size: int, img_size: int,
+                     num_classes: int, amp_enabled: bool, logger):
+    """训练开始前用虚拟数据实测批大小：OOM 或超显存预算则减半重试。
+
+    推导公式只能给出估算值，实际占用受 cudnn 工作区与优化器实现影响较大；
+    且 Windows WDDM 驱动显存不足时不报 OOM 而是静默换页到内存（训练极慢），
+    因此除捕获 OOM 外还检查峰值分配是否超出物理显存预算。探测只做一次
+    前向+反向（分配梯度，不更新参数），通过后再与最近失败值取中点精调一次，
+    避免二分减半过冲。返回实测可用的批大小。
+    """
+    if device.type != "cuda":
+        return batch_size
+    gpu_total = get_gpu_memory_bytes() or 0
+    if gpu_total <= 0:
+        return batch_size
+    # 优化器状态（Adam/AdamW 每参数 8 字节）探测时尚未分配，从预算中扣除
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    budget = int(gpu_total * PROBE_BUDGET_RATIO) - param_bytes * 2
+    criterion = nn.CrossEntropyLoss()
+    scaler = _amp_grad_scaler(enabled=amp_enabled)
+    # 探测期关闭 cudnn 自动寻优：寻优会遍历多种算法工作区，污染峰值测量
+    prev_benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+
+    def _try_once(batch: int) -> bool:
+        """单次探测：虚拟前向+反向，OOM 或峰值超预算均视为失败。"""
+        imgs = labels = outputs = loss = None
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            imgs = torch.randn(batch, 3, img_size, img_size, device=device)
+            labels = torch.randint(0, max(1, num_classes), (batch,), device=device)
+            with _amp_autocast(enabled=amp_enabled):
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()   # 仅分配梯度，不执行参数更新
+            peak = torch.cuda.max_memory_allocated()
+            if peak > budget:
+                logger(f"[探测] batch={batch} 峰值显存 {peak / 1024 ** 3:.2f}GB "
+                       f"超预算 {budget / 1024 ** 3:.2f}GB，减半重试")
+                return False
+            return True
+        except RuntimeError as exc:
+            # OOM 新版为 torch.cuda.OutOfMemoryError（RuntimeError 子类），
+            # 旧版为普通 RuntimeError 按报错文本识别；其余运行时错误照常抛出
+            if "out of memory" not in str(exc).lower():
+                raise
+            logger(f"[探测] batch={batch} 显存不足（OOM），减半重试")
+            return False
+        finally:
+            model.zero_grad(set_to_none=True)
+            imgs = labels = outputs = loss = None
+            torch.cuda.empty_cache()
+
+    try:
+        tried = max(2, int(batch_size))
+        last_failed = None
+        while tried >= 2:
+            if _try_once(tried):
+                # 通过后与最近失败值取中点精调一次，缓解减半过冲
+                if last_failed is not None:
+                    mid = (tried + last_failed) // 2
+                    if mid > tried and _try_once(mid):
+                        tried = mid
+                logger(f"[探测] 批大小实测通过: batch={tried}"
+                       f"（预算 {budget / 1024 ** 3:.2f}GB）")
+                return tried
+            last_failed = tried
+            tried //= 2
+        logger("[告警] 批大小探测：减至 2 仍未通过显存实测，按 batch=2 继续（训练可能较慢）")
+        return 2
+    finally:
+        torch.backends.cudnn.benchmark = prev_benchmark
 
 
 def _infer_architecture(base_model: str) -> str:
@@ -1154,10 +1269,14 @@ def main() -> int:
         log("提示：当前无可用 GPU，已忽略该模式的混合精度（AMP）预设。")
 
     # 批大小：按模式 + 架构 + AMP 状态推导（命令行显式 --batch-size 最优先）
+    # batch_auto_derived 标记本值是否为自动推导（显式指定/续训回填时为 False），
+    # 用于后续决定是否需要做显存实测探测
+    batch_auto_derived = False
     if batch_size is None:
         # 仅 adaptive/high 预设的 batch 为 None（表示按设备资源自适应推导）
         arch_hint = _infer_architecture(args.base_model)
         batch_size, probe_lines = derive_auto_batch(mode, arch_hint, amp_enabled)
+        batch_auto_derived = True
         for line in probe_lines:
             log(line)
 
@@ -1194,6 +1313,42 @@ def main() -> int:
     log(f"最佳模型判据: {METRIC_CN_NAMES.get(select_metric, select_metric)}"
         f"（{'越大越好' if higher_better else '越小越好'}）")
 
+    # ---- 断点续训：回填训练超参（优化器/学习率/批大小/耐心值/AMP/workers）----
+    # GUI 续训仅传 --epochs，若不回填，patience/batch/amp 等会回退默认值；
+    # 且优化器类型一旦变化（如 SGD→AdamW），优化器状态恢复会失败并静默重置为全新训练
+    if isinstance(resume_state, dict):
+        snap = resume_state.get("snapshot") or {}
+        restored_params = []
+        if snap.get("optimizer") and snap["optimizer"] != optimizer_name:
+            optimizer_name = snap["optimizer"]
+            restored_params.append(f"optimizer={optimizer_name}")
+        if snap.get("lr"):
+            lr = float(snap["lr"])
+            restored_params.append(f"lr={lr:g}")
+        if snap.get("batch_size"):
+            batch_size = int(snap["batch_size"])
+            batch_auto_derived = False
+            restored_params.append(f"batch={batch_size}")
+        if snap.get("patience"):
+            patience = int(snap["patience"])
+            restored_params.append(f"patience={patience}")
+        if snap.get("amp_enabled") is not None:
+            amp_enabled = bool(snap["amp_enabled"])
+            restored_params.append(f"amp={'开启' if amp_enabled else '关闭'}")
+        if snap.get("workers") is not None:
+            workers = int(snap["workers"])
+            restored_params.append(f"workers={workers}")
+        if restored_params:
+            log(f"续训回填：{'，'.join(restored_params)}")
+
+    # ---- 批大小实测探测：估算仅作起点，虚拟前向+反向实测显存后最终确定 ----
+    # 仅 GPU + 自动推导 + 全新训练时探测；Windows WDDM 下显存不足不报 OOM
+    # 而是静默换页到系统内存（GPU 利用率 100% 但速度骤降），故探测同时检查
+    # OOM 异常与实际峰值显存两道防线（见 probe_batch_size）
+    if batch_auto_derived and device.type == "cuda" and resume_state is None:
+        batch_size = probe_batch_size(model, device, batch_size, args.img_size,
+                                      len(classes), amp_enabled, log)
+
     # ---- 数据增强与加载（增强强度由策略决定） ----
     img_size = args.img_size
     train_tf, eval_tf = build_transforms(strategy, img_size)
@@ -1205,15 +1360,20 @@ def main() -> int:
     if workers > 0 and sys.platform.startswith("win"):
         log("提示：Windows 下多线程数据加载可能不稳定，如遇异常请将线程设为 0 重试。")
     pin = (device.type == "cuda")
-    # 多进程加载时保持进程常驻并预取下一批，避免每轮重建进程与 GPU 空等数据
-    loader_extra = {"persistent_workers": True, "prefetch_factor": 4} \
+    # 训练加载器：多进程时常驻并预取下一批，避免每轮重建进程与 GPU 空等数据
+    train_extra = {"persistent_workers": True, "prefetch_factor": 4} \
         if workers > 0 else {}
+    # 评估加载器（验证/测试）：评估吞吐不是瓶颈，进程数降为 min(workers, 2)；
+    # 训练池 + 两个评估池的总量已由 derive_auto_workers 按可用内存统一约束
+    eval_workers = min(workers, 2)
+    eval_extra = {"persistent_workers": True, "prefetch_factor": 4} \
+        if eval_workers > 0 else {}
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=workers, pin_memory=pin, **loader_extra)
+                              num_workers=workers, pin_memory=pin, **train_extra)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=workers, pin_memory=pin, **loader_extra)
+                            num_workers=eval_workers, pin_memory=pin, **eval_extra)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False,
-                             num_workers=workers, pin_memory=pin, **loader_extra)
+                             num_workers=eval_workers, pin_memory=pin, **eval_extra)
 
     # 损失函数：按策略启用标签平滑（0 表示关闭，等价原 CrossEntropyLoss）
     smoothing = float(strategy.get("label_smoothing") or 0.0)
@@ -1233,8 +1393,9 @@ def main() -> int:
     # 学习率调度器：线性升温 + 余弦退火（按策略）
     scheduler, sched_note = build_scheduler(optimizer, strategy, epochs)
     log(f"学习率调度: {sched_note}")
-    # 混合精度梯度缩放器（enabled=False 时全部操作自动退化为普通前向/反向）
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    # 混合精度梯度缩放器（enabled=False 时全部操作自动退化为普通前向/反向；
+    # 经兼容层创建：新版 torch.amp.GradScaler("cuda")，旧版回退 torch.cuda.amp）
+    scaler = _amp_grad_scaler(enabled=amp_enabled)
 
     # ---- 输出目录：续训沿用断点目录；模式化训练走共享模型库自动取号；否则沿用旧默认目录 ----
     register_after_train = False      # 训练正常结束后是否注册入库
@@ -1320,6 +1481,9 @@ def main() -> int:
                 optimizer.load_state_dict(resume_state["optimizer_state_dict"])
             if scheduler is not None and resume_state.get("scheduler_state_dict"):
                 scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            # AMP 梯度缩放器状态恢复（旧断点无此字段时跳过，保持初始缩放因子）
+            if amp_enabled and resume_state.get("scaler_state_dict"):
+                scaler.load_state_dict(resume_state["scaler_state_dict"])
             start_epoch = int(resume_state.get("completed_epoch", 0)) + 1
             best_metric = resume_state.get("best_metric")
             no_improve = int(resume_state.get("no_improve", 0))
@@ -1363,6 +1527,13 @@ def main() -> int:
         "architecture": architecture,
         "epochs": epochs,
         "select_metric": select_metric,
+        # 训练超参一并入快照：续训时回填，防止 GUI 只传 --epochs 时参数回退默认值
+        "optimizer": optimizer_name,
+        "lr": lr,
+        "batch_size": batch_size,
+        "patience": patience,
+        "amp_enabled": amp_enabled,
+        "workers": workers,
     }
 
     def report_corrupt(stage: str) -> None:
@@ -1395,8 +1566,8 @@ def main() -> int:
                 imgs = imgs.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 optimizer.zero_grad()
-                # 混合精度前向：autocast 关闭时等价普通前向
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                # 混合精度前向：autocast 关闭时等价普通前向（经兼容层创建）
+                with _amp_autocast(enabled=amp_enabled):
                     outputs = model(imgs)
                     loss = criterion(outputs, labels)
                 # 混合精度反向与参数更新：GradScaler 关闭时自动等价普通反向
@@ -1483,6 +1654,8 @@ def main() -> int:
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+                # AMP 梯度缩放器状态：续训恢复，防止中断前后缩放因子不一致
+                "scaler_state_dict": scaler.state_dict() if amp_enabled else None,
                 "best_metric": best_metric,
                 "best_metric_name": select_metric,
                 "no_improve": no_improve,

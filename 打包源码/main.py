@@ -50,7 +50,7 @@ from inaturalist_db_manager import INaturalistDatabaseManager
 # ============================================================
 # 数字水印与版权信息（程序权属标识，受保护内容，请勿移除）
 # ============================================================
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.1"
 APP_AUTHOR = "天咏"
 APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
 # 控制台输出的版权行不含 © 字符（Windows 控制台默认 GBK 代码页无法
@@ -58,8 +58,8 @@ APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
 APP_COPYRIGHT = "2026 天咏 版权所有（明月照今日，风摇过两川。）"
 # 以下两项为打包占位符：打包准备脚本构建时自动替换为源码指纹与构建时间；
 # 源码直接运行时保留占位说明文本，不影响任何功能。
-APP_BUILD_FINGERPRINT = "D05AE2B7C154DBB9"
-APP_BUILD_TIME = "2026-10-15 08:37:20"
+APP_BUILD_FINGERPRINT = "4F182B222DA55343"
+APP_BUILD_TIME = "2026-10-15 22:10:00"
 # 数字水印标识：TYWM（天咏水印）+ 产品代号 + 版本 + 源码指纹
 APP_WATERMARK_ID = f"TYWM-BIRD-v{APP_VERSION}-{APP_BUILD_FINGERPRINT}"
 

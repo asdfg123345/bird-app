@@ -279,7 +279,7 @@ def _build_registries():
         "resnet50_200": {
             "adapter": ResNet50_200Adapter,
             "params": {},            # 默认读 config.RESNET200_CHECKPOINT
-            "display_name": "200类ResNet50（项目自训）",
+            "display_name": "200类ResNet50（历史条目，权重未随安装包分发）",
         },
     }
     part_models = {

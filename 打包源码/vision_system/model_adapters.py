@@ -17,7 +17,16 @@ import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import torch
+try:
+    import torch
+except ImportError:
+    # 无 torch 环境的友好中文提示（安装版 exe 本体不含 torch，本模块
+    # 应在含 torch 的外部解释器中运行）。仍抛 ImportError：gui_app 的
+    # 本地注册表降级链路捕获的就是 ImportError 族异常，类型不变不受影响
+    raise ImportError(
+        "未找到 PyTorch（torch）：视觉分析功能需要在装有 torch 的 Python "
+        "解释器中运行。请在桌面控制台的「训练设置」里配置含 torch 的解释器，"
+        "或先安装 PyTorch 后重试。") from None
 from PIL import Image
 
 import config

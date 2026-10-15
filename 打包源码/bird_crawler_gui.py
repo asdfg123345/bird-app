@@ -191,6 +191,9 @@ class BirdCrawlerGUI:
         self.train_lock = threading.Lock()               # 训练子进程并发启动锁
         self.train_python_var = tk.StringVar(
             value=str(DEFAULT_TRAIN_PYTHON))             # 训练用 Python 解释器
+        # 含 torch 解释器的自动探测缓存（探测一次后复用，避免重复扫描）
+        self._torch_python: str = ""
+        self._torch_python_probed: bool = False
         self.photo_index: dict | None = None             # 照片文件名索引缓存
         self._thumb_refs: list = []                      # 防止缩略图被垃圾回收
         self._model_preview_ref = None                   # 模型库预览图引用（防垃圾回收）
@@ -198,7 +201,7 @@ class BirdCrawlerGUI:
         self._ph_offset = 0                              # 照片分页偏移
 
         # 标题栏嵌入版本号与版权标识（程序数字水印的界面层）
-        root.title("鸟类爬虫控制台 v1.5 - iNaturalist 数据采集与浏览 | © 2026 天咏")
+        root.title("鸟类爬虫控制台 v1.5.1 - iNaturalist 数据采集与浏览 | © 2026 天咏")
         root.geometry("1080x760")
         root.minsize(960, 660)
         root.option_add("*Font", ("Microsoft YaHei UI", 9))
@@ -1567,6 +1570,69 @@ class BirdCrawlerGUI:
         # 冻结形态：exe 自身无法充当训练解释器，返回空串由调用方提示
         return ""
 
+    def _detect_torch_python(self) -> str:
+        """自动探测本机装有 torch 的 Python 解释器（冻结形态兜底）。
+
+        背景：安装版 exe 不含 torch，视觉分析与模型训练依赖外部解释器
+        以子进程运行；默认解释器路径是开发机路径，其他设备不存在，
+        故按常见安装位置（conda 环境 / 系统 Python / PATH）逐一探测，
+        以 importlib.find_spec 快速验证是否含 torch（不实际加载）。
+        找到返回完整路径并缓存；找不到返回空串（同样缓存，避免重复探测）。
+        """
+        if self._torch_python_probed:
+            return self._torch_python
+        self._torch_python_probed = True   # 无论成败只探测一次
+        # 候选解释器收集（去重，保持探测顺序稳定）
+        candidates: list[Path] = []
+        roots = [
+            Path.home() / "anaconda3", Path.home() / "miniconda3",
+            Path.home() / "miniforge3",
+            Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "anaconda3",
+            Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "miniconda3",
+        ]
+        for root in roots:
+            if (root / "python.exe").is_file():
+                candidates.append(root / "python.exe")
+            envs = root / "envs"
+            if envs.is_dir():
+                candidates.extend(
+                    sorted(envs.glob("*/python.exe")))
+        # 系统安装位置的 Python（LOCALAPPDATA 与各盘符根目录的常见布局）
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            candidates.extend(sorted(
+                Path(local_app).glob(r"Programs\Python\Python3*\python.exe")))
+        # 扫描本机全部逻辑盘符根目录的常见安装布局（不硬编码盘符，
+        # Python 装在任意盘均可探测到；无此布局的盘符自然跳过）
+        for code in range(ord("A"), ord("Z") + 1):
+            drive_root = Path(f"{chr(code)}:/")
+            if drive_root.is_dir():
+                candidates.extend(sorted(drive_root.glob("Python3*/python.exe")))
+        which_py = shutil.which("python")
+        if which_py:
+            candidates.append(Path(which_py))
+        seen: set[str] = set()
+        # 探测命令：find_spec 不实际加载 torch，速度快、无副作用
+        probe = ("import importlib.util;"
+                 "print(importlib.util.find_spec('torch') is not None)")
+        for cand in candidates:
+            key = str(cand).lower()
+            if key in seen or not cand.is_file():
+                continue
+            seen.add(key)
+            try:
+                out = subprocess.run(
+                    [str(cand), "-c", probe], capture_output=True,
+                    text=True, timeout=20, encoding="utf-8",
+                    errors="replace")
+                if out.returncode == 0 and "True" in (out.stdout or ""):
+                    self._torch_python = str(cand)
+                    print(f"[视觉] 自动探测到含 torch 的解释器：{cand}")
+                    break
+            except Exception:
+                continue          # 单个候选探测失败不影响后续候选
+        return self._torch_python
+
     def _check_train_deps(self) -> None:
         """检测训练依赖（torch/torchvision/PIL）是否就绪，结果显示在标签上。"""
         py = self._train_python()
@@ -2530,6 +2596,13 @@ class BirdCrawlerGUI:
             # 解释器与「模型训练」页共用同一份配置
             service_cmd = None
             _qa_py = self._train_python()
+            # 冻结形态且未配置有效解释器时：自动探测本机含 torch 的解释器
+            # （扫描 conda 环境 / 系统 Python 等常见位置），找到即回填
+            # 「模型训练」页的解释器配置（两页共用），直接进入服务模式
+            if not _qa_py:
+                _qa_py = self._detect_torch_python()
+                if _qa_py:
+                    self.train_python_var.set(_qa_py)
             # 解释器可用才启用服务模式；缺失时回退本地模式（由面板给出错误说明）
             if _qa_py and (vision_dir / "qa_server.py").is_file():
                 service_cmd = [_qa_py, "-u",
@@ -2547,9 +2620,23 @@ class BirdCrawlerGUI:
                 "「视觉分析」面板加载失败，控制台其余功能不受影响。\n\n"
                 f"视觉系统目录：{vision_dir}\n"
                 f"错误信息：{exc}\n\n"
-                "请检查该目录下的 gui_app.py 是否完整、依赖（Pillow 等）是否已安装，"
-                "处理后重启控制台重试。"
             )
+            if "torch" in str(exc):
+                # 典型场景：其他设备安装后无含 torch 的训练解释器
+                err += (
+                    "原因：本机未找到含 torch 的 Python 环境（安装包按设计"
+                    "不内置 torch，推理需由外部解释器以子进程完成）。\n\n"
+                    "处理办法（任选其一）：\n"
+                    "  1. 安装含 torch/torchvision 的 Python 环境后重启控制台，"
+                    "程序会自动探测并使用；\n"
+                    "  2. 若本机已有该环境，请到「模型训练」页的「解释器」处"
+                    "选择其 python.exe，然后重启控制台。"
+                )
+            else:
+                err += (
+                    "请检查该目录下的 gui_app.py 是否完整、依赖（Pillow 等）"
+                    "是否已安装，处理后重启控制台重试。"
+                )
             tk.Label(page, text=err, justify=tk.LEFT, anchor="nw",
                      fg="#a02020", bg="#fdecec",
                      font=("Microsoft YaHei UI", 10),
@@ -2983,6 +3070,9 @@ class BirdCrawlerGUI:
                 return
             self.proc.terminate()
         if self.drop_proc and self.drop_proc.poll() is None:
+            # 拖入处理同为长耗时且写数据库的任务，退出前与其他任务一致先确认
+            if not messagebox.askokcancel("退出", "拖入处理仍在进行，确定终止并退出？"):
+                return
             self.drop_proc.terminate()
         if self.train_proc and self.train_proc.poll() is None:
             if not messagebox.askokcancel("退出", "模型训练仍在进行，确定终止并退出？"):
@@ -2990,6 +3080,12 @@ class BirdCrawlerGUI:
             self.train_proc.terminate()
         # 释放训练子进程引用，避免残留 Popen 对象持有管道
         self.train_proc = None
+        # 数据集导出子进程同为长耗时任务，退出前同样确认并终止，
+        # 防止关窗后残留进程继续写出不完整的数据集目录
+        if self.ds_export_proc and self.ds_export_proc.poll() is None:
+            if not messagebox.askokcancel("退出", "数据集导出仍在进行，确定终止并退出？"):
+                return
+            self.ds_export_proc.terminate()
         # 关闭视觉问答服务子进程（服务模式时存在；幂等，未启动则空操作）
         if self._vision_panel is not None and hasattr(self._vision_panel, "shutdown"):
             try:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# 项目：鸟类 v1.5 打包准备脚本（含数字水印注入）
+# 项目：鸟类 v1.5.1 打包准备脚本（含数字水印注入）
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # ============================================================
 
-"""v1.5 打包准备脚本：生成「打包源码」目录与全部构建配套文件。
+"""v1.5.1 打包准备脚本：生成「打包源码」目录与全部构建配套文件。
 
 功能（可重复执行，每次全量重建）：
     1. 计算打包模块的源码构建指纹（13 个模块逐个 SHA-256 后合并再
@@ -17,17 +17,17 @@
     4. 复制视觉分析系统 11 个最小运行模块到 打包源码/vision_system/；
     5. 生成发布附件：两个 bat（GBK+CRLF）、使用说明.txt（UTF-8 LF，
        含版权与数字水印节）；
-    6. 生成 版本信息_v1.5.txt（PyInstaller PE 版本资源：exe 文件
+    6. 生成 版本信息_v1.5.1.txt（PyInstaller PE 版本资源：exe 文件
        属性中的公司、版权、水印标识）；
-    7. 生成 封装脚本_v1.5.iss（Inno Setup 安装包脚本：向导版权行、
+    7. 生成 封装脚本_v1.5.1.iss（Inno Setup 安装包脚本：向导版权行、
        安装包 PE 版本资源、备注水印）。
 
 数字水印说明：
-    水印标识格式：TYWM-BIRD-v1.5-<16位源码指纹>
+    水印标识格式：TYWM-BIRD-v1.5.1-<16位源码指纹>
     同一指纹同时嵌入：exe 内代码常量、exe PE 版本资源、
     安装包 PE 版本资源、控制面板卸载备注、使用说明、构建日志。
 
-用法：python 准备打包源码_v1.5.py
+用法：python 准备打包源码_v1.5.1.py
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# 本脚本所在目录（即 v1.5 发布目录）
+# 本脚本所在目录（即 v1.5.1 发布目录）
 RELEASE_DIR = Path(__file__).resolve().parent
 # 项目源码目录（相对发布目录推导，不硬编码绝对路径）
 SRC_DIR = RELEASE_DIR.parent / "iNaturalist"
@@ -103,7 +103,7 @@ def _frozen_base(src_file):
 
 # 应用名与版本（与 iss / 版本信息文件保持一致）
 APP_NAME = "鸟类"
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.1"
 APP_EXE = f"{APP_NAME}.exe"
 APP_AUTHOR = "天咏"
 APP_SIGNATURE = "明月照今日，风摇过两川。"
@@ -334,14 +334,20 @@ def prepare_attachments(watermark_id: str) -> None:
   视觉系统代码已内置安装包（vision_system\\ 目录），开箱零配置；
   问答引擎在本机训练环境的 Python 解释器中以子进程运行（首次提问
   自动启动，退出控制台自动关闭），解释器与「模型训练」页共用同一份
-  配置，无需另行设置。视觉模型（ViT 物种识别、OWL-ViT 部位检测）
-  不随安装包分发，由训练环境按其自带配置加载本地权重文件。
+  配置；程序会自动探测本机常见位置中装有 torch 的解释器（v1.5.1
+  新增），也可在训练页手工指定。视觉模型（ViT 物种识别、OWL-ViT
+  部位检测）不随安装包分发，由训练环境按其自带配置加载本地权重文件。
 
 【卸载说明】
   卸载只移除程序文件，您的数据（照片、数据库、模型库）将完整
   保留在安装目录的 data 文件夹中，可自行决定是否删除。
 
 【版本历史】
+  v1.5.1 修复：其他设备安装后「视觉分析」页签因缺少含 torch 的训练
+        解释器而整体加载失败的问题。现在程序会自动探测本机常见位置
+        （conda 环境 / 系统 Python）中装有 torch 的解释器并回填到
+        「模型训练」页配置；确实没有时视觉面板优雅降级为页内中文
+        指引，不再报「No module named 'torch'」，其余页签不受影响。
   v1.5  新增：训练数据集页签（类群勾选生成已划分数据集）、
         训练脚本批大小实测探测与断点续训快照完善、按架构差异化
         数据增强/学习率预热/余弦退火；程序与安装包全面嵌入
@@ -363,13 +369,13 @@ def write_version_info(watermark_id: str, fingerprint: str, build_time: str) -> 
     """步骤 4：生成 PyInstaller PE 版本资源文件（exe 属性页水印）。"""
     content = f"""# -*- coding: utf-8 -*-
 # ============================================================
-# 鸟类 v1.5 PE 版本资源（数字水印层：exe 文件属性详细信息页）
-# 由 准备打包源码_v1.5.py 生成，请勿手工编辑
+# 鸟类 v1.5.1 PE 版本资源（数字水印层：exe 文件属性详细信息页）
+# 由 准备打包源码_v1.5.1.py 生成，请勿手工编辑
 # ============================================================
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 5, 0, 0),
-    prodvers=(1, 5, 0, 0),
+    filevers=(1, 5, 1, 0),
+    prodvers=(1, 5, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -384,19 +390,19 @@ VSVersionInfo(
         '080404b0',
         [StringStruct('CompanyName', '{APP_AUTHOR}'),
         StringStruct('FileDescription', '鸟类——iNaturalist 鸟类数据采集、模型训练与视觉分析系统'),
-        StringStruct('FileVersion', '1.5.0.0'),
+        StringStruct('FileVersion', '1.5.1.0'),
         StringStruct('InternalName', '鸟类'),
         StringStruct('LegalCopyright', '{APP_COPYRIGHT}'),
         StringStruct('OriginalFilename', '{APP_EXE}'),
         StringStruct('ProductName', '鸟类'),
-        StringStruct('ProductVersion', '1.5.0'),
+        StringStruct('ProductVersion', '1.5.1'),
         StringStruct('Comments', '数字水印：{watermark_id}；构建指纹：{fingerprint}；构建时间：{build_time}；作者：{APP_AUTHOR}（{APP_SIGNATURE}）')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]
 )
 """
-    out = RELEASE_DIR / "版本信息_v1.5.txt"
+    out = RELEASE_DIR / "版本信息_v1.5.1.txt"
     out.write_text(content, encoding="utf-8", newline="\n")
     print(f"  [版本] PE 版本资源已生成：{out.name}（水印标识嵌入 Comments）")
 
@@ -410,16 +416,16 @@ def write_inno_script(watermark_id: str, fingerprint: str) -> None:
     序列，普通字符串会把它们解释成控制符破坏文件内容。
     """
     content = r"""; ============================================================
-; 鸟类 v1.5 标准安装包封装脚本（含数字水印）
+; 鸟类 v1.5.1 标准安装包封装脚本（含数字水印）
 ; 工具：Inno Setup 7.1
 ; 作者签名：@@AUTHOR@@（@@SIGNATURE@@）
-; 说明：AppId 与历史版本保持一致，v1.0~v1.4 可直接原地升级
+; 说明：AppId 与历史版本保持一致，v1.0~v1.5 可直接原地升级
 ;       水印位置：向导版权行 / 安装包 PE 版本资源 / 卸载备注
-; 本文件由 准备打包源码_v1.5.py 生成，请勿手工编辑
+; 本文件由 准备打包源码_v1.5.1.py 生成，请勿手工编辑
 ; ============================================================
 
 #define MyAppName "鸟类"
-#define MyAppVersion "1.5"
+#define MyAppVersion "1.5.1"
 #define MyAppPublisher "@@AUTHOR@@"
 #define MyAppExeName "鸟类.exe"
 
@@ -432,10 +438,10 @@ AppPublisher={#MyAppPublisher}
 AppComments=版权所有 © 2026 @@AUTHOR@@；数字水印：@@WATERMARK@@；构建指纹：@@FINGERPRINT@@
 AppCopyright=@@COPYRIGHT@@
 ; 安装包 PE 版本资源（安装包 exe 文件属性详细信息页水印）
-VersionInfoVersion=1.5.0.0
+VersionInfoVersion=1.5.1.0
 VersionInfoCompany=@@AUTHOR@@
 VersionInfoCopyright=@@COPYRIGHT@@
-VersionInfoDescription=鸟类 v1.5 安装程序（数字水印：@@WATERMARK@@）
+VersionInfoDescription=鸟类 v1.5.1 安装程序（数字水印：@@WATERMARK@@）
 VersionInfoProductName=鸟类
 
 ; 默认装到用户目录：程序运行需写入数据（数据库、照片、模型库），用户目录始终可写，无需管理员权限
@@ -454,7 +460,7 @@ WizardSizePercent=110
 Compression=lzma2
 SolidCompression=yes
 OutputDir=@@RELEASE_DIR@@
-OutputBaseFilename=鸟类_安装包_v1.5
+OutputBaseFilename=鸟类_安装包_v1.5.1
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} v{#MyAppVersion}
 
@@ -522,7 +528,7 @@ end;
     }
     for key, value in replacements.items():
         content = content.replace(key, value)
-    out = RELEASE_DIR / "封装脚本_v1.5.iss"
+    out = RELEASE_DIR / "封装脚本_v1.5.1.iss"
     out.write_text(content, encoding="utf-8-sig", newline="\r\n")
     print(f"  [封装] Inno Setup 脚本已生成：{out.name}（版权行 + PE 资源 + 备注水印）")
 
@@ -549,7 +555,7 @@ def main() -> int:
     write_inno_script(watermark_id, fingerprint)
 
     # 指纹存档：供构建脚本与系统日志引用比对
-    (RELEASE_DIR / "构建指纹_v1.5.txt").write_text(
+    (RELEASE_DIR / "构建指纹_v1.5.1.txt").write_text(
         f"watermark_id={watermark_id}\nfingerprint={fingerprint}\nbuild_time={build_time}\n",
         encoding="utf-8", newline="\n")
     print(f"== 打包源码准备完成（水印标识 {watermark_id}）==")

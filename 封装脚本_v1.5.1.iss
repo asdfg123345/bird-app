@@ -1,14 +1,14 @@
 ﻿; ============================================================
-; 鸟类 v1.5 标准安装包封装脚本（含数字水印）
+; 鸟类 v1.5.1 标准安装包封装脚本（含数字水印）
 ; 工具：Inno Setup 7.1
 ; 作者签名：天咏（明月照今日，风摇过两川。）
-; 说明：AppId 与历史版本保持一致，v1.0~v1.4 可直接原地升级
+; 说明：AppId 与历史版本保持一致，v1.0~v1.5 可直接原地升级
 ;       水印位置：向导版权行 / 安装包 PE 版本资源 / 卸载备注
-; 本文件由 准备打包源码_v1.5.py 生成，请勿手工编辑
+; 本文件由 准备打包源码_v1.5.1.py 生成，请勿手工编辑
 ; ============================================================
 
 #define MyAppName "鸟类"
-#define MyAppVersion "1.5"
+#define MyAppVersion "1.5.1"
 #define MyAppPublisher "天咏"
 #define MyAppExeName "鸟类.exe"
 
@@ -18,13 +18,13 @@ AppId={{F48372BD-EC83-4434-B628-5B713BD36932}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-AppComments=版权所有 © 2026 天咏；数字水印：TYWM-BIRD-v1.5-D05AE2B7C154DBB9；构建指纹：D05AE2B7C154DBB9
+AppComments=版权所有 © 2026 天咏；数字水印：TYWM-BIRD-v1.5.1-4F182B222DA55343；构建指纹：4F182B222DA55343
 AppCopyright=© 2026 天咏 版权所有（明月照今日，风摇过两川。）
 ; 安装包 PE 版本资源（安装包 exe 文件属性详细信息页水印）
-VersionInfoVersion=1.5.0.0
+VersionInfoVersion=1.5.1.0
 VersionInfoCompany=天咏
 VersionInfoCopyright=© 2026 天咏 版权所有（明月照今日，风摇过两川。）
-VersionInfoDescription=鸟类 v1.5 安装程序（数字水印：TYWM-BIRD-v1.5-D05AE2B7C154DBB9）
+VersionInfoDescription=鸟类 v1.5.1 安装程序（数字水印：TYWM-BIRD-v1.5.1-4F182B222DA55343）
 VersionInfoProductName=鸟类
 
 ; 默认装到用户目录：程序运行需写入数据（数据库、照片、模型库），用户目录始终可写，无需管理员权限
@@ -42,8 +42,8 @@ WizardStyle=modern
 WizardSizePercent=110
 Compression=lzma2
 SolidCompression=yes
-OutputDir=D:\鸟类\iNaturalist\发布_鸟类应用_20261014_001
-OutputBaseFilename=鸟类_安装包_v1.5
+OutputDir=D:\鸟类\iNaturalist\发布_鸟类应用_20261015_001
+OutputBaseFilename=鸟类_安装包_v1.5.1
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} v{#MyAppVersion}
 
@@ -59,9 +59,9 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 ; 预置数据库单独装入且标记卸载不删除：用户运行期间持续写入数据，卸载必须保留；
 ; onlyifdoesntexist：升级安装时用户已有数据库原样保留，仅全新安装写入预置空库
 ; （缺少该标志时空预置库会在升级时覆盖用户数据库，2026-10-14 升级冒烟前修复）
-Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261014_001\发布程序\鸟类\*"; DestDir: "{app}"; Excludes: "data\db\raw_data.db,data\db\bird_observations.db"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261014_001\发布程序\鸟类\data\db\raw_data.db"; DestDir: "{app}\data\db"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
-Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261014_001\发布程序\鸟类\data\db\bird_observations.db"; DestDir: "{app}\data\db"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261015_001\发布程序\鸟类\*"; DestDir: "{app}"; Excludes: "data\db\raw_data.db,data\db\bird_observations.db"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261015_001\发布程序\鸟类\data\db\raw_data.db"; DestDir: "{app}\data\db"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+Source: "D:\鸟类\iNaturalist\发布_鸟类应用_20261015_001\发布程序\鸟类\data\db\bird_observations.db"; DestDir: "{app}\data\db"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
 
 [UninstallDelete]
 ; 卸载时清理运行库目录壳（Inno 只删有记录的文件，纯空目录会残留；以下均为纯程序文件，删除不影响用户数据）

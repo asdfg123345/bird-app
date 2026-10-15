@@ -1,13 +1,13 @@
 ﻿# ============================================================
-# 鸟类 v1.5 一键构建脚本（PyInstaller + Inno Setup，含数字水印）
+# 鸟类 v1.5.1 一键构建脚本（PyInstaller + Inno Setup，含数字水印）
 # 作者签名：天咏（明月照今日，风摇过两川。）
-# 用法：powershell -ExecutionPolicy Bypass -File 构建脚本_v1.5.ps1
+# 用法：powershell -ExecutionPolicy Bypass -File 构建脚本_v1.5.1.ps1
 # 步骤：准备打包源码（含水印注入）→ PyInstaller 构建 → 部署数据文件
 #       与附件 → 生成预置数据库 → Inno Setup 编译安装包 → 构建验证
 # ============================================================
 
 $ErrorActionPreference = "Stop"
-# 本脚本所在目录（即 v1.5 发布目录）
+# 本脚本所在目录（即 v1.5.1 发布目录）
 $ReleaseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PkgDir = Join-Path $ReleaseDir "打包源码"
 $DistDir = Join-Path $ReleaseDir "发布程序\鸟类"
@@ -17,14 +17,14 @@ $AppExe = Join-Path $DistDir "鸟类.exe"
 $Python = "C:\Users\MECHREVO\AppData\Local\Programs\Python\Python311\python.exe"
 if (-not (Test-Path $Python)) { throw "未找到系统 Python：$Python" }
 
-Write-Host "== 鸟类 v1.5 构建（数字水印版）==" -ForegroundColor Cyan
+Write-Host "== 鸟类 v1.5.1 构建（数字水印版）==" -ForegroundColor Cyan
 
 # 步骤 1：准备打包源码（复制 + 注入冻结适配 + 数字水印注入 + 生成版本资源与 iss）
 Write-Host "`n[1/6] 准备打包源码（含水印注入）..." -ForegroundColor Yellow
-& $Python (Join-Path $ReleaseDir "准备打包源码_v1.5.py")
+& $Python (Join-Path $ReleaseDir "准备打包源码_v1.5.1.py")
 if ($LASTEXITCODE -ne 0) { throw "准备打包源码失败（退出码 $LASTEXITCODE）" }
 # 读取构建指纹存档，供验证步骤比对
-$FP = Get-Content (Join-Path $ReleaseDir "构建指纹_v1.5.txt") -Encoding UTF8
+$FP = Get-Content (Join-Path $ReleaseDir "构建指纹_v1.5.1.txt") -Encoding UTF8
 $WatermarkId = ($FP | Where-Object { $_ -like "watermark_id=*" }) -replace "watermark_id=", ""
 Write-Host "数字水印标识：$WatermarkId" -ForegroundColor Cyan
 
@@ -54,6 +54,9 @@ if (Test-Path $VisionSrc) {
     $VisionDst = Join-Path $DistDir "vision_system"
     if (Test-Path $VisionDst) { Remove-Item $VisionDst -Recurse -Force }
     Copy-Item $VisionSrc $VisionDst -Recurse -Force
+    # 清理复制时带入的 Python 运行缓存目录（开发机产物，不属于发布内容）
+    Get-ChildItem $VisionDst -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Host "已部署：model_trainer.py、model_library.py、启动爬虫界面.bat、拖入文件自动爬取.bat、使用说明.txt、vision_system\"
 } else {
     Write-Host "[警告] 打包源码中缺少 vision_system 目录，视觉分析页将无法自动探测引擎" -ForegroundColor Yellow
@@ -74,10 +77,10 @@ Write-Host "预置数据库已生成：$dbMain"
 Write-Host "`n[5/6] Inno Setup 编译安装包..." -ForegroundColor Yellow
 $ISCC = "C:\Program Files\Inno Setup 7\ISCC.exe"
 if (-not (Test-Path $ISCC)) { throw "未找到 Inno Setup 编译器：$ISCC" }
-& $ISCC (Join-Path $ReleaseDir "封装脚本_v1.5.iss")
+& $ISCC (Join-Path $ReleaseDir "封装脚本_v1.5.1.iss")
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败（退出码 $LASTEXITCODE）" }
 
-$SetupExe = Join-Path $ReleaseDir "鸟类_安装包_v1.5.exe"
+$SetupExe = Join-Path $ReleaseDir "鸟类_安装包_v1.5.1.exe"
 if (-not (Test-Path $SetupExe)) { throw "安装包未生成：$SetupExe" }
 
 # 步骤 6：构建验证（体积回归 + 程序水印自检 + PE 资源水印核对）

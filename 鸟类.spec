@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ============================================================
-# 项目：鸟类 v1.5 PyInstaller 打包配置（含数字水印）
+# 项目：鸟类 v1.5.1 PyInstaller 打包配置（含数字水印）
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # 说明：onedir + console 模式（中文日志与子命令交互依赖控制台）；
 #       model_trainer.py / model_library.py 不进 Analysis（torch 不打入
@@ -37,7 +37,7 @@ exe = EXE(
     exclude_binaries=True,
     name='鸟类',
     # PE 版本资源水印：文件属性详细信息页展示公司、版权与水印标识
-    version=os.path.join(SPECPATH, '版本信息_v1.5.txt'),
+    version=os.path.join(SPECPATH, '版本信息_v1.5.1.txt'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -13,18 +13,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import hashlib
 import json
 import re
@@ -361,6 +349,20 @@ class INaturalistDatabaseManager:
             """,
             (batch_id, observation_id),
         )
+        conn.commit()
+
+    def delete_batch_run(self, batch_id: int) -> None:
+        """删除批次运行记录及其关联行（batch_taxa / batch_observations）。
+
+        供拖入导入在本次未入库任何照片时调用，避免遗留空批次记录
+        （健康检查 C4 项）。
+        """
+        conn = self._get_main_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM batch_taxa WHERE batch_id = ?", (batch_id,))
+        cursor.execute("DELETE FROM batch_observations WHERE batch_id = ?",
+                       (batch_id,))
+        cursor.execute("DELETE FROM batch_runs WHERE id = ?", (batch_id,))
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -898,7 +900,7 @@ class INaturalistDatabaseManager:
 
 if __name__ == "__main__":
     # 简单自测：初始化并打印统计
-    base = _frozen_base(__file__) / "data" / "db"
+    base = Path(__file__).resolve().parent / "data" / "db"
     manager = INaturalistDatabaseManager(base / "raw_data.db", base / "bird_observations.db")
     print(f"观察记录总数: {manager.get_observation_count()}")
     print(f"照片总数: {manager.get_photo_count()}")

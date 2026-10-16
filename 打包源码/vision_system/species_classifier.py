@@ -14,6 +14,8 @@ species_classifier.py —— 物种识别：模型获取（含注册表回退）
 
 from typing import Dict, List, Optional
 
+import threading
+
 import config
 from model_backends import (
     ModelLoadError,
@@ -24,6 +26,9 @@ from model_backends import (
 
 # 模型实例缓存：键为模型注册名，值为加载成功的模型实例（进程内单例复用）
 _BACKEND_CACHE: Dict[str, SpeciesBackend] = {}
+# 加载串行锁：界面后台预热线程与识别任务线程可能同时请求加载同一模型，
+# 串行化后后到者等待片刻即命中缓存，避免同一模型被重复加载两份
+_BACKEND_LOAD_LOCK = threading.Lock()
 
 
 def _species_registry() -> dict:
@@ -62,50 +67,55 @@ def get_species_backend(name: Optional[str] = None) -> SpeciesBackend:
     if requested in _BACKEND_CACHE:
         return _BACKEND_CACHE[requested]
 
-    # 注册表：出厂 + 共享模型库合并视图（共享库模型 id 同样可解析加载）
-    registry = _species_registry()
+    with _BACKEND_LOAD_LOCK:
+        # 拿到锁后重查缓存：等待期间其他线程可能已完成加载
+        if requested in _BACKEND_CACHE:
+            return _BACKEND_CACHE[requested]
 
-    failure_reasons: List[str] = []
-    # 候选顺序：先尝试请求模型本身，再按配置的回退顺序尝试其余模型
-    candidates = [requested] + [
-        item for item in config.SPECIES_FALLBACK_ORDER if item != requested
-    ]
+        # 注册表：出厂 + 共享模型库合并视图（共享库模型 id 同样可解析加载）
+        registry = _species_registry()
 
-    for position, candidate in enumerate(candidates):
-        # 回退链上的模型若已有缓存实例，直接复用并提示回退结果
-        if candidate in _BACKEND_CACHE:
+        failure_reasons: List[str] = []
+        # 候选顺序：先尝试请求模型本身，再按配置的回退顺序尝试其余模型
+        candidates = [requested] + [
+            item for item in config.SPECIES_FALLBACK_ORDER if item != requested
+        ]
+
+        for position, candidate in enumerate(candidates):
+            # 回退链上的模型若已有缓存实例，直接复用并提示回退结果
+            if candidate in _BACKEND_CACHE:
+                if position > 0:
+                    print(f"激活模型 {requested} 不可用，回退到 {candidate}（缓存实例）")
+                return _BACKEND_CACHE[candidate]
+
             if position > 0:
-                print(f"激活模型 {requested} 不可用，回退到 {candidate}（缓存实例）")
-            return _BACKEND_CACHE[candidate]
+                print(f"激活模型 {requested} 不可用，回退到 {candidate}")
 
-        if position > 0:
-            print(f"激活模型 {requested} 不可用，回退到 {candidate}")
+            # 注册表登记检查：未登记的名称无法实例化
+            if candidate not in registry:
+                failure_reasons.append(f"{candidate}：未在物种模型注册表中登记")
+                continue
+            entry = registry[candidate]
 
-        # 注册表登记检查：未登记的名称无法实例化
-        if candidate not in registry:
-            failure_reasons.append(f"{candidate}：未在物种模型注册表中登记")
-            continue
-        entry = registry[candidate]
+            # 按注册表参数实例化适配器，并记录实际使用的注册名
+            backend = entry["adapter"](**entry.get("params", {}))
+            backend.registry_name = candidate
 
-        # 按注册表参数实例化适配器，并记录实际使用的注册名
-        backend = entry["adapter"](**entry.get("params", {}))
-        backend.registry_name = candidate
+            # 权重文件缺失：记录中文原因并进入下一步回退
+            if not backend.is_available():
+                failure_reasons.append(f"{candidate}：模型文件缺失或不可用")
+                continue
 
-        # 权重文件缺失：记录中文原因并进入下一步回退
-        if not backend.is_available():
-            failure_reasons.append(f"{candidate}：模型文件缺失或不可用")
-            continue
+            # 加载权重；失败按中文原因记录后继续回退
+            try:
+                backend.load()
+            except ModelLoadError as exc:
+                failure_reasons.append(f"{candidate}：{exc}")
+                continue
 
-        # 加载权重；失败按中文原因记录后继续回退
-        try:
-            backend.load()
-        except ModelLoadError as exc:
-            failure_reasons.append(f"{candidate}：{exc}")
-            continue
-
-        # 加载成功：写入缓存，后续同名请求直接复用
-        _BACKEND_CACHE[candidate] = backend
-        return backend
+            # 加载成功：写入缓存，后续同名请求直接复用
+            _BACKEND_CACHE[candidate] = backend
+            return backend
 
     raise ModelUnavailableError(
         "所有候选物种识别模型均不可用：" + "；".join(failure_reasons)

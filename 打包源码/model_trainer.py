@@ -356,7 +356,7 @@ def probe_batch_size(model, device, batch_size: int, img_size: int,
             imgs = torch.randn(batch, 3, img_size, img_size, device=device)
             labels = torch.randint(0, max(1, num_classes), (batch,), device=device)
             with _amp_autocast(enabled=amp_enabled):
-                outputs = model(imgs)
+                outputs = _extract_logits(model(imgs))
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()   # 仅分配梯度，不执行参数更新
             peak = torch.cuda.max_memory_allocated()
@@ -494,9 +494,10 @@ def build_samples(grouped: dict[str, dict[str, list[Path]]], split: str,
 
 # ============================================================
 # 分架构训练策略注册表（不同网络用不同优化策略）
-# 说明：训练模式（adaptive/low/high/custom）负责「训练多久、多大批量、何时早停」；
+# 说明：训练模式（adaptive/low/high/custom）负责「资源推导与批大小」等设备适配，
+#       轮数/优化器/耐心值/学习率由用户自定义（GUI 提供推荐值）；
 #       本注册表负责「怎么优化」——优化器、学习率分配、调度器、增强、标签平滑。
-#       两者正交叠加：模式定节奏，策略定手法。
+#       两者正交叠加：模式定资源，策略定手法。
 # ============================================================
 # ViT 系列（鸟类专域起点 / 通用 HuggingFace ViT）共用同一套迁移策略
 _VIT_TRANSFER_STRATEGY = {
@@ -525,6 +526,7 @@ ARCH_TRAINING_STRATEGY = {
     },
     "vit_bird_525": _VIT_TRANSFER_STRATEGY,
     "vit_hf": _VIT_TRANSFER_STRATEGY,
+    "hf_image": _VIT_TRANSFER_STRATEGY,
     "resnest101": {
         "label": "ResNeSt101 策略",
         "optimizer": "sgd",
@@ -558,6 +560,7 @@ EVAL_METRIC_REGISTRY = {
     "resnet50": _CLS_METRIC_ENTRY,
     "vit_bird_525": _CLS_METRIC_ENTRY,
     "vit_hf": _CLS_METRIC_ENTRY,
+    "hf_image": _CLS_METRIC_ENTRY,
     "resnest101": _CLS_METRIC_ENTRY,
     "segformer_seg": {"primary": "miou", "options": ["miou"]},   # 预留（当前不训练分割）
     "generic": _CLS_METRIC_ENTRY,
@@ -849,7 +852,7 @@ def evaluate_model(model, loader, criterion, device, num_classes: int,
             # pin_memory + non_blocking：异步拷贝，验证阶段同样避免 CPU 阻塞
             imgs = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            outputs = model(imgs)
+            outputs = _extract_logits(model(imgs))
             loss_sum += criterion(outputs, labels).item() * imgs.size(0)
             k = min(5, outputs.shape[1])
             topk = outputs.topk(k, dim=1).indices          # (N, k)
@@ -887,6 +890,19 @@ def _save_resume_state(out_dir: Path, payload: dict) -> None:
                 tmp.unlink()
         except OSError:
             pass
+
+
+def _extract_logits(outputs):
+    """从模型前向输出中提取 logits 张量。
+
+    兼容两类输出：torchvision/timm 的纯 logits 张量；HuggingFace 图像分类
+    模型的 ImageClassifierOutput（logits 位于 .logits 属性）。返回 logits 张量。
+    """
+    if hasattr(outputs, "logits"):
+        return outputs.logits
+    if isinstance(outputs, (tuple, list)) and outputs:
+        return outputs[0]
+    return outputs
 
 
 def build_model(base_model: str, class_count: int, vit_dir=None):
@@ -951,21 +967,22 @@ def build_model(base_model: str, class_count: int, vit_dir=None):
 
     architecture = str(record.get("architecture") or "resnet50")
     # 分类头替换：按架构重建对应的骨干网络，保证权重键名与结构匹配
-    if architecture in ("vit_bird_525", "vit_hf"):
+    if architecture in ("vit_bird_525", "vit_hf", "hf_image"):
         try:
-            from transformers import AutoConfig, ViTForImageClassification
+            from transformers import AutoConfig, AutoModelForImageClassification
         except ImportError:
             raise RuntimeError(
-                "微调 ViT 架构的库内模型需要 transformers 库，"
+                "微调 HuggingFace 架构的库内模型需要 transformers 库，"
                 "请先安装：pip install transformers")
-        # 优先用模型自身目录的 config.json（本机训练产物已随目录复制配置）；
-        # 缺失时回退到内置鸟类 ViT 的配置
-        if (model_dir / "config.json").is_file() and \
-                str(weights_path.name).startswith(("best_model", "last_model")):
+        # 优先用模型自身目录的 config.json（本机训练产物与外部 HF 模型均带此配置）；
+        # AutoModel 按 config.model_type 自动选择对应架构（ViT/Swin/ConvNeXt/BEiT/DeiT 等）
+        if (model_dir / "config.json").is_file():
             cfg = AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
             cfg.num_labels = class_count
-            model = ViTForImageClassification(cfg)
+            model = AutoModelForImageClassification.from_config(cfg)
         else:
+            # 无 config.json（仅旧版 ViT 产物），回退内置鸟类 ViT 结构
+            from transformers import ViTForImageClassification
             vit_src = model_library.resolve_vit_bird_525_dir()
             model = ViTForImageClassification.from_pretrained(str(vit_src))
             in_features = model.classifier.in_features
@@ -991,7 +1008,13 @@ def build_model(base_model: str, class_count: int, vit_dir=None):
             f"当前不支持作为训练起点（仅入库管理）。"
             f"请改选 ResNet50 / 鸟类ViT，或其他可推理架构的库内模型。")
 
-    state = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+    # 权重加载：safetensors 与 torch 检查点格式不同，需分别处理
+    # （外部导入的 HuggingFace 模型为 model.safetensors，torch.load 无法解析）
+    if str(weights_path).lower().endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state = load_file(str(weights_path))
+    else:
+        state = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     state = model_library.unwrap_state_dict(state)
     # DataParallel 保存的权重（module. 前缀）先剥前缀再比对键名
     state = {str(k)[7:] if str(k).startswith("module.") else str(k): v
@@ -1025,7 +1048,7 @@ def main() -> int:
     parser.add_argument("--epochs", type=int, default=None,
                         help="训练轮数（默认 15；--mode 时未传则用模式预设值）")
     parser.add_argument("--batch-size", type=int, default=None,
-                        help="批大小（默认 32；adaptive/high 模式未传时按设备自适应推导）")
+                        help="批大小（默认 32；adaptive/high/custom 模式未传时按设备自适应推导）")
     parser.add_argument("--lr", type=float, default=None,
                         help="学习率（默认 1e-3；--mode 时未传则用模式预设值）")
     parser.add_argument("--img-size", type=int, default=224, help="输入图片边长（默认 224）")
@@ -1102,17 +1125,8 @@ def main() -> int:
         if preset is None:
             log(f"未知的训练模式: {mode}（可选 adaptive/low/high/custom）")
             return 1
-        # 自定义模式的轮数/批大小/耐心值没有预设兜底，必须显式给出，避免误用空预设
-        if mode == "custom":
-            if args.epochs is None:
-                log("自定义模式必须显式指定 --epochs（训练轮数）。")
-                return 1
-            if args.batch_size is None:
-                log("自定义模式必须显式指定 --batch-size（批大小）。")
-                return 1
-            if args.patience is None:
-                log("自定义模式必须显式指定 --patience（早停耐心值，传 0 表示不早停）。")
-                return 1
+        # 说明：所有模式的轮数/优化器/耐心值/学习率均不再预设固定值，
+        # 由用户显式传入；未传入时回退下方 pick 的内置默认值（各模式行为一致）
 
     def pick(explicit, preset_value, legacy_value):
         """单个参数取值：命令行显式值 > 模式预设值 > 旧默认值。"""
@@ -1127,7 +1141,7 @@ def main() -> int:
     optimizer_name = pick(args.optimizer, preset["optimizer"] if preset else None, "adamw")
     patience = pick(args.patience, preset["patience"] if preset else None, None)
     workers = args.workers  # None 表示未显式指定，待设备探测后再决定默认值
-    # 批大小单独归一化：adaptive/high 预设的 batch=None 表示「按设备推导」，
+    # 批大小单独归一化：adaptive/high/custom 预设的 batch=None 表示「按设备推导」，
     # 与「未传参数回退旧默认 32」含义不同，不能走 pick 的回退逻辑
     if args.batch_size is not None:
         batch_size = args.batch_size          # 命令行显式值最优先
@@ -1239,6 +1253,18 @@ def main() -> int:
     if counts["train"] == 0:
         log("训练集为 0 张，无法训练。")
         return 1
+    # 验证集为空会导致评估指标全为 0（损失/准确率分母被兜底为 1），
+    # 且无法驱动早停与最佳模型选择，属致命数据问题，必须明确报错并给出解决路径，
+    # 避免静默训练出无效产物、让用户误判为公式错误。
+    if counts["val"] == 0:
+        log("[错误] 验证集为 0 张，无法计算评估指标（损失/Top-1/Top-5/宏F1 会显示为 0）。")
+        log("       请二选一解决：")
+        log("       1) 在数据目录下补充 val 子目录（结构：val/类别名/图片）；")
+        log("       2) 改用自动划分（--auto-split，按比例从训练集切出验证/检测集）。")
+        return 1
+    # 检测集为空不影响训练主流程，仅结束评估无意义，给出警告即可。
+    if counts["test"] == 0:
+        log("[警告] 检测集为 0 张，训练结束时的检测集评估指标将显示为 0。")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1568,7 +1594,7 @@ def main() -> int:
                 optimizer.zero_grad()
                 # 混合精度前向：autocast 关闭时等价普通前向（经兼容层创建）
                 with _amp_autocast(enabled=amp_enabled):
-                    outputs = model(imgs)
+                    outputs = _extract_logits(model(imgs))
                     loss = criterion(outputs, labels)
                 # 混合精度反向与参数更新：GradScaler 关闭时自动等价普通反向
                 scaler.scale(loss).backward()

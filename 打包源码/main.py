@@ -26,18 +26,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import argparse
 import sys
 from pathlib import Path
@@ -58,8 +46,8 @@ APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
 APP_COPYRIGHT = "2026 天咏 版权所有（明月照今日，风摇过两川。）"
 # 以下两项为打包占位符：打包准备脚本构建时自动替换为源码指纹与构建时间；
 # 源码直接运行时保留占位说明文本，不影响任何功能。
-APP_BUILD_FINGERPRINT = "4F182B222DA55343"
-APP_BUILD_TIME = "2026-10-15 22:10:00"
+APP_BUILD_FINGERPRINT = "@@BUILD_FINGERPRINT@@"
+APP_BUILD_TIME = "@@BUILD_TIME@@"
 # 数字水印标识：TYWM（天咏水印）+ 产品代号 + 版本 + 源码指纹
 APP_WATERMARK_ID = f"TYWM-BIRD-v{APP_VERSION}-{APP_BUILD_FINGERPRINT}"
 
@@ -93,7 +81,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=_frozen_base(__file__) / "data",
+        default=Path(__file__).resolve().parent / "data",
         help="输出根目录（默认脚本所在目录下的 data）。",
     )
     parser.add_argument(
@@ -285,6 +273,22 @@ def cmd_copyright(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_health(args: argparse.Namespace) -> int:
+    """数据库健康检查子命令（复用 db_health_check 模块）。
+
+    默认只读检查；--apply 时执行安全修复（修复前自动整库备份）。
+    """
+    from db_health_check import main as health_main
+
+    raw_db, main_db = _resolve_db_paths(args, args.out_dir)
+    argv: list[str] = ["--data-dir", str(args.out_dir),
+                       "--db", str(main_db),
+                       "--raw-db", str(raw_db)]
+    if args.apply:
+        argv.append("--apply")
+    return health_main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行解析器。"""
     parser = argparse.ArgumentParser(
@@ -439,10 +443,10 @@ def build_parser() -> argparse.ArgumentParser:
                              help="要处理的文件/文件夹路径，可一次传多个")
     drop_parser.add_argument("--watch", action="store_true", help="常驻监视投放目录")
     drop_parser.add_argument("--inbox", type=Path,
-                             default=_frozen_base(__file__) / "data" / "drop_inbox",
+                             default=Path(__file__).resolve().parent / "data" / "drop_inbox",
                              help="投放目录（默认 data/drop_inbox）")
     drop_parser.add_argument("--out-dir", type=Path,
-                             default=_frozen_base(__file__) / "data",
+                             default=Path(__file__).resolve().parent / "data",
                              help="输出根目录（默认脚本所在目录下的 data）")
     drop_parser.add_argument("--db-dir", type=Path, default=None,
                              help="数据库目录（默认 out-dir/db）")
@@ -502,6 +506,14 @@ def build_parser() -> argparse.ArgumentParser:
     # copyright 子命令（版权与数字水印查询：输出权属标识信息）
     subparsers.add_parser("copyright", help="查看版权与数字水印信息")
 
+    # health 子命令（数据库健康检查：残留/孤儿/空批次/重复/歧义/两库一致性）
+    health_parser = subparsers.add_parser(
+        "health", help="数据库健康检查（残留/孤儿记录/空批次/重复/同名歧义/两库一致性）")
+    _add_common_args(health_parser)
+    health_parser.add_argument(
+        "--apply", action="store_true",
+        help="执行安全修复（默认只检查；修复前自动整库备份）")
+
     return parser
 
 
@@ -540,6 +552,7 @@ def main() -> int:
         "drop": cmd_drop,
         "dataset": cmd_dataset,
         "copyright": cmd_copyright,
+        "health": cmd_health,
     }
     handler = command_map[args.command]
     return handler(args)

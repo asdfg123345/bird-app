@@ -25,18 +25,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import json
 import os
 import queue
@@ -58,20 +46,47 @@ import model_library as ml
 import dataset_registry
 
 # 路径均相对脚本目录解析，避免硬编码
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_DIR = DATA_DIR / "db"
 DEFAULT_RAW_DB = DB_DIR / "raw_data.db"
 DEFAULT_MAIN_DB = DB_DIR / "bird_observations.db"
 
+# 本地环境覆盖文件（与 vision_system/config.py 共用同一份；开发机专用，
+# 安装包打包时排除不随包分发）：本机特有的解释器与外部资源路径写在这里，
+# 代码中不再出现任何硬编码绝对路径
+_LOCAL_OVERRIDE_FILE = BASE_DIR / "本地环境路径.local.json"
+try:
+    _LOCAL_OVERRIDES = json.loads(
+        _LOCAL_OVERRIDE_FILE.read_text(encoding="utf-8")) \
+        if _LOCAL_OVERRIDE_FILE.is_file() else {}
+    if not isinstance(_LOCAL_OVERRIDES, dict):
+        _LOCAL_OVERRIDES = {}
+except Exception:
+    _LOCAL_OVERRIDES = {}          # 覆盖文件仅是可选增强，损坏时静默降级
+
 # 模型训练默认使用的 Python 解释器（训练需 torch/torchvision，GUI 默认解释器不一定具备）。
-# 默认优先用 anaconda 的「框架一_GPU」conda 环境；可用 --train-python 覆盖。
-DEFAULT_TRAIN_PYTHON = Path(
-    r"C:\Users\MECHREVO\anaconda3\envs\框架一_GPU\python.exe")
-# 模型训练默认数据根目录（训练数据集压缩版，脚本会自动下钻一层外壳）
-DEFAULT_TRAIN_DATA = Path(r"d:\鸟类\鸟类训练数据集_压缩版")
+# 取值优先级：本地覆盖文件 train_python > 环境变量 BIRD_TRAIN_PYTHON > 空
+# （空时回退当前解释器，冻结形态下由 _detect_torch_python 自动探测）。
+DEFAULT_TRAIN_PYTHON = (_LOCAL_OVERRIDES.get("train_python")
+                        or os.environ.get("BIRD_TRAIN_PYTHON", ""))
+# 模型训练默认数据根目录（训练数据集压缩版，脚本会自动下钻一层外壳）。
+# 取值优先级：本地覆盖文件 default_train_data > 应用自带 data\train_datasets。
+DEFAULT_TRAIN_DATA = Path(_LOCAL_OVERRIDES.get("default_train_data")
+                          or (DATA_DIR / "train_datasets"))
 # 训练产物不再使用散装输出目录：统一由训练脚本注册进模型库
 # （模型库根目录见 model_library.MODEL_LIBRARY_DIR，即 data/model_library）
+
+# ============ 部位模型训练（part_model_training\，2026-10-17 新增） ============
+PART_TRAINING_DIR = BASE_DIR / "part_model_training"   # 部位训练模块根目录
+PART_SEG_PRESET = "v7 增强 SegFormer（默认）"           # 部位分割预设底座（v7 定制架构）
+PART_DET_PRESET = "管线 B Faster R-CNN（默认）"         # 部位检测预设底座（管线 B）
+# HF 镜像端点：优先复用部位训练模块 hub_resolver 的常量（单一来源），
+# 模块缺失或导入失败时回退同值字面量，保证 GUI 始终可用
+try:
+    from part_model_training.hub_resolver import DEFAULT_MIRROR as HF_MIRROR_ENDPOINT
+except Exception:
+    HF_MIRROR_ENDPOINT = "https://hf-mirror.com"
 
 # Pillow 为可选依赖：存在则显示缩略图，否则显示文件名按钮（不强制安装）
 try:
@@ -205,6 +220,13 @@ class BirdCrawlerGUI:
         root.geometry("1080x760")
         root.minsize(960, 660)
         root.option_add("*Font", ("Microsoft YaHei UI", 9))
+        # 窗口图标：星云封面（资源缺失时静默回退系统默认图标）
+        try:
+            self._icon_img = tk.PhotoImage(
+                file=str(BASE_DIR / "星云图标.png"))
+            root.iconphoto(True, self._icon_img)
+        except Exception:
+            self._icon_img = None
 
         self._build_banner()
         self._build_status_bar()
@@ -1039,6 +1061,19 @@ class BirdCrawlerGUI:
         env = ttk.LabelFrame(page, text=" 训练环境与数据 ", padding=6)
         env.pack(fill=tk.X, padx=8, pady=(8, 0))
 
+        # 任务类型：物种分类（原有）/ 部位分割 / 部位检测（2026-10-17 新增）
+        row_task = ttk.Frame(env); row_task.pack(fill=tk.X, pady=2)
+        ttk.Label(row_task, text="任务类型:").pack(side=tk.LEFT)
+        self.train_task_var = tk.StringVar(value="物种分类")
+        self.train_task_combo = ttk.Combobox(
+            row_task, textvariable=self.train_task_var, state="readonly",
+            width=10, values=["物种分类", "部位分割", "部位检测"])
+        self.train_task_combo.pack(side=tk.LEFT, padx=4)
+        self.train_task_combo.bind(
+            "<<ComboboxSelected>>", self._on_train_task_changed)
+        self.train_task_hint = ttk.Label(row_task, text="", foreground="#8a95a1")
+        self.train_task_hint.pack(side=tk.LEFT, padx=8)
+
         row_env = ttk.Frame(env); row_env.pack(fill=tk.X, pady=2)
         ttk.Label(row_env, text="训练Python:").pack(side=tk.LEFT)
         self.train_python_entry = ttk.Entry(
@@ -1087,11 +1122,15 @@ class BirdCrawlerGUI:
         mode.pack(fill=tk.X, padx=8, pady=6)
         self.train_mode_var = tk.StringVar(value="adaptive")
         row_mode = ttk.Frame(mode); row_mode.pack(fill=tk.X)
+        # 收集单选按钮引用：部位训练模式下需整体置灰
+        self._mode_radio_widgets = []
         for mode_key in ("adaptive", "low", "high", "custom"):
-            ttk.Radiobutton(
+            radio = ttk.Radiobutton(
                 row_mode, text=ml.TRAINING_MODE_LABELS[mode_key],
                 value=mode_key, variable=self.train_mode_var,
-                command=self._on_train_mode_changed).pack(side=tk.LEFT, padx=(0, 14))
+                command=self._on_train_mode_changed)
+            radio.pack(side=tk.LEFT, padx=(0, 14))
+            self._mode_radio_widgets.append(radio)
 
         # 基础模型：训练起点下拉（内置预置 + 模型库已训练模型），选中后自动带出模型基名
         row_foundation = ttk.Frame(mode); row_foundation.pack(fill=tk.X, pady=(4, 0))
@@ -1103,9 +1142,14 @@ class BirdCrawlerGUI:
         self.train_base_model_combo.pack(side=tk.LEFT, padx=4)
         self.train_base_model_combo.bind(
             "<<ComboboxSelected>>", self._on_base_model_selected)
-        ttk.Label(row_foundation,
-                  text="（训练起点；选模型库模型即以其权重继续微调）",
-                  foreground="#8a95a1").pack(side=tk.LEFT)
+        # 部位模式下基础模型为可编辑输入框：失焦时刷新预设/自由输入联动状态
+        self.train_base_model_combo.bind(
+            "<FocusOut>", self._on_base_model_focus_out)
+        self._base_model_hint_label = ttk.Label(
+            row_foundation,
+            text="（训练起点；选模型库模型即以其权重继续微调）",
+            foreground="#8a95a1")
+        self._base_model_hint_label.pack(side=tk.LEFT)
         self._base_model_id = "resnet50"     # 当前选中的基础模型 id
         self._refresh_base_model_options()
 
@@ -1126,19 +1170,20 @@ class BirdCrawlerGUI:
 
         # 模式说明区：只读文本，随单选切换即时刷新
         self.train_mode_desc = tk.Text(
-            mode, height=6, wrap="word", relief="flat", bd=0,
+            mode, height=9, wrap="word", relief="flat", bd=0,
             bg="#f4f6f9", font=("Microsoft YaHei UI", 9), state=tk.DISABLED)
         self.train_mode_desc.pack(fill=tk.X, pady=(4, 0))
         self.train_mode_desc.tag_configure(
             "mode_hl", foreground="#b04818",
             font=("Microsoft YaHei UI", 9, "bold"))
 
-        # 训练参数：自定义模式专属参数 + 通用线程数
+        # 训练参数：轮数/优化器/耐心值/学习率各模式均可自定义（自动填入推荐值）
         params = ttk.LabelFrame(
-            page, text=" 训练参数（轮数/优化器等仅自定义模式生效） ", padding=6)
+            page, text=" 训练参数（轮数/优化器/耐心值/学习率各模式可改；批大小/混合精度仅自定义模式生效） ",
+            padding=6)
         params.pack(fill=tk.X, padx=8, pady=6)
 
-        # 自定义参数行：选中「自定义模式」时启用，其余模式置灰禁用
+        # 参数行：轮数/优化器/耐心值/学习率全模式可用；批大小/混合精度仅自定义模式启用
         self.train_epochs_var = tk.IntVar(value=15)
         self.train_optimizer_var = tk.StringVar(value="adamw")
         self.train_patience_var = tk.IntVar(value=6)
@@ -1170,9 +1215,16 @@ class BirdCrawlerGUI:
         self.cb_amp = ttk.Checkbutton(row_custom, text="混合精度(AMP)",
                                       variable=self.train_amp_var)
         self.cb_amp.pack(side=tk.LEFT, padx=(10, 0))
-        # 记录自定义参数控件，便于随模式切换统一启用/禁用
-        self._custom_param_widgets = [sb_epochs, cb_optimizer,
-                                      sb_patience, sb_batch, en_lr, self.cb_amp]
+        # 控件分组：通用组（全模式可用）与自定义组（仅自定义模式启用）
+        self._common_param_widgets = [sb_epochs, cb_optimizer,
+                                       sb_patience, en_lr]
+        self._custom_param_widgets = [sb_batch, self.cb_amp]
+        # 物种分类专属参数（优化器/耐心值/学习率）：部位训练不使用，切换时置灰
+        self._species_only_param_widgets = [cb_optimizer, sb_patience, en_lr]
+        # 硬件/数据量探测缓存与最新推荐结果（供说明区展示推导理由）
+        self._train_hw_cache = None          # (has_gpu, gpu_mem_gb) 元组
+        self._dataset_count_cache = {}      # 目录路径 -> 图片总数
+        self._last_recommend = None         # 最近一次推荐参数（含理由）
 
         # 线程数（与模式无关，始终可用）
         # Windows 下多线程 DataLoader 易出问题，默认 0（主进程加载，最稳）
@@ -1197,10 +1249,11 @@ class BirdCrawlerGUI:
         self._split_label_to_key = {v: k for k, v in ml.SPLIT_PRESET_LABELS.items()}
         self.train_split_var = tk.StringVar(
             value=ml.SPLIT_PRESET_LABELS["existing"])
-        ttk.Combobox(row_split, textvariable=self.train_split_var,
-                     state="readonly", width=26,
-                     values=list(ml.SPLIT_PRESET_LABELS.values())).pack(
-            side=tk.LEFT, padx=4)
+        self.train_split_combo = ttk.Combobox(
+            row_split, textvariable=self.train_split_var,
+            state="readonly", width=26,
+            values=list(ml.SPLIT_PRESET_LABELS.values()))
+        self.train_split_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(row_split, text="训练:验证:检测 =",
                   foreground="#8a95a1").pack(side=tk.LEFT, padx=(6, 2))
         self.train_split_ratio_var = tk.StringVar(value="8,1,1")
@@ -1217,10 +1270,11 @@ class BirdCrawlerGUI:
             v: k for k, v in ml.SELECT_METRIC_OPTIONS.items()}
         self.train_metric_var = tk.StringVar(
             value=ml.SELECT_METRIC_OPTIONS["top1_acc"])
-        ttk.Combobox(row_metric, textvariable=self.train_metric_var,
-                     state="readonly", width=24,
-                     values=list(ml.SELECT_METRIC_OPTIONS.values())).pack(
-            side=tk.LEFT, padx=4)
+        self.train_metric_combo = ttk.Combobox(
+            row_metric, textvariable=self.train_metric_var,
+            state="readonly", width=24,
+            values=list(ml.SELECT_METRIC_OPTIONS.values()))
+        self.train_metric_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(row_metric, text="（按该指标保存最佳模型并驱动早停）",
                   foreground="#8a95a1").pack(side=tk.LEFT, padx=6)
 
@@ -1281,7 +1335,9 @@ class BirdCrawlerGUI:
         self.train_log.pack(fill=tk.X, padx=8, pady=(2, 10))
 
     def _on_train_mode_changed(self) -> None:
-        """训练模式切换回调：刷新说明区文字并切换自定义参数可用状态。"""
+        """训练模式切换回调：重算推荐值、刷新说明区并切换参数可用状态。"""
+        # 先计算推荐值（说明区展示推导理由），再刷新说明与控件可用状态
+        self._fill_recommended_params()
         self._update_mode_description()
         self._apply_custom_param_state()
 
@@ -1327,6 +1383,10 @@ class BirdCrawlerGUI:
 
     def _on_base_model_selected(self, _event=None) -> None:
         """基础模型选中回调：记录 id，并把模型基名自动填为其基名（用户可再手改）。"""
+        # 部位模式：预设/自由输入切换仅刷新联动状态，不查物种模型库
+        if self._current_task_kind() != "species":
+            self._sync_part_ui_state()
+            return
         display = self.train_base_model_var.get()
         for model_id, disp in getattr(self, "_base_model_options", []):
             if disp == display:
@@ -1342,6 +1402,9 @@ class BirdCrawlerGUI:
         if base_name:
             self.train_model_base_var.set(base_name)
         self._update_train_strategy_label()
+        # 架构变化影响推荐参数：重算推荐值并刷新说明
+        self._fill_recommended_params()
+        self._update_mode_description()
 
     def _update_train_strategy_label(self) -> None:
         """按所选基础模型的架构刷新「训练策略」说明文字。"""
@@ -1477,22 +1540,24 @@ class BirdCrawlerGUI:
             })
 
     def _update_mode_description(self) -> None:
-        """把当前模式的预设信息（轮数/优化器/耐心值/批大小/学习率/说明）写入说明区。"""
+        """把当前模式的推荐值与推导依据写入说明区（各模式参数不再预设固定值）。"""
         key = self.train_mode_var.get()
         preset = ml.TRAINING_MODE_PRESETS.get(key, {})
-        if key == "custom":
-            # 自定义模式：预设不提供固定值，提示在下方参数区填写
-            epochs_text = "自定义（在下方填写）"
-            patience_text = "自定义（在下方填写）"
-            batch_text = "自定义（在下方填写）"
-        else:
-            epochs_text = str(preset.get("epochs", "—"))
-            patience_text = str(preset.get("patience", "—"))
-            batch_value = preset.get("batch")
-            # batch 为 None 表示按设备自适应（由训练脚本推导）
-            batch_text = "按设备自适应" if batch_value is None else str(batch_value)
-        lr_value = preset.get("lr")
+        # 推荐值：轮数/优化器/耐心值/学习率按「模式×架构×数据量×硬件」推导
+        rec = getattr(self, "_last_recommend", None) or {}
+        epochs_text = str(rec.get("epochs", "—"))
+        optimizer_text = str(rec.get("optimizer", "—"))
+        patience_text = str(rec.get("patience", "—"))
+        lr_value = rec.get("lr")
         lr_text = f"{lr_value:g}" if isinstance(lr_value, (int, float)) else "—"
+        # 批大小：自定义模式由用户填写；low 预设固定 8；adaptive/high 按设备自适应推导
+        batch_value = preset.get("batch")
+        if key == "custom":
+            batch_text = "自定义（在下方填写）"
+        elif batch_value is None:
+            batch_text = "按设备自适应"
+        else:
+            batch_text = str(batch_value)
         # 混合精度显示：True=固定开启；auto=有 GPU 时自动开启；False=关闭
         amp_value = preset.get("amp")
         if amp_value is True:
@@ -1503,14 +1568,15 @@ class BirdCrawlerGUI:
             amp_text = "关闭（自定义模式可勾选）" if key == "custom" else "关闭"
         workers_text = preset.get("workers_hint", "—")
         lines = [
-            f"轮数：{epochs_text}",
-            f"优化器：{preset.get('optimizer', '—')}",
-            f"耐心值：{patience_text}",
+            f"轮数：{epochs_text}（推荐值，可在下方修改）",
+            f"优化器：{optimizer_text}（推荐值，可在下方修改）",
+            f"耐心值：{patience_text}（推荐值，可在下方修改）",
+            f"学习率：{lr_text}（推荐值，可在下方修改）",
             f"批大小：{batch_text}",
-            f"学习率：{lr_text}",
             f"混合精度：{amp_text}",
             f"数据加载线程：{workers_text}",
             f"说明：{preset.get('description', '')}",
+            "推荐依据：" + "；".join(rec.get("reasons", ["尚未计算"])),
         ]
         box = self.train_mode_desc
         box.config(state=tk.NORMAL)
@@ -1525,13 +1591,99 @@ class BirdCrawlerGUI:
         box.config(state=tk.DISABLED)
 
     def _apply_custom_param_state(self) -> None:
-        """自定义模式时启用参数输入，其余模式置灰禁用。"""
+        """轮数/优化器/耐心值/学习率全模式可编辑；批大小/混合精度仅自定义模式启用。"""
+        for widget in getattr(self, "_common_param_widgets", []):
+            try:
+                widget.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass  # 控件已销毁时忽略
         state = tk.NORMAL if self.train_mode_var.get() == "custom" else tk.DISABLED
-        for widget in self._custom_param_widgets:
+        for widget in getattr(self, "_custom_param_widgets", []):
             try:
                 widget.config(state=state)
             except tk.TclError:
                 pass  # 控件已销毁时忽略
+
+    # ---------- 推荐参数：按「模式×架构×数据量×硬件」推导并自动填表 ----------
+
+    def _detect_train_hardware(self) -> tuple[bool, float]:
+        """用训练解释器查询 CUDA 可用性与 GPU 显存（结果缓存，避免重复探测）。"""
+        if self._train_hw_cache is not None:
+            return self._train_hw_cache
+        has_gpu, gpu_mem_gb = False, 0.0
+        py = self._train_python()
+        if py:
+            probe = (
+                "import torch\n"
+                "avail = torch.cuda.is_available()\n"
+                "print(1 if avail else 0)\n"
+                "print(torch.cuda.get_device_properties(0).total_memory / 2**30"
+                " if avail else 0)\n"
+            )
+            try:
+                import subprocess as _sp
+                result = _sp.run([py, "-c", probe], capture_output=True,
+                                 timeout=60, creationflags=0x08000000)
+                lines = result.stdout.decode("utf-8", "replace").split()
+                if lines and lines[0] == "1":
+                    has_gpu = True
+                    gpu_mem_gb = float(lines[1])
+            except Exception:
+                pass  # 探测失败按无 GPU 处理，训练脚本内部还会做设备推导
+        self._train_hw_cache = (has_gpu, gpu_mem_gb)
+        return self._train_hw_cache
+
+    def _count_dataset_images(self, data_dir: str) -> int | None:
+        """统计数据目录内的图片总数（按目录缓存；失败返回 None 不参与修正）。"""
+        if not data_dir:
+            return None
+        path = str(Path(data_dir))
+        if path in self._dataset_count_cache:
+            return self._dataset_count_cache[path]
+        count = 0
+        try:
+            exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+            for p in Path(data_dir).rglob("*"):
+                if p.suffix.lower() in exts:
+                    count += 1
+                    if count > 500000:   # 超大目录封顶，避免统计耗时过长
+                        break
+        except OSError:
+            return None
+        self._dataset_count_cache[path] = count
+        return count
+
+    def _current_train_architecture(self) -> str:
+        """当前所选基础模型对应的架构 key（与训练策略联动）。"""
+        model_id = getattr(self, "_base_model_id", "resnet50")
+        if model_id == "resnet50":
+            return "resnet50"
+        if model_id == "vit_bird_525":
+            return "vit_bird_525"
+        try:
+            record = ml.get_model(model_id)
+        except Exception:
+            record = None
+        return str((record or {}).get("architecture") or "resnet50")
+
+    def _fill_recommended_params(self) -> None:
+        """按「模式×架构×数据量×硬件」计算推荐值并自动填入参数输入框。
+
+        模式/基础模型/数据目录变化时调用；用户仍可在填入后手动修改。
+        """
+        mode = self.train_mode_var.get()
+        arch = self._current_train_architecture()
+        has_gpu, gpu_mem_gb = self._detect_train_hardware()
+        dataset_count = self._count_dataset_images(self.train_data_var.get().strip())
+        rec = ml.recommend_train_params(mode, arch, dataset_count, has_gpu, gpu_mem_gb)
+        self._last_recommend = rec
+        try:
+            self.train_epochs_var.set(rec["epochs"])
+            self.train_optimizer_var.set(rec["optimizer"])
+            self.train_patience_var.set(rec["patience"])
+            self.train_lr_var.set(f"{rec['lr']:g}")
+        except tk.TclError:
+            pass  # 控件已销毁时忽略
 
     def _browse_train_python(self) -> None:
         """选择训练用 Python 解释器。"""
@@ -1684,6 +1836,221 @@ class BirdCrawlerGUI:
                "--data-dir", data_dir, "--list-only"]
         self._run_train_subprocess(cmd, label="扫描数据")
 
+    # ---------- 部位模型训练（任务类型切换 + 四分支启动，2026-10-17 新增） ----------
+    def _current_task_kind(self) -> str:
+        """当前任务类型：species（物种分类）/ seg（部位分割）/ det（部位检测）。"""
+        var = getattr(self, "train_task_var", None)
+        if var is None:
+            return "species"
+        label = var.get()
+        if label == "部位分割":
+            return "seg"
+        if label == "部位检测":
+            return "det"
+        return "species"
+
+    def _on_base_model_focus_out(self, _event=None) -> None:
+        """部位模式下基础模型输入框失焦：刷新预设/自由输入联动状态。"""
+        if self._current_task_kind() != "species":
+            self._sync_part_ui_state()
+
+    def _on_train_task_changed(self, _event=None) -> None:
+        """任务类型切换回调。
+
+        物种分类：完全恢复原有界面（零回归）；部位模式：基础模型改为
+        「预设 + 自由输入 HuggingFace/魔搭模型 ID 或本地目录」，并置灰
+        分类专属控件（训练模式/划分方式/指标/优化器·耐心值·学习率）。
+        """
+        kind = self._current_task_kind()
+        combo = self.train_base_model_combo
+        if kind == "species":
+            # 恢复物种分类原状：只读下拉 + 原选项与选中项
+            combo.config(state="readonly")
+            self._refresh_base_model_options()
+            self._base_model_hint_label.config(
+                text="（训练起点；选模型库模型即以其权重继续微调）")
+            for widget in self._mode_radio_widgets:
+                widget.config(state=tk.NORMAL)
+            self.train_split_combo.config(state="readonly")
+            self.train_split_ratio_entry.config(state=tk.NORMAL)
+            self.train_metric_combo.config(state="readonly")
+            for widget in self._species_only_param_widgets:
+                widget.config(state=tk.NORMAL)
+            self._on_train_mode_changed()   # 恢复批大小/AMP 按模式控制
+            self._refresh_resume_state()
+            self.train_task_hint.config(text="")
+            return
+        # 部位模式：基础模型改为可编辑（预设项 + 自由输入框）
+        combo.config(state="normal")
+        preset = PART_SEG_PRESET if kind == "seg" else PART_DET_PRESET
+        combo["values"] = [preset]
+        self.train_base_model_var.set(preset)
+        # 部位训练基名默认值（用户可改；允许中文）
+        self.train_model_base_var.set(
+            "v7部位分割模型" if kind == "seg" else "部位检测器")
+        hint = ("（训练起点：预设底座，或输入 HuggingFace/魔搭分割模型 ID / 本地目录，"
+                "如 nvidia/segformer-b0-finetuned-ade-512-512）" if kind == "seg"
+                else "（训练起点：预设底座，或输入 HuggingFace/魔搭检测模型 ID，"
+                     "如 facebook/detr-resnet-50）")
+        self._base_model_hint_label.config(text=hint)
+        self.train_task_hint.config(
+            text="部位训练读取所选目录的关键点标注（annotations.csv），"
+                 "自动渲染监督标签；产物自动登记模型库并可在视觉分析「部位模型」中选择")
+        self._sync_part_ui_state()
+
+    def _sync_part_ui_state(self) -> None:
+        """部位模式联动状态：置灰分类专属控件，按底座刷新策略说明与续训可用性。"""
+        kind = self._current_task_kind()
+        # 置灰：训练模式单选 / 划分方式与比例 / 最佳模型判据 / 优化器·耐心值·学习率 / AMP
+        for widget in self._mode_radio_widgets:
+            widget.config(state=tk.DISABLED)
+        self.train_split_combo.config(state=tk.DISABLED)
+        self.train_split_ratio_entry.config(state=tk.DISABLED)
+        self.train_metric_combo.config(state=tk.DISABLED)
+        for widget in self._species_only_param_widgets:
+            widget.config(state=tk.DISABLED)
+        self.cb_amp.config(state=tk.DISABLED)
+        # 部位训练直接使用界面轮数与批大小（不受训练模式预设控制）
+        self._custom_param_widgets[0].config(state=tk.NORMAL)
+        # 策略说明：预设走定制脚本，自由输入走 HuggingFace/魔搭通用微调
+        base_text = self.train_base_model_var.get().strip()
+        is_preset = base_text == (PART_SEG_PRESET if kind == "seg"
+                                  else PART_DET_PRESET)
+        if kind == "seg":
+            self.train_strategy_label.config(
+                text=("训练策略：v7 增强 SegFormer（MSFPA/BA-MSR 定制头，"
+                      "类别加权防塌缩）" if is_preset else
+                      f"训练策略：HuggingFace/魔搭分割底座「{base_text}」通用微调"
+                      "（AutoModelForSemanticSegmentation，自动替换 16 类分割头）"))
+        else:
+            self.train_strategy_label.config(
+                text=("训练策略：管线 B Faster R-CNN（关键点自动转 YOLO 框监督）"
+                      if is_preset else
+                      f"训练策略：HuggingFace/魔搭检测底座「{base_text}」通用微调"
+                      "（AutoModelForObjectDetection，自动替换 15 类检测头）"))
+        # 续训：仅「部位分割 + v7 预设」支持（热启动 last_segpart.pth，轮数为追加轮数）
+        check = self.train_resume_check
+        label = self.train_resume_label
+        if kind == "seg" and is_preset:
+            last_path = PART_TRAINING_DIR / "training_output" / "last_segpart.pth"
+            if last_path.is_file():
+                check.config(state=tk.NORMAL)
+                label.config(
+                    text="检测到上次训练权重（last_segpart.pth），"
+                         "勾选后热启动追加训练（轮数=追加轮数）",
+                    foreground="#b06a00")
+            else:
+                check.config(state=tk.DISABLED)
+                if self.train_resume_var.get():
+                    self.train_resume_var.set(False)
+                label.config(text="暂无部位分割训练权重（先完成一次训练）",
+                             foreground="#8a95a1")
+        else:
+            check.config(state=tk.DISABLED)
+            if self.train_resume_var.get():
+                self.train_resume_var.set(False)
+            label.config(text="该训练路径不支持续训", foreground="#8a95a1")
+        # 模式说明区替换为部位训练说明（避免残留分类模式的推荐参数说明）
+        self.train_mode_desc.config(state=tk.NORMAL)
+        self.train_mode_desc.delete("1.0", tk.END)
+        self.train_mode_desc.insert(
+            tk.END, "部位训练说明：自动读取所选数据目录的 annotations.csv 关键点标注，"
+                    "按部位尺寸先验渲染为分割掩码 / 检测框监督。轮数、批大小、线程与"
+                    "模型基名可用；优化器/耐心值/学习率/数据划分/最佳判据等分类专属"
+                    "参数不参与部位训练，由各训练脚本使用内置默认值。")
+        self.train_mode_desc.config(state=tk.DISABLED)
+
+    def _start_part_train(self, kind: str) -> None:
+        """启动部位模型训练子进程（分割/检测 × 预设/通用底座四分支）。
+
+        预设底座走 v7 / 管线 B 定制脚本；自由输入的模型 ID / 本地目录走
+        HuggingFace/魔搭通用微调脚本。产物均自动登记共享模型库，视觉系统
+        「部位模型」下拉即可选用。
+        """
+        if self.train_proc and self.train_proc.poll() is None:
+            messagebox.showinfo("提示", "训练进程正在运行中。")
+            return
+        data_dir = self.train_data_var.get().strip()
+        if not data_dir or not Path(data_dir).exists():
+            messagebox.showerror("错误", "训练数据目录无效，请先选择。")
+            return
+        base_name = self.train_model_base_var.get().strip()
+        if not base_name:
+            messagebox.showerror("错误", "请填写模型基名（用于训练产物命名）。")
+            return
+        # 部位训练基名允许中文（模型库命名规则支持），仅排除文件名非法字符
+        if re.search(r'[\\/:*?"<>|]', base_name):
+            messagebox.showerror(
+                "错误", "模型基名不能包含 \\ / : * ? \" < > | 等文件名非法字符。")
+            return
+        py = self._train_python()
+        if not py:
+            messagebox.showerror(
+                "错误", "未找到可用的训练用 Python 解释器，"
+                "请在「训练解释器」中选择安装了 torch 的 python.exe。")
+            return
+        try:
+            epochs = int(self.train_epochs_var.get())
+            batch = int(self.train_batch_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("错误", "轮数与批大小必须是有效数字。")
+            return
+        if epochs < 1:
+            messagebox.showerror("错误", "轮数必须 ≥ 1。")
+            return
+        if batch < 1:
+            messagebox.showerror("错误", "批大小必须 ≥ 1。")
+            return
+        base_text = self.train_base_model_var.get().strip()
+        if not base_text:
+            messagebox.showerror("错误", "请选择预设底座或输入模型 ID / 本地目录。")
+            return
+        is_seg = kind == "seg"
+        preset = PART_SEG_PRESET if is_seg else PART_DET_PRESET
+        use_preset = base_text == preset
+        # 续训：仅 v7 预设支持（热启动 last_segpart.pth，轮数=追加轮数）
+        resume_path = None
+        if is_seg and use_preset and self.train_resume_var.get():
+            resume_path = str(
+                PART_TRAINING_DIR / "training_output" / "last_segpart.pth")
+            if not Path(resume_path).is_file():
+                messagebox.showerror("错误", "续训权重文件不存在，请取消勾选续训。")
+                return
+        if is_seg and use_preset:
+            cmd = [py, str(PART_TRAINING_DIR / "train_segpart.py"),
+                   "--data_root", data_dir, "--epochs", str(epochs),
+                   "--batch-size", str(batch), "--grad-accum", "2",
+                   "--model-name", base_name]
+            if resume_path:
+                cmd += ["--resume", resume_path]
+            label = "部位分割训练（v7 增强 SegFormer）"
+        elif is_seg:
+            cmd = [py, str(PART_TRAINING_DIR / "train_generic_seg.py"),
+                   "--data_root", data_dir, "--base-model", base_text,
+                   "--epochs", str(epochs), "--batch-size", str(batch),
+                   "--grad-accum", "2", "--model-name", base_name]
+            label = f"部位分割训练（通用底座 {base_text}）"
+        elif use_preset:
+            cmd = [py, str(PART_TRAINING_DIR / "train_detector_entry.py"),
+                   "--data_root", data_dir, "--epochs", str(epochs),
+                   "--batch-size", str(batch), "--model-name", base_name]
+            label = "部位检测训练（管线 B Faster R-CNN）"
+        else:
+            cmd = [py, str(PART_TRAINING_DIR / "train_generic_det.py"),
+                   "--data_root", data_dir, "--base-model", base_text,
+                   "--epochs", str(epochs), "--batch-size", str(batch),
+                   "--grad-accum", "2", "--model-name", base_name]
+            label = f"部位检测训练（通用底座 {base_text}）"
+        self._clear_metric_table()
+        # 部位训练专用环境变量：共享库定位 / 显存优化 / HF 镜像
+        # （不设 HF_HUB_OFFLINE，保留新底座下载能力；已缓存模型自动复用）
+        extra_env = {
+            "BIRD_SHARED_MODEL_LIBRARY": str(ml.MODEL_LIBRARY_DIR),
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "HF_ENDPOINT": HF_MIRROR_ENDPOINT,
+        }
+        self._run_train_subprocess(cmd, label=label, extra_env=extra_env)
+
     def _start_train(self) -> None:
         """启动模型训练子进程（model_trainer.py），实时捕获终端输出。
 
@@ -1691,6 +2058,11 @@ class BirdCrawlerGUI:
         自定义模式额外追加轮数/优化器/耐心值/批大小/学习率（先校验合法性）。
         训练产物由训练脚本统一注册进模型库，因此不再传递 --out-dir。
         """
+        # 部位模型训练（分割/检测）：转入 part_model_training 专属分支
+        task_kind = self._current_task_kind()
+        if task_kind in ("seg", "det"):
+            self._start_part_train(task_kind)
+            return
         if self.train_proc and self.train_proc.poll() is None:
             messagebox.showinfo("提示", "训练进程正在运行中。")
             return
@@ -1766,44 +2138,53 @@ class BirdCrawlerGUI:
             cmd += ["--auto-split", "--split-ratio", ratio_arg]
         if metric_key:
             cmd += ["--select-metric", metric_key]
-        if mode == "custom" or resume_dir:
-            # 自定义模式：校验并传入轮数/优化器/耐心值/批大小/学习率
-            # 续训：只传轮数（总目标轮数），其余参数从断点快照恢复
+        # 所有模式：轮数/优化器/耐心值/学习率均由界面传入（模式不预设固定值）
+        # 续训：只传轮数（总目标轮数），其余参数从断点快照恢复
+        try:
+            epochs = int(self.train_epochs_var.get())
+            patience = int(self.train_patience_var.get())
+            lr = float(self.train_lr_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("错误", "训练参数必须是有效数字（学习率如 1e-3）。")
+            return
+        if epochs < 1:
+            messagebox.showerror("错误", "轮数必须 ≥ 1。")
+            return
+        if patience < 0:
+            messagebox.showerror("错误", "耐心值必须 ≥ 0。")
+            return
+        if lr <= 0:
+            messagebox.showerror("错误", "学习率必须大于 0。")
+            return
+        # 批大小仅自定义模式由界面传入；其余模式按预设/设备自适应推导
+        batch_arg = None
+        if mode == "custom" and not resume_dir:
             try:
-                epochs = int(self.train_epochs_var.get())
-                patience = int(self.train_patience_var.get())
-                batch = int(self.train_batch_var.get())
-                lr = float(self.train_lr_var.get())
+                batch_arg = int(self.train_batch_var.get())
             except (ValueError, tk.TclError):
-                messagebox.showerror("错误", "自定义参数必须是有效数字（学习率如 1e-3）。")
+                messagebox.showerror("错误", "批大小必须是有效数字。")
                 return
-            if epochs < 1:
-                messagebox.showerror("错误", "轮数必须 ≥ 1。")
-                return
-            if patience < 0:
-                messagebox.showerror("错误", "耐心值必须 ≥ 0。")
-                return
-            if batch < 1:
+            if batch_arg < 1:
                 messagebox.showerror("错误", "批大小必须 ≥ 1。")
                 return
-            if lr <= 0:
-                messagebox.showerror("错误", "学习率必须大于 0。")
-                return
-            cmd += ["--epochs", str(epochs)]
-            if not resume_dir:
-                cmd += ["--optimizer", self.train_optimizer_var.get(),
-                        "--patience", str(patience),
-                        "--batch-size", str(batch),
-                        "--lr", str(lr)]
+        cmd += ["--epochs", str(epochs)]
+        if not resume_dir:
+            cmd += ["--optimizer", self.train_optimizer_var.get(),
+                    "--patience", str(patience),
+                    "--lr", str(lr)]
+            if batch_arg is not None:
+                cmd += ["--batch-size", str(batch_arg)]
         # 自定义模式：勾选混合精度时显式传 --amp（其余模式按预设固定，不由 GUI 传参）
         if mode == "custom" and self.train_amp_var.get():
             cmd += ["--amp"]
         self._run_train_subprocess(cmd, label="续训" if resume_dir else "开始训练")
 
-    def _run_train_subprocess(self, cmd: list[str], label: str) -> None:
+    def _run_train_subprocess(self, cmd: list[str], label: str,
+                              extra_env: dict | None = None) -> None:
         """启动训练相关子进程并接管道，后台线程把输出放入队列。
 
         加锁防止扫描/训练按钮被连点导致多个训练子进程并发启动。
+        extra_env：附加环境变量（部位训练用于共享库定位/显存优化/HF 镜像）。
         """
         with self.train_lock:
             if self.train_proc and self.train_proc.poll() is None:
@@ -1812,6 +2193,8 @@ class BirdCrawlerGUI:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
+            if extra_env:
+                env.update(extra_env)
             try:
                 self.train_proc = subprocess.Popen(  # noqa: S603
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -2358,6 +2741,10 @@ class BirdCrawlerGUI:
                 for key in ("state_dict", "model_state_dict", "model_state",
                             "model", "weights"):
                     if isinstance(ckpt, dict) and isinstance(ckpt.get(key), dict):
+                        # 通用部位模型（HF/魔搭底座微调）优先按顶层标记识别
+                        if key == "model_state" and ckpt.get("hub_model_id"):
+                            return ml.detect_architecture(ckpt), \
+                                "按通用部位模型标记识别（hub_model_id）"
                         ckpt = ckpt[key]
                         break
                 if isinstance(ckpt, dict) and ckpt:
@@ -2366,6 +2753,10 @@ class BirdCrawlerGUI:
             pass
         # 3. 目录特征启发式（无 torch 时的兜底）
         if ml.has_hf_config(src_dir):
+            # 按 config.json 的 model_type 精确推断架构（ViT/Swin/ConvNeXt 等）
+            arch = ml.detect_hf_config_architecture(src_dir)
+            if arch != "generic":
+                return arch, "按 config.json 的 model_type 推断（可手动改选）"
             return "vit_hf", "按 HuggingFace 目录结构推断（可手动改选）"
         return "resnet50", "未能读取权重，按默认 ResNet50 处理（可手动改选）"
 
@@ -2726,6 +3117,11 @@ class BirdCrawlerGUI:
 
         bar = ttk.Frame(page, padding=6); bar.pack(fill=tk.X)
         ttk.Button(bar, text="刷新统计", command=self._load_stats).pack(side=tk.LEFT)
+        ttk.Button(bar, text="数据库健康检查", command=self._run_health_check).pack(
+            side=tk.LEFT, padx=(8, 0))
+        self.health_fix_btn = ttk.Button(
+            bar, text="执行安全修复", command=self._apply_health_fixes, state=tk.DISABLED)
+        self.health_fix_btn.pack(side=tk.LEFT, padx=(8, 0))
 
         self.stats_text = scrolledtext.ScrolledText(page, state=tk.DISABLED,
                                                     font=("Microsoft YaHei", 10))
@@ -3061,6 +3457,67 @@ class BirdCrawlerGUI:
         self.stats_text.delete("1.0", tk.END)
         self.stats_text.insert(tk.END, "\n".join(lines))
         self.stats_text.config(state=tk.DISABLED)
+
+    # ================= 数据库健康检查 =================
+    def _show_stats_text(self, text: str) -> None:
+        """线程安全地向统计页文本框写入内容（工作线程经 root.after 调度）。"""
+        def _write() -> None:
+            self.stats_text.config(state=tk.NORMAL)
+            self.stats_text.delete("1.0", tk.END)
+            self.stats_text.insert(tk.END, text)
+            self.stats_text.config(state=tk.DISABLED)
+        self.root.after(0, _write)
+
+    def _run_health_check(self, apply_fix: bool = False) -> None:
+        """后台运行数据库健康检查（只读扫描；apply_fix=True 时执行安全修复）。
+
+        检查/修复逻辑由 db_health_check 模块提供：
+        - 检查项覆盖 .part 残留、未入库散图、孤儿记录、空批次、
+          重复指纹、路径可解析性、同名歧义、两库一致性；
+        - 修复前自动整库备份，修复动作与 GUI 界面的只读访问互不影响。
+        """
+        # 修复属于写库操作，下载/拖入/训练运行中时禁止执行，避免并发写冲突
+        if apply_fix:
+            busy = ((self.proc and self.proc.poll() is None)
+                    or (self.drop_proc and self.drop_proc.poll() is None)
+                    or (self.train_proc and self.train_proc.poll() is None)
+                    or (self.ds_export_proc and self.ds_export_proc.poll() is None))
+            if busy:
+                messagebox.showwarning("提示", "下载/拖入/训练任务运行中，暂不能执行修复。")
+                return
+            if not messagebox.askokcancel(
+                    "执行安全修复",
+                    "将执行：删除 .part 残留、散图移入待处理区、\n"
+                    "删除无照片观察记录（两库同步）、删除空批次。\n"
+                    "执行前会自动整库备份。确定继续吗？"):
+                return
+
+        self.health_fix_btn.config(state=tk.DISABLED)
+        self._show_stats_text("数据库健康检查运行中，请稍候……")
+
+        def worker() -> None:
+            try:
+                from db_health_check import run_checks, apply_fixes
+                rep = run_checks(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB)
+                out = [rep.render()]
+                if apply_fix and rep.issues:
+                    out.append("\n=== 执行修复 ===")
+                    for line in apply_fixes(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB, rep):
+                        out.append(f"  {line}")
+                    out.append("\n=== 修复后复查 ===")
+                    rep2 = run_checks(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB)
+                    out.append(rep2.render())
+                self._show_stats_text("\n".join(out))
+                # 类群列表可能因清理而变化，刷新筛选下拉框
+                self.root.after(0, self._refresh_taxon_filters)
+            except Exception as exc:  # noqa: BLE001
+                self._show_stats_text(f"健康检查失败: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_health_fixes(self) -> None:
+        """执行安全修复入口（先弹确认，再复用健康检查流程）。"""
+        self._run_health_check(apply_fix=True)
 
     # ================= 关闭处理 =================
     def _on_close(self) -> None:

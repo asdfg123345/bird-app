@@ -8,17 +8,21 @@ gui_app.py —— tkinter 桌面界面：模型选择 / 选图预览 / 提问识
 1. 全项目仅本文件导入 tkinter；main.py 的 gui 分支延迟导入本模块，
    云端训练环境不 import gui_app 即无 GUI 依赖；
 2. 全部界面与交互逻辑封装在可嵌入面板 BirdVqaPanel(tk.Frame) 中，
-   可放入任意父容器复用；BirdVqaApp(tk.Tk) 仅作为独立窗口包壳，
-   保持 main.py gui 入口的原有调用方式完全兼容；
-3. 识别过程在子线程执行，结果经 panel.after 回到主线程刷新界面；
-4. 窗口标题、默认模型、默认标记样式等一律取自 config，无硬编码；
-5. 物种模型下拉防御性接入 config.get_all_species_models()（出厂+共享库
+   可放入任意父容器复用；BirdVqaApp(tk.Tk) 仅作为独立窗口包壳；
+3. 界面分区架构：图片区（选图 / 图库联动 / 预览）常驻可用，不依赖任何
+   模型环境；视觉问答区（模型选择 / 提问 / 标记）默认收起，用户勾选
+   「启用视觉问答」后才首次加载模型或启动问答服务（懒加载），加载
+   失败仅影响问答，选图浏览等基础功能不受影响；
+4. 识别过程在子线程执行，结果经 panel.after 回到主线程刷新界面；
+5. 窗口标题、默认模型、默认标记样式等一律取自 config，无硬编码；
+6. 物种模型下拉防御性接入 config.get_all_species_models()（出厂+共享库
    合并注册表）：该接口尚不存在或调用失败时自动退回 config.SPECIES_MODELS。
 """
 
 import hashlib
 import json
 import os
+import queue
 import sqlite3
 import threading
 import tkinter as tk
@@ -50,6 +54,58 @@ GALLERY_MAX_SHOW = 800
 
 # 图库文件名索引支持识别的图片后缀（与控制台全盘索引口径一致）
 _GALLERY_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+
+def _format_species_rows(rows):
+    """物种识别结果格式化为中文文本（rows: [(中文名, 置信度 0~1)]）。"""
+    if not rows:
+        return "物种识别：无结果"
+    lines = []
+    for idx, (label, conf) in enumerate(rows):
+        rank = "Top-1" if idx == 0 else f"Top-{idx + 1}"
+        lines.append(f"{rank}：{label}（{conf * 100:.1f}%）")
+    return "\n".join(lines)
+
+
+class _UiMarshaller:
+    """工作线程 → UI 线程的回调投递器（队列 + 主线程定时轮询）。
+
+    tkinter 的 after() 只允许创建 Tk 解释器的主线程调用，工作线程直接
+    调用会抛 RuntimeError（"main thread is not in main loop"）。本类把
+    回调放入线程安全队列，由主线程每 100ms 轮询执行，任何线程均可安全
+    投递界面刷新任务；容器销毁后轮询自动停止（TclError 静默忽略）。
+    """
+
+    def __init__(self, master):
+        self._queue = queue.Queue()    # 待执行的 (回调, 参数) 队列
+        self._master = master          # 关联的 tk 容器（面板或对话框）
+        self._polling = False          # 轮询是否已启动（只启动一次）
+
+    def post(self, func, *args):
+        """工作线程调用：把回调放入队列，等待主线程执行。"""
+        self._queue.put((func, args))
+
+    def start(self):
+        """在主线程启动轮询（容器构建时调用一次）。"""
+        if not self._polling:
+            self._polling = True
+            self._master.after(100, self._poll)
+
+    def _poll(self):
+        """主线程定时执行：取出并运行队列中的回调，然后继续排队。"""
+        try:
+            while True:
+                func, args = self._queue.get_nowait()
+                try:
+                    func(*args)
+                except tk.TclError:
+                    pass           # 控件已销毁等场景：静默丢弃
+        except queue.Empty:
+            pass
+        try:
+            self._master.after(100, self._poll)
+        except tk.TclError:
+            pass                   # 容器已销毁：停止轮询
 
 
 def _gallery_cache_path(db_path):
@@ -138,6 +194,10 @@ class GalleryPickerDialog(tk.Toplevel):
         self._shown_records = []         # 当前列表渲染的记录（与列表项一一对应）
         self._data_dir = db_path.parent.parent  # 数据目录（db 目录的上一级）
         self._cache_path = _gallery_cache_path(db_path)  # 文件名索引缓存文件
+        # 线程 → UI 回调投递器：读库与建索引在后台线程执行，
+        # 结果经队列回主线程刷新列表（after 不允许跨线程调用）
+        self._ui = _UiMarshaller(self)
+        self._ui.start()
 
         self._build_widgets()
         self._load_records()
@@ -183,9 +243,9 @@ class GalleryPickerDialog(tk.Toplevel):
             try:
                 records, missing = self._read_and_resolve()
             except Exception as exc:
-                self.after(0, self._on_load_failed, str(exc))
+                self._ui.post(self._on_load_failed, str(exc))
                 return
-            self.after(0, self._on_records_ready, records, missing)
+            self._ui.post(self._on_records_ready, records, missing)
         threading.Thread(target=worker, daemon=True).start()
 
     def _read_and_resolve(self):
@@ -265,10 +325,10 @@ class GalleryPickerDialog(tk.Toplevel):
             cache_key = f"unknown-{row_count}"
         index = self._load_index_cache(cache_key)
         if index is not None:
-            self.after(0, lambda: self._status_var.set("已加载图库索引缓存"))
+            self._ui.post(self._status_var.set, "已加载图库索引缓存")
             return index
-        self.after(0, lambda: self._status_var.set(
-            "正在按文件名建立图库索引（首次较慢，完成后自动缓存）..."))
+        self._ui.post(self._status_var.set,
+                      "正在按文件名建立图库索引（首次较慢，完成后自动缓存）...")
         index = self._build_name_index()
         self._save_index_cache(cache_key, index)
         return index
@@ -438,28 +498,50 @@ class QaServiceClient:
         if not payload.get("ok"):
             raise RuntimeError(f"视觉服务启动失败：{payload.get('error', '未知原因')}")
 
-    def request(self, payload, timeout=1800):
-        """发送一个请求并等待响应；超时/进程退出/协议异常均抛中文异常。"""
+    def request(self, payload, timeout=1800, on_progress=None):
+        """发送一个请求并等待最终响应；超时/进程退出/协议异常均抛中文异常。
+
+        服务在最终响应之前可能发送零到多行进度事件
+        （{"event": "progress", "stage", "current", "total"}），
+        提供 on_progress(stage, current, total) 回调时逐行转发给调用方
+        用于推进界面进度条，直到读到无 event 字段的最终响应行为止。
+        """
         import subprocess
         with self._lock:
             if not self.running:
                 raise RuntimeError("视觉服务进程未运行")
             self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self._proc.stdin.flush()
-            line = self._proc.stdout.readline()
-            if not line:
-                code = self._proc.poll()
-                raise RuntimeError(f"视觉服务进程已退出（退出码 {code}）")
-            try:
-                return json.loads(line)
-            except ValueError:
-                raise RuntimeError("视觉服务响应不是合法 JSON")
+            while True:
+                line = self._proc.stdout.readline()
+                if not line:
+                    code = self._proc.poll()
+                    raise RuntimeError(f"视觉服务进程已退出（退出码 {code}）")
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    raise RuntimeError("视觉服务响应不是合法 JSON")
+                if isinstance(data, dict) and data.get("event") == "progress":
+                    if on_progress is not None:
+                        try:
+                            on_progress(data.get("stage", ""),
+                                        data.get("current"),
+                                        data.get("total"))
+                        except Exception:
+                            pass           # 进度回调异常不影响请求
+                    continue                # 进度事件不是最终响应，继续读
+                return data
 
     def models(self):
         """拉取物种/部位模型下拉数据（含可用性标记）。"""
         return self.request({"cmd": "models"})
 
-    def answer(self, image_path, question, marker_style, species_model, part_model):
+    def preload(self, on_progress=None):
+        """请求服务端预热当前激活的物种与部位模型。"""
+        return self.request({"cmd": "preload"}, on_progress=on_progress)
+
+    def answer(self, image_path, question, marker_style, species_model,
+               part_model, on_progress=None):
         """执行一次问答；返回 qa_server 的响应字典。"""
         return self.request({
             "cmd": "answer",
@@ -468,7 +550,7 @@ class QaServiceClient:
             "marker_style": marker_style or "",
             "species_model": species_model or "",
             "part_model": part_model or "",
-        })
+        }, on_progress=on_progress)
 
     def close(self):
         """终止服务子进程（先礼貌终止，超时后强杀）。"""
@@ -486,16 +568,6 @@ class QaServiceClient:
             pass
 
 
-class _ServiceAnswer:
-    """服务响应适配：包装 qa_server 的 answer 响应字典，提供与
-    vqa_engine.VqaAnswer 相同的 message / marked_image_path 只读属性，
-    使面板结果展示代码两种模式完全复用。"""
-
-    def __init__(self, payload: dict):
-        self.message = payload.get("message") or ""
-        self.marked_image_path = payload.get("marked_image_path") or None
-
-
 class BirdVqaPanel(tk.Frame):
     """可嵌入识别面板：左列控制区，右列结果区，底部状态栏。
 
@@ -510,95 +582,184 @@ class BirdVqaPanel(tk.Frame):
         self._image_path = None        # 当前选中的图片路径
         self._preview_photo = None     # 左侧预览图引用（防止被回收）
         self._result_photo = None      # 右侧结果图引用（防止被回收）
+        self._interactive_rects = []   # 结果图上可点击的部位框（画布坐标 + 部位信息）
+        self._detect_button = None     # 「部位检测」按钮（问答区构建后存在）
+        self._ask_button = None        # 「提问」按钮（问答区构建后存在）
+        self._clear_dialog_button = None  # 「清空对话」按钮（问答区构建后存在）
         self._worker_running = False   # 识别线程是否运行中
         # 服务模式：提供 qa_service_cmd 时，模型推理整体在训练环境子进程中
         # 运行（控制台 exe 无 torch），面板只负责界面与 JSON 协议转发
         self._service = None           # QaServiceClient（服务模式时创建）
         self._service_cmd = list(qa_service_cmd) if qa_service_cmd else None
 
-        # 本地注册表构建失败标记：无 torch 环境下（如安装版 exe 未配置
-        # 训练解释器）构建选项会触发 config 注册表 → model_adapters →
-        # import torch 而抛 ModuleNotFoundError；此时选项留空并给出
-        # 中文指引，避免整个面板加载失败（控制台其余功能不受影响）
+        # 问答引擎懒加载状态：未勾选启用前，模型注册表/服务进程一概不
+        # 初始化（两者均会引入 torch），选图、预览、图库联动等基础功能
+        # 在任何 Python 环境下都可直接使用
+        self._qa_enabled = False        # 用户是否勾选启用问答
+        self._qa_ready = False          # 问答引擎是否已完成初始化
+        self._qa_initializing = False   # 问答引擎初始化是否进行中
+        self._qa_box_built = False      # 问答区界面是否已构建
+        self._species_pending = False   # 物种识别是否在等引擎就绪后继续
+        self._species_options_loading = False  # 图片区模型库列表是否加载中
+        self._preloading = False        # 模型后台预热是否进行中
         self._local_registry_error = None
-
-        if self._service_cmd:
-            # 服务模式：选项列表先留空，待服务就绪后由子进程数据填充；
-            # 本地构建选项会触发 config 注册表 → model_adapters → import torch，
-            # 在无 torch 的控制台 exe 内必须避开
-            self._species_options = []
-            self._part_options = []
-        else:
-            # 生成下拉框选项：注册名 | 显示名，不可用项追加后缀；
-            # 构建过程需要 import torch，缺失时降级为空列表 + 状态栏指引
-            try:
-                self._species_options = self._build_species_options()
-                self._part_options = self._build_options(config.PART_MODELS)
-            except Exception as exc:
-                self._species_options = []
-                self._part_options = []
-                self._local_registry_error = str(exc)
+        self._species_options = []      # 模型下拉选项（引擎初始化后填充）
+        self._part_options = []
+        # 线程 → UI 回调投递器：引擎初始化与识别均在后台线程执行，
+        # 结果经队列回主线程刷新界面（after 不允许跨线程调用）
+        self._ui = _UiMarshaller(self)
 
         self._build_widgets()
+        self._ui.start()
+        self._set_status("就绪：可先选择图片；需要部位检测或问题互动时请勾选「启用视觉问答」")
 
-        if self._service_cmd:
-            self._set_status("视觉服务启动中（首次加载模型较慢，请稍候）...")
-            worker = threading.Thread(target=self._start_service_worker,
-                                      daemon=True)
-            worker.start()
-        elif self._local_registry_error is not None:
-            # 本地模式降级提示：指引用户配置含 torch 的训练解释器
-            self._set_status(
-                "本机视觉环境不可用（"
-                + self._local_registry_error
-                + "）。请到「模型训练」页将解释器指向装有 torch 的 "
-                "python.exe 后，切换其他页签再切回本页重试。")
+    # ---------- 问答引擎懒加载 ----------
 
-    # ---------- 服务模式 ----------
+    def _init_qa_engine(self):
+        """首次勾选启用问答时调用：按模式在后台线程初始化引擎（懒加载）。
 
-    def _start_service_worker(self):
-        """服务线程：启动引擎子进程并拉取模型下拉数据，完成后回主线程刷新。"""
-        import os
+        服务模式：启动 qa_server 子进程并拉取模型下拉数据；
+        本地模式：构建模型下拉选项（内部 import torch，缺失即失败）。
+        初始化结果经 after 回主线程处理，期间界面给出中文进度提示。
+        """
+        self._qa_initializing = True
+        self._set_status("问答引擎初始化中（首次加载模型较慢，请稍候）...")
+        self._progress_busy()          # 初始化时长不定：进度条滚动动画
+        self._populate_qa_box(loading=True)   # 先展示问答骨架与初始化提示
+        threading.Thread(target=self._qa_init_worker, daemon=True).start()
+
+    def _qa_init_worker(self):
+        """初始化子线程：按服务模式/本地模式分别完成引擎就绪探测。"""
         try:
-            client = QaServiceClient(self._service_cmd,
-                                     cwd=os.path.dirname(self._service_cmd[-1]))
-            client.start()
-            payload = client.models()
-            if not payload.get("ok"):
-                raise RuntimeError(payload.get("error", "模型列表获取失败"))
+            if self._service_cmd:
+                import os
+                client = QaServiceClient(
+                    self._service_cmd,
+                    cwd=os.path.dirname(self._service_cmd[-1]))
+                client.start()
+                payload = client.models()
+                if not payload.get("ok"):
+                    raise RuntimeError(payload.get("error", "模型列表获取失败"))
+                self._service = client
+                self._ui.post(self._on_qa_init_done, payload)
+            else:
+                # 构建下拉选项需 import torch：无 torch 环境在此抛异常，
+                # 由统一失败回调转为中文指引（不影响选图等基础功能）
+                species_options = self._build_species_options()
+                part_options = self._build_options(config.PART_MODELS)
+                self._ui.post(self._on_qa_local_ready,
+                              species_options, part_options)
         except Exception as exc:
-            self.after(0, self._on_service_failed, str(exc))
-            return
-        self._service = client
-        self.after(0, self._on_service_models, payload)
+            self._ui.post(self._on_qa_init_failed, str(exc))
 
-    def _on_service_models(self, payload):
-        """服务模型数据到达：填充下拉选项并恢复默认选中。"""
+    def _on_qa_init_done(self, payload):
+        """服务模式初始化完成：保存下拉数据并构建问答区界面。"""
+        self._qa_initializing = False
+        self._qa_ready = True
+        self._progress_finish()
         self._species_options = [(n, d) for n, d, _a in payload.get("species", [])]
         self._part_options = [(n, d) for n, d, _a in payload.get("part", [])]
-        self._species_combo["values"] = [d for _, d in self._species_options]
-        self._species_var.set(
-            _default_display(self._species_options, config.ACTIVE_SPECIES_MODEL))
+        self._finish_qa_box()
+
+    def _on_qa_local_ready(self, species_options, part_options):
+        """本地模式初始化完成：保存下拉数据并构建问答区界面。"""
+        self._qa_initializing = False
+        self._qa_ready = True
+        self._progress_finish()
+        self._species_options = species_options
+        self._part_options = part_options
+        self._finish_qa_box()
+
+    def _finish_qa_box(self):
+        """引擎就绪后：填充图片区下拉框；若用户仍勾选着启用，再填充问答区。"""
+        pending_species = self._species_pending   # 物种识别在等引擎就绪
+        self._species_pending = False
+        # 图片区物种下拉与问答开关无关：引擎就绪即刷新，保证不启用
+        # 问答也能自主选择模型（否则下拉框永远停在"默认激活模型"）
+        self._refresh_species_combo_values()
+        if not self._qa_toggle_var.get():
+            # 初始化期间用户已取消勾选：保留就绪状态，界面保持收起
+            self._set_status("问答引擎已就绪（当前未启用，可随时勾选开启）")
+            if pending_species:
+                self._run_species_request()  # 继续被挂起的物种识别
+            return
+        self._populate_qa_box(loading=False)
         self._part_combo["values"] = [d for _, d in self._part_options]
         self._part_var.set(
             _default_display(self._part_options, config.ACTIVE_PART_MODEL))
-        self._set_status("视觉服务就绪")
+        self._set_status("视觉问答已启用，可一键部位检测，或输入问题互动交流")
+        self._start_model_preload()    # 后台预热模型，首次检测无需现场加载
 
-    def _on_service_failed(self, message):
-        """服务启动失败：状态栏与回答区显示中文原因，界面其余部分可用。"""
-        self._set_status("视觉服务启动失败")
+    def _on_qa_init_failed(self, message):
+        """引擎初始化失败：取消勾选、显示中文原因，基础功能不受影响。"""
+        self._qa_initializing = False
+        self._qa_ready = False
+        self._progress_finish()
+        self._species_pending = False       # 挂起的物种识别随失败一并取消
+        self._qa_toggle_var.set(False)     # 回退为未启用状态
+        self._populate_qa_box()            # 清空问答骨架（未启用不展示）
         self._result_text.delete("1.0", "end")
         self._result_text.insert(
             "1.0",
-            f"视觉问答服务启动失败：\n{message}\n\n"
+            f"视觉问答引擎启动失败：\n{message}\n\n"
             "处理办法：请到「模型训练」页确认 Python 解释器已指向本机训练环境"
-            "（含 torch/transformers），然后切换到其他页签再切回本页重试。")
+            "（含 torch/transformers），然后重新勾选「启用视觉问答」重试。\n\n"
+            "提示：选图、图库联动与预览不依赖问答引擎，可正常使用。")
+        self._set_status("问答引擎初始化失败（选图与预览不受影响）")
 
     def shutdown(self):
         """关闭服务子进程（父容器销毁前调用，幂等）。"""
         if self._service is not None:
             self._service.close()
             self._service = None
+
+    # ---------- 模型后台预热 ----------
+
+    def _start_model_preload(self):
+        """引擎就绪且问答启用后：后台预热激活模型，首次检测免现场加载。
+
+        预热在独立线程进行，不阻塞界面；期间用户点检测/提问时请求会
+        与预热串行排队（复用同一实例缓存），等待时间不劣于改造前。
+        """
+        if self._preloading or not self._qa_ready or not self._qa_enabled:
+            return
+        if self._service is None and self._service_cmd:
+            return                      # 服务模式但服务未就绪：不预热
+        self._preloading = True
+        self._set_status("正在后台预热模型（首次加载较慢，完成后即可秒级检测）...")
+        threading.Thread(target=self._preload_worker, daemon=True).start()
+
+    def _preload_worker(self):
+        """预热子线程：服务模式发 preload 命令，本地模式进程内加载。"""
+        try:
+            if self._service is not None:
+                resp = self._service.preload()
+                if not resp.get("ok"):
+                    raise RuntimeError(resp.get("error", "未知原因"))
+            else:
+                # 本地模式：进程内加载激活的物种与部位模型（写入实例缓存）
+                from part_locator import get_part_detector
+                from species_classifier import get_species_backend
+                get_species_backend()
+                get_part_detector()
+        except Exception:
+            # 预热失败不致命：正式检测时按原逻辑加载/回退并给出完整提示
+            self._ui.post(self._on_preload_failed)
+            return
+        self._ui.post(self._on_preload_done)
+
+    def _on_preload_done(self):
+        """预热完成：提示可立即检测（界面按钮全程未被禁用）。"""
+        self._preloading = False
+        if self._worker_running:
+            return                      # 已有任务在跑：不打断其状态提示
+        self._set_status("模型已预热完毕，可一键部位检测，或输入问题互动交流")
+
+    def _on_preload_failed(self):
+        """预热失败：静默降级（正式检测时再按原逻辑加载并提示原因）。"""
+        self._preloading = False
+        if not self._worker_running:
+            self._set_status("模型预热未完成（不影响使用，首次检测时将自动加载）")
 
     # ---------- 可编程接口 ----------
 
@@ -624,12 +785,11 @@ class BirdVqaPanel(tk.Frame):
             return
         self._species_options = species_options
         self._part_options = part_options
-        self._species_combo["values"] = [d for _, d in self._species_options]
-        self._species_var.set(
-            _default_display(self._species_options, config.ACTIVE_SPECIES_MODEL))
-        self._part_combo["values"] = [d for _, d in self._part_options]
-        self._part_var.set(
-            _default_display(self._part_options, config.ACTIVE_PART_MODEL))
+        self._refresh_species_combo_values()  # 同步图片区与问答区物种下拉
+        if hasattr(self, "_species_combo"):   # 问答区未展开时仅刷新物种下拉
+            self._part_combo["values"] = [d for _, d in self._part_options]
+            self._part_var.set(
+                _default_display(self._part_options, config.ACTIVE_PART_MODEL))
         self._set_status("模型下拉已刷新")
 
     @property
@@ -666,7 +826,7 @@ class BirdVqaPanel(tk.Frame):
     # ---------- 界面搭建 ----------
 
     def _build_widgets(self):
-        """按 grid 布局：左列控制区、右列结果区、底部状态栏。"""
+        """分区布局：左列图片区（常驻）+ 可开关问答区，右列结果区，底部状态栏。"""
         control = ttk.Frame(self, padding=10)
         control.grid(row=0, column=0, sticky="nsw", padx=(10, 5), pady=10)
         result = ttk.Frame(self, padding=10)
@@ -674,15 +834,21 @@ class BirdVqaPanel(tk.Frame):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
 
-        self._build_model_area(control)
-        self._build_image_area(control)
-        self._build_question_area(control)
-        self._build_marker_area(control)
+        self._build_image_area(control)       # 图片区：常驻，不依赖问答引擎
+        self._build_qa_toggle_area(control)   # 问答启用开关（默认关闭）
+        self._qa_box = ttk.Frame(control)     # 问答区容器：启用后才填充
         self._build_status_area()
 
-        ttk.Label(result, text="标记结果图：").pack(anchor="w")
-        self._result_image_label = ttk.Label(result, text="（提问后此处显示标记图）")
-        self._result_image_label.pack(anchor="w", pady=(0, 8))
+        ttk.Label(result, text="标记结果图（点击部位标记可查看名称）：").pack(anchor="w")
+        # 画布承载标记图：标记图上的部位框已绘制成红色边框，此处按画布坐标
+        # 登记可点击矩形，点击命中即在状态栏与对话区显示部位名称
+        self._result_canvas = tk.Canvas(
+            result, width=_RESULT_MAX_WIDTH, height=320,
+            highlightthickness=0, bg="#f0f0f0")
+        self._result_canvas.pack(anchor="w", pady=(0, 8))
+        self._reset_result_canvas_placeholder()
+        self._result_canvas.bind("<Button-1>", self._on_result_canvas_click)
+        self._result_canvas.bind("<Motion>", self._on_result_canvas_motion)
 
         ttk.Label(result, text="回答文本：").pack(anchor="w")
         text_frame = ttk.Frame(result)
@@ -693,6 +859,59 @@ class BirdVqaPanel(tk.Frame):
         self._result_text.configure(yscrollcommand=scroll.set)
         self._result_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+    # ---------- 问答启用开关与问答区填充 ----------
+
+    def _build_qa_toggle_area(self, parent):
+        """问答启用开关：默认关闭，首次勾选时才懒加载问答引擎。"""
+        box = ttk.Frame(parent)
+        box.pack(fill="x", pady=(0, 10))
+        self._qa_toggle_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box, text="启用视觉问答（问题互动与部位检测，需加载模型，不启用时不加载）",
+            variable=self._qa_toggle_var,
+            command=self._on_qa_toggled).pack(anchor="w")
+
+    def _on_qa_toggled(self):
+        """勾选状态变化：勾选→首次懒加载引擎；取消→收起问答区。"""
+        enabled = self._qa_toggle_var.get()
+        self._qa_enabled = enabled
+        if enabled:
+            if not self._qa_ready and not self._qa_initializing:
+                self._init_qa_engine()
+                return              # 初始化完成回调里会继续填充问答区
+            if self._qa_ready:
+                self._populate_qa_box(loading=False)
+            self._set_status("视觉问答已启用，可一键部位检测，或输入问题互动交流")
+            self._start_model_preload()   # 引擎已就绪：后台预热（未预热过时）
+        else:
+            self._populate_qa_box()  # 收起问答区（清空容器即隐藏）
+            self._set_status("视觉问答已关闭（选图与预览不受影响）")
+
+    def _populate_qa_box(self, loading=False):
+        """填充或收起问答区容器。
+
+        loading=True  仅显示初始化进度提示（引擎加载中）；
+        loading=False 构建完整问答区（模型选择 / 提问 / 标记样式 / 提问按钮）；
+        默认（无参）  清空容器，即收起问答区。
+        """
+        for child in self._qa_box.winfo_children():
+            child.destroy()
+        self._qa_box_built = False
+        if not self._qa_enabled and not loading:
+            self._qa_box.pack_forget()  # 未启用：收起问答区容器
+            return
+        if loading:
+            ttk.Label(self._qa_box,
+                      text="问答引擎初始化中，完成后即可提问...",
+                      foreground="#8a5a2a").pack(anchor="w", pady=6)
+            self._qa_box.pack(fill="x", pady=(0, 10))
+            return
+        self._build_model_area(self._qa_box)
+        self._build_question_area(self._qa_box)
+        self._build_marker_area(self._qa_box)
+        self._qa_box.pack(fill="x", pady=(0, 10))
+        self._qa_box_built = True
 
     def _build_model_area(self, parent):
         """顶部模型选择区：物种模型与部位模型两个只读下拉框。"""
@@ -728,7 +947,7 @@ class BirdVqaPanel(tk.Frame):
         box.columnconfigure(1, weight=1)
 
     def _build_image_area(self, parent):
-        """选图区：选择按钮、路径标签与预览区。"""
+        """选图区：选择按钮、模型选择、路径标签与预览区。"""
         box = ttk.LabelFrame(parent, text="图片", padding=8)
         box.pack(fill="x", pady=(0, 10))
         btn_row = ttk.Frame(box)
@@ -738,14 +957,97 @@ class BirdVqaPanel(tk.Frame):
         # 图库联动：从 iNaturalist 爬取图库（数据库）中选图直接载入
         ttk.Button(btn_row, text="从图库选图",
                    command=self._choose_gallery_image).pack(side="left", padx=(6, 0))
+        # 物种识别：加载图片后即可一键识别种类（独立于问答开关，不需提问）
+        self._species_button = ttk.Button(btn_row, text="识别物种",
+                                          command=self._on_species_identify)
+        self._species_button.pack(side="left", padx=(6, 0))
+        # 物种模型选择器：常驻显示、独立于问答开关；首次点开时才后台
+        # 加载模型库列表（默认使用注册表激活模型，加载后可自主选择）
+        model_row = ttk.Frame(box)
+        model_row.pack(anchor="w", pady=(4, 0))
+        ttk.Label(model_row, text="物种模型：").pack(side="left")
+        self._img_species_var = tk.StringVar(value="（默认激活模型）")
+        self._img_species_combo = ttk.Combobox(
+            model_row, textvariable=self._img_species_var,
+            state="readonly", width=42)
+        self._img_species_combo.pack(side="left", padx=(6, 0))
+        self._img_species_combo.bind(
+            "<Button-1>", lambda _e: self._on_img_species_dropdown())
         self._path_label = ttk.Label(box, text="尚未选择图片", wraplength=340)
         self._path_label.pack(anchor="w", pady=(4, 0))
         self._preview_label = ttk.Label(box, text="（预览区）")
         self._preview_label.pack(anchor="w", pady=(6, 0))
 
+    # ---------- 物种模型选择器（图片区常驻，懒加载模型库） ----------
+
+    def _on_img_species_dropdown(self):
+        """首次点开物种模型下拉框时，后台加载模型库合并注册表选项。"""
+        if self._species_options or self._species_options_loading:
+            return                      # 已加载或加载中：直接用现有列表
+        if self._service_cmd and not self._qa_ready:
+            # 服务模式：模型列表须由引擎子进程提供，走问答引擎初始化
+            if not self._qa_initializing:
+                self._init_qa_engine()
+            return
+        self._species_options_loading = True
+        self._img_species_var.set("（模型库加载中…）")
+        self._set_status("正在加载模型库物种模型列表（首次需数秒）...")
+        threading.Thread(target=self._species_options_worker,
+                         daemon=True).start()
+
+    def _species_options_worker(self):
+        """后台线程：构建「出厂 + 共享模型库」物种模型合并选项列表。
+
+        服务模式（控制台进程无 torch）经 JSON 协议向问答子进程拉取
+        models 列表；本地模式在进程内直接构建（需本机可 import torch）。
+        """
+        try:
+            if self._service is not None:
+                # 服务模式：模型注册表在训练环境子进程侧，走协议获取
+                payload = self._service.models()
+                if not payload.get("ok"):
+                    raise RuntimeError(
+                        payload.get("error") or "问答服务未返回模型列表")
+                options = [(n, d)
+                           for n, d, _a in payload.get("species", [])]
+            else:
+                # 本地模式：进程内构建合并注册表选项
+                options = self._build_species_options()
+        except Exception as exc:
+            self._ui.post(self._on_species_options_failed, str(exc))
+            return
+        self._ui.post(self._on_species_options_ready, options)
+
+    def _on_species_options_ready(self, options):
+        """模型库选项加载完成：填充下拉框并恢复默认选中。"""
+        self._species_options_loading = False
+        self._species_options = options
+        self._refresh_species_combo_values()
+        self._set_status("模型库已加载，可自主选择物种模型")
+
+    def _on_species_options_failed(self, message):
+        """模型库加载失败：下拉框回退默认项并提示，识别仍可用激活模型。"""
+        self._species_options_loading = False
+        self._img_species_var.set("（默认激活模型）")
+        self._set_status(f"模型库加载失败（{message}），将继续使用激活模型")
+
+    def _refresh_species_combo_values(self):
+        """用最新选项列表刷新图片区与问答区的物种模型下拉框。"""
+        displays = [d for _, d in self._species_options]
+        if not displays:
+            return
+        self._img_species_combo["values"] = displays
+        self._img_species_var.set(
+            _default_display(self._species_options, config.ACTIVE_SPECIES_MODEL))
+        if hasattr(self, "_species_combo"):   # 问答区已展开时同步刷新
+            self._species_combo["values"] = displays
+            self._species_var.set(
+                _default_display(self._species_options,
+                                 config.ACTIVE_SPECIES_MODEL))
+
     def _build_question_area(self, parent):
         """问题区：输入框与灰色占位提示。"""
-        box = ttk.LabelFrame(parent, text="提问", padding=8)
+        box = ttk.LabelFrame(parent, text="问题互动", padding=8)
         box.pack(fill="x", pady=(0, 10))
         self._placeholder = "请输入中文问题，例如：这种鸟的翅膀长啥样？"
         self._question_entry = ttk.Entry(box, width=44)
@@ -766,15 +1068,34 @@ class BirdVqaPanel(tk.Frame):
                         value="frame").pack(anchor="w")
         ttk.Radiobutton(box, text="圆圈（circle）", variable=self._marker_var,
                         value="circle").pack(anchor="w")
-        self._ask_button = ttk.Button(parent, text="提问", command=self._on_ask)
-        self._ask_button.pack(fill="x", pady=(4, 0))
+        # 动作按钮行：一键全部位检测（无需提问）/ 提问 / 清空对话
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(4, 0))
+        self._detect_button = ttk.Button(
+            btn_row, text="部位检测（全部位）", command=self._on_detect_parts)
+        self._detect_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._ask_button = ttk.Button(btn_row, text="提问",
+                                      command=self._on_ask)
+        self._ask_button.pack(side="left", fill="x", expand=True,
+                              padx=(0, 4))
+        self._clear_dialog_button = ttk.Button(
+            btn_row, text="清空对话", command=self._on_clear_dialogue)
+        self._clear_dialog_button.pack(side="left", fill="x", expand=True)
 
     def _build_status_area(self):
-        """底部状态栏。"""
+        """底部状态栏：状态文本 + 任务进度条。"""
+        bar = ttk.Frame(self)
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
         self._status_var = tk.StringVar(value="就绪")
-        ttk.Label(self, textvariable=self._status_var, anchor="w",
-                  relief="sunken").grid(row=1, column=0, columnspan=2,
-                                        sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(bar, textvariable=self._status_var, anchor="w",
+                  relief="sunken").pack(side="left", fill="x", expand=True)
+        # 任务进度条：模型加载等无法计步的阶段用滚动动画，
+        # 全部位检测等可计步任务按 当前步/总步数 推进
+        self._progress_var = tk.DoubleVar(value=0.0)
+        self._progress_bar = ttk.Progressbar(
+            bar, mode="determinate", maximum=100.0,
+            variable=self._progress_var, length=220)
+        self._progress_bar.pack(side="right", padx=(8, 0))
 
     # ---------- 模型选择校验 ----------
 
@@ -827,8 +1148,97 @@ class BirdVqaPanel(tk.Frame):
         img.thumbnail((_PREVIEW_MAX_WIDTH, 1 << 20), _RESAMPLE)
         self._preview_photo = ImageTk.PhotoImage(img)
         self._preview_label.config(image=self._preview_photo, text="")
-        self._set_status("图片已加载，请输入问题后点击“提问”")
+        self._set_status("图片已加载；可点击「识别物种」，或勾选「启用视觉问答」进行部位检测与问题互动")
         return True
+
+    # ---------- 物种识别（独立于问答开关，一键识别种类） ----------
+
+    def _on_species_identify(self):
+        """物种识别入口：使用「模型选择」下拉框中选中的物种模型识别种类。
+
+        模型来源为「出厂 + 共享模型库」合并注册表（config.get_all_species_
+        models()），模型库中新注册/设为激活的物种模型均可在此调用。
+        """
+        if self._worker_running:
+            self._set_status("识别正在进行，请稍候...")
+            return
+        if not self._image_path:
+            self._set_status("请先选择图片")
+            return
+        # 服务模式且引擎未就绪：先完成懒加载初始化，就绪后自动继续识别
+        if self._service_cmd and not self._qa_ready:
+            if self._qa_initializing:
+                self._set_status("引擎初始化中，请稍候再试...")
+                return
+            self._species_pending = True
+            self._init_qa_engine()
+            return
+        # 本地模式顺带懒加载模型库选项（不阻塞本次识别，激活模型先行）
+        self._on_img_species_dropdown()
+        self._run_species_request()
+
+    def _run_species_request(self):
+        """执行物种识别：服务模式经子进程协议，本地模式进程内后台分类。"""
+        # 模型名取自图片区常驻「物种模型」下拉框（数据源为模型库合并
+        # 注册表）；选项未加载时传 None 即用注册表激活模型
+        species_name = None
+        if self._species_options:
+            species_name = self._registry_of(
+                self._img_species_var.get(), self._species_options)
+        self._worker_running = True
+        self._species_button.config(state="disabled")
+        self._set_status("正在识别物种（首次加载模型较慢，请稍候）...")
+        self._progress_busy()          # 模型加载时长不定：先滚动动画
+        threading.Thread(target=self._species_worker,
+                         args=(self._image_path, species_name),
+                         daemon=True).start()
+
+    def _species_worker(self, image_path, species_name):
+        """物种识别子线程：服务模式走 JSON 协议，本地模式进程内分类。"""
+        progress_cb = self._make_progress_cb()
+        try:
+            if self._service is not None:
+                # 服务模式：模型推理在训练环境子进程中执行
+                resp = self._service.request({
+                    "cmd": "species",
+                    "image_path": str(image_path),
+                    "species_model": species_name or "",
+                }, on_progress=progress_cb)
+                if not resp.get("ok"):
+                    raise RuntimeError(resp.get("error") or "识别失败")
+                rows = [(r[0], float(r[1]))
+                        for r in resp.get("species_rows", [])]
+            else:
+                # 本地模式：进程内加载物种模型（需要 torch，缺失时报中文错）
+                from species_classifier import (classify_species,
+                                                get_species_backend)
+                progress_cb("正在加载物种识别模型（首次加载较慢，请稍候）...",
+                            None, None)
+                backend = get_species_backend(species_name)
+                progress_cb("正在进行物种识别...", 1, 1)
+                pil_image = Image.open(image_path).convert("RGB")
+                top3 = classify_species(pil_image, backend=backend)
+                rows = [(p.label_cn, float(p.confidence)) for p in top3]
+        except Exception as exc:
+            self._ui.post(self._on_species_error, f"物种识别出错：{exc}")
+            return
+        self._ui.post(self._on_species_done, rows)
+
+    def _on_species_done(self, rows):
+        """物种识别完成：对话区追加 Top-3 结果并恢复按钮。"""
+        self._worker_running = False
+        self._species_button.config(state="normal")
+        self._progress_finish()
+        self._append_dialogue("物种识别", _format_species_rows(rows))
+        self._set_status("物种识别完成")
+
+    def _on_species_error(self, message):
+        """物种识别失败：对话区追加中文原因并恢复按钮。"""
+        self._worker_running = False
+        self._species_button.config(state="normal")
+        self._progress_finish()
+        self._append_dialogue("物种识别出错", message)
+        self._set_status("物种识别失败")
 
     # ---------- 问题输入框占位提示 ----------
 
@@ -849,7 +1259,7 @@ class BirdVqaPanel(tk.Frame):
         text = self._question_entry.get().strip()
         return "" if text == self._placeholder else text
 
-    # ---------- 提问与识别 ----------
+    # ---------- 提问与识别（问题互动） ----------
 
     def _on_ask(self):
         """校验输入后启动识别子线程。"""
@@ -868,8 +1278,9 @@ class BirdVqaPanel(tk.Frame):
         part_name = self._registry_of(self._part_var.get(), self._part_options)
         marker = self._marker_var.get()
 
-        self._ask_button.config(state="disabled")
+        self._set_action_buttons("disabled")
         self._set_status("正在识别，请稍候...")
+        self._progress_busy()          # 模型加载时长不定：先滚动动画
         self._worker_running = True
         worker = threading.Thread(
             target=self._ask_worker,
@@ -879,16 +1290,26 @@ class BirdVqaPanel(tk.Frame):
         worker.start()
 
     def _ask_worker(self, image_path, question, marker, species_name, part_name):
-        """识别子线程：调用问答引擎，异常兜底转中文提示。"""
+        """识别子线程：调用问答引擎，异常兜底转中文提示。
+
+        统一回传 (问题, 回答文本, 标记图路径, 可点击部位框列表)，
+        供对话式结果区与画布交互使用。
+        """
+        progress_cb = self._make_progress_cb()
         try:
             if self._service is not None:
                 # 服务模式：问答整体在训练环境子进程执行，按 JSON 协议取结果
                 resp = self._service.answer(
-                    image_path, question, marker, species_name, part_name)
-                if not resp.get("ok"):
-                    raise RuntimeError(resp.get("error") or resp.get("message")
-                                       or "识别失败")
-                answer = _ServiceAnswer(resp)
+                    image_path, question, marker, species_name, part_name,
+                    on_progress=progress_cb)
+                if not resp.get("ok") and not resp.get("message"):
+                    raise RuntimeError(resp.get("error") or "识别失败")
+                message = resp.get("message") or resp.get("error") or "识别失败"
+                marked = resp.get("marked_image_path")
+                boxes = []
+                if resp.get("part_box") and resp.get("part_cn"):
+                    boxes = [(resp["part_box"], resp["part_cn"],
+                              resp.get("description"), resp.get("is_estimated"))]
             else:
                 answer = vqa_engine.answer_question(
                     image_path=image_path,
@@ -896,48 +1317,275 @@ class BirdVqaPanel(tk.Frame):
                     marker_style=marker,
                     species_model=species_name,
                     part_model=part_name,
+                    progress_callback=progress_cb,
                 )
+                message = answer.message
+                marked = (str(answer.marked_image_path)
+                          if answer.marked_image_path else None)
+                boxes = []
+                if answer.part_box and answer.part_cn:
+                    boxes = [(answer.part_box, answer.part_cn,
+                              answer.description, answer.is_estimated)]
         except Exception as exc:
-            self.after(0, self._on_ask_error, f"识别出错：{exc}")
+            self._ui.post(self._on_ask_error, f"识别出错：{exc}")
             return
-        self.after(0, self._on_ask_done, answer)
+        self._ui.post(self._on_ask_done, question, message, marked, boxes)
 
-    def _on_ask_done(self, answer):
-        """识别完成：回到主线程刷新文本区、结果图与状态栏。"""
+    def _on_ask_done(self, question, message, marked, boxes):
+        """提问完成：对话区追加"问/答"记录并展示可点击标记图。"""
         self._worker_running = False
-        self._ask_button.config(state="normal")
-        self._result_text.delete("1.0", "end")
-        self._result_text.insert("1.0", answer.message)
-        if answer.marked_image_path:
-            self._show_result_image(answer.marked_image_path)
-            self._set_status("识别完成")
+        self._set_action_buttons("normal")
+        self._progress_finish()
+        self._append_dialogue(None, f"问：{question}\n答：{message}")
+        if marked:
+            self._show_result_image(marked, boxes)
+            self._set_status("识别完成：点击图中部位标记可查看名称")
         else:
+            self._interactive_rects = []
             self._set_status("识别完成（未生成标记图）")
 
     def _on_ask_error(self, message):
-        """识别异常：文本区显示中文错误并恢复按钮。"""
+        """识别异常：对话区追加中文原因并恢复按钮。"""
         self._worker_running = False
-        self._ask_button.config(state="normal")
-        self._result_text.delete("1.0", "end")
-        self._result_text.insert("1.0", message)
+        self._set_action_buttons("normal")
+        self._progress_finish()
+        self._append_dialogue("识别出错", message)
         self._set_status("识别失败")
 
-    def _show_result_image(self, path):
-        """在结果区显示标记图（等比缩放至宽 480）。"""
+    # ---------- 一键全部位检测（无需提问） ----------
+
+    def _on_detect_parts(self):
+        """一键全部位检测入口：直接对当前图片检测全部语义部位。"""
+        if self._worker_running:
+            self._set_status("识别正在进行，请稍候...")
+            return
+        if not self._image_path:
+            self._set_status("请先选择图片")
+            return
+        part_name = self._registry_of(self._part_var.get(), self._part_options)
+        marker = self._marker_var.get()
+        self._set_action_buttons("disabled")
+        self._set_status("正在进行全部位检测（首次加载模型较慢，请稍候）...")
+        self._progress_busy()          # 模型加载时长不定：先滚动动画
+        self._worker_running = True
+        threading.Thread(
+            target=self._detect_parts_worker,
+            args=(self._image_path, marker, part_name),
+            daemon=True,
+        ).start()
+
+    def _detect_parts_worker(self, image_path, marker, part_name):
+        """全部位检测子线程：服务模式走 detect_parts 协议，本地模式进程内检测。
+
+        服务模式 parts 行结构：[中文名, 英文名, x1, y1, x2, y2, 是否估计, 描述]。
+        """
+        progress_cb = self._make_progress_cb()
+        try:
+            if self._service is not None:
+                resp = self._service.request({
+                    "cmd": "detect_parts",
+                    "image_path": str(image_path),
+                    "marker_style": marker or "",
+                    "part_model": part_name or "",
+                }, on_progress=progress_cb)
+                if not resp.get("ok") and not resp.get("message"):
+                    raise RuntimeError(resp.get("error") or "检测失败")
+                message = resp.get("message") or resp.get("error") or "检测失败"
+                marked = resp.get("marked_image_path")
+                boxes = [([r[2], r[3], r[4], r[5]], r[0],
+                          r[7] if len(r) > 7 else "", r[6])
+                         for r in resp.get("parts", [])]
+            else:
+                result = vqa_engine.detect_all_parts(
+                    image_path=image_path,
+                    marker_style=marker,
+                    part_model=part_name,
+                    progress_callback=progress_cb,
+                )
+                message = result.message
+                marked = (str(result.marked_image_path)
+                          if result.marked_image_path else None)
+                boxes = [(hit.box, hit.part_cn, hit.description, hit.is_estimated)
+                         for hit in result.parts]
+        except Exception as exc:
+            self._ui.post(self._on_detect_parts_error, f"部位检测出错：{exc}")
+            return
+        self._ui.post(self._on_detect_parts_done, message, marked, boxes)
+
+    def _on_detect_parts_done(self, message, marked, boxes):
+        """全部位检测完成：对话区追加汇总并展示可点击标注图。"""
+        self._worker_running = False
+        self._set_action_buttons("normal")
+        self._progress_finish()
+        self._append_dialogue("部位检测", message)
+        if marked:
+            self._show_result_image(marked, boxes)
+            self._set_status("部位检测完成：点击图中部位标记可查看名称")
+        else:
+            self._interactive_rects = []
+            self._set_status("部位检测完成（未生成标记图）")
+
+    def _on_detect_parts_error(self, message):
+        """全部位检测异常：对话区追加中文原因并恢复按钮。"""
+        self._worker_running = False
+        self._set_action_buttons("normal")
+        self._progress_finish()
+        self._append_dialogue("部位检测出错", message)
+        self._set_status("部位检测失败")
+
+    # ---------- 对话式结果区 ----------
+
+    def _append_dialogue(self, header, text):
+        """向结果文本区追加一条对话记录块并自动滚动到底部。
+
+        header 为 None 时按原文追加（用于"问：…/答：…"格式），
+        否则冠以【标题】头（如【部位检测】【点击部位】）。
+        """
+        block = f"【{header}】\n{text}" if header else text
+        current = self._result_text.get("1.0", "end").strip("\n")
+        if current:
+            block = "\n\n" + block
+        self._result_text.insert("end", block + "\n")
+        self._result_text.see("end")
+
+    def _on_clear_dialogue(self):
+        """清空对话记录并恢复结果图占位提示。"""
+        self._result_text.delete("1.0", "end")
+        self._reset_result_canvas_placeholder()
+        self._set_status("对话记录已清空")
+
+    def _set_action_buttons(self, state):
+        """统一设置问答区三个动作按钮（部位检测/提问/清空对话）的可用状态。"""
+        for name in ("_detect_button", "_ask_button", "_clear_dialog_button"):
+            btn = getattr(self, name, None)
+            if btn is None:
+                continue
+            try:
+                if btn.winfo_exists():
+                    btn.config(state=state)
+            except Exception:
+                pass                       # 控件已销毁（问答区重建）时忽略
+
+    # ---------- 结果图画布与部位点击交互 ----------
+
+    def _show_result_image(self, path, boxes=None):
+        """在结果区画布显示标记图，并登记可点击的部位框。
+
+        boxes 为原图像素坐标部位框列表
+        [(框[x1,y1,x2,y2], 中文名, 特征描述, 是否估计), ...]；
+        标记图与原图同尺寸，按显示缩放比换算为画布坐标供点击命中检测。
+        """
         try:
             img = Image.open(path).convert("RGB")
         except Exception as exc:
             self._set_status(f"标记图读取失败：{exc}")
             return
+        orig_w, orig_h = img.size
         img.thumbnail((_RESULT_MAX_WIDTH, 1 << 20), _RESAMPLE)
+        disp_w, disp_h = img.size
         self._result_photo = ImageTk.PhotoImage(img)
-        self._result_image_label.config(image=self._result_photo, text="")
+        self._result_canvas.delete("all")
+        self._result_canvas.config(width=disp_w, height=disp_h)
+        self._result_canvas.create_image(
+            0, 0, image=self._result_photo, anchor="nw")
+        # 原图坐标 → 画布坐标（等比缩放），登记可交互部位框
+        scale = (disp_w / orig_w) if orig_w else 1.0
+        self._interactive_rects = []
+        for box, part_cn, description, is_estimated in (boxes or []):
+            try:
+                x1, y1, x2, y2 = (float(v) for v in box[:4])
+            except (TypeError, ValueError):
+                continue                   # 坐标异常的框跳过，不影响其余交互
+            self._interactive_rects.append({
+                "rect": (x1 * scale, y1 * scale, x2 * scale, y2 * scale),
+                "part_cn": part_cn,
+                "description": description or "",
+                "is_estimated": bool(is_estimated),
+            })
 
-    # ---------- 状态 ----------
+    def _reset_result_canvas_placeholder(self):
+        """结果图画布恢复占位提示（无标记图时）。"""
+        self._result_canvas.delete("all")
+        self._result_canvas.config(width=_RESULT_MAX_WIDTH, height=320)
+        self._result_canvas.create_text(
+            _RESULT_MAX_WIDTH // 2, 160,
+            text="（部位检测或提问后此处显示标记图）",
+            fill="#808080", width=_RESULT_MAX_WIDTH - 40)
+        self._interactive_rects = []
+
+    def _hit_interactive_rect(self, x, y):
+        """返回画布坐标 (x, y) 命中的部位框；多框重叠时取面积最小者。"""
+        best = None
+        best_area = None
+        for item in self._interactive_rects:
+            rx1, ry1, rx2, ry2 = item["rect"]
+            if rx1 <= x <= rx2 and ry1 <= y <= ry2:
+                area = max(1.0, (rx2 - rx1) * (ry2 - ry1))
+                if best is None or area < best_area:
+                    best, best_area = item, area
+        return best
+
+    def _on_result_canvas_click(self, event):
+        """点击标记图上的部位标记：状态栏与对话区显示该部位名称与描述。"""
+        hit = self._hit_interactive_rect(event.x, event.y)
+        if hit is None:
+            return                         # 未命中任何部位框：不响应
+        est_note = "（空间先验估计）" if hit["is_estimated"] else "（已检出）"
+        self._set_status(f"部位名称：{hit['part_cn']}{est_note}")
+        text = f"部位名称：{hit['part_cn']}{est_note}"
+        if hit["description"]:
+            text += f"\n{hit['description']}"
+        self._append_dialogue("点击部位", text)
+
+    def _on_result_canvas_motion(self, event):
+        """鼠标移入部位标记范围时光标切换为手型，提示可点击。"""
+        inside = self._hit_interactive_rect(event.x, event.y) is not None
+        self._result_canvas.config(cursor="hand2" if inside else "")
+
+    # ---------- 状态与进度 ----------
 
     def _set_status(self, text):
         """更新状态栏文本。"""
         self._status_var.set(text)
+
+    def _progress_busy(self):
+        """进度条切换为滚动动画（模型加载等无法计步的阶段）。"""
+        self._progress_bar.config(mode="indeterminate")
+        self._progress_bar.start(15)
+
+    def _progress_step(self, current, total):
+        """进度条按 当前步/总步数 推进（可计步任务）。"""
+        self._progress_bar.stop()
+        total = max(1, int(total or 1))
+        self._progress_bar.config(mode="determinate", maximum=float(total))
+        self._progress_var.set(min(float(current or 0), float(total)))
+
+    def _progress_finish(self):
+        """任务结束：停止动画并把进度条归零。"""
+        try:
+            self._progress_bar.stop()
+        except Exception:
+            pass                       # 控件已销毁时忽略
+        self._progress_bar.config(mode="determinate", maximum=100.0)
+        self._progress_var.set(0.0)
+
+    def _on_task_progress(self, stage, current, total):
+        """任务进度主线程回调：刷新状态文本并推进进度条。
+
+        统一进度协议：current 为 None 表示无法计步（忙碌动画），
+        否则按 (current, total) 推进；由后台线程经 _ui.post 投递调用。
+        """
+        self._set_status(stage)
+        if current is None:
+            self._progress_busy()
+        else:
+            self._progress_step(current, total)
+
+    def _make_progress_cb(self):
+        """构造可跨线程使用的进度回调（转发到主线程刷新界面）。"""
+        def _cb(stage, current, total):
+            self._ui.post(self._on_task_progress, stage, current, total)
+        return _cb
 
 
 class BirdVqaApp(tk.Tk):

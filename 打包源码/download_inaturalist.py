@@ -17,18 +17,6 @@ Example:
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import argparse
 import csv
 import json
@@ -131,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=_frozen_base(__file__) / "data",
+        default=Path(__file__).resolve().parent / "data",
     )
     parser.add_argument(
         "--photo-size",

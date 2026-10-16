@@ -20,18 +20,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import argparse
 import json
 import sqlite3
@@ -43,7 +31,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 # 默认数据库路径：脚本所在目录 / data / db / bird_observations.db（避免硬编码绝对路径）
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MAIN_DB = BASE_DIR / "data" / "db" / "bird_observations.db"
 
 # 面板页面（单页应用：页面数据全部通过 /api/* 接口异步加载）

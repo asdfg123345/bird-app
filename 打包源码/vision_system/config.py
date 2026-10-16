@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-config.py —— 系统集中配置（唯一允许出现绝对路径的文件）
+config.py —— 系统集中配置
 
 作者：天咏（明月照今日，风摇过两川。）
 
 说明：
 1. 系统内路径（缓存/输出/训练产物）基于本文件位置自动推导，整体迁移无需修改；
-2. 外部资源默认路径（预置模型、数据集）集中于"外部资源"一节，系统迁移后仅需修改该节；
+2. 全文件禁止硬编码绝对路径：外部资源（预置模型、数据集）经
+   "本地环境路径.local.json 覆盖 > 环境变量 > 应用根相对默认"三级解析，
+   开发机特有路径写入本地覆盖文件（不随安装包分发）；
 3. 模型注册表、阈值、提示词映射、空间先验表、训练超参、指标参考带全部集中在本文件。
 """
 
@@ -27,10 +29,46 @@ DETECTOR_OUTPUT_DIR = TRAINING_OUTPUT_DIR / "detector"    # 管线 B 检测器�
 PSEUDO_LABELS_DIR = TRAINING_OUTPUT_DIR / "pseudo_labels" # 管线 B 伪标注产物（labels/ + report.csv）
 TRAINING_LOCK_FILE = TRAINING_OUTPUT_DIR / "training.lock"  # 训练互斥锁
 
-# ============ 外部资源默认路径（系统迁移后仅需修改本节） ============
-VIT_BIRD_525_DIR = Path(r"d:\鸟类\bird_species_image_detection")                 # 525 类鸟类 ViT（出厂预置）
-RESNET200_CHECKPOINT = Path(r"d:\鸟类\data\model_output\best_model.pth")         # 200 类 ResNet50（项目自训，可不存在）
-SPECIES_DATASET_DIR = Path(r"d:\鸟类\鸟类训练数据集_压缩版\鸟类训练数据集_压缩版")  # 200 类数据集根（含 train/val/test）
+# ============ 外部资源路径（动态解析，禁止硬编码绝对路径） ============
+# 应用根：vision_system 的上一级（源码运行=项目根，安装后=安装目录）
+APP_ROOT = SYSTEM_ROOT.parent
+# 本地环境覆盖文件（开发机专用，记录本机特有路径；安装包打包时排除，
+# 不随包分发）。结构与键名见文件内示例，缺省时走应用根相对默认值。
+LOCAL_OVERRIDE_FILE = APP_ROOT / "本地环境路径.local.json"
+
+
+def _load_local_overrides() -> dict:
+    """读取本地环境覆盖文件；不存在或损坏时返回空字典（静默降级）。"""
+    try:
+        if LOCAL_OVERRIDE_FILE.is_file():
+            data = json.loads(LOCAL_OVERRIDE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass                 # 覆盖文件仅是可选增强，异常不影响默认路径
+    return {}
+
+
+_LOCAL_OVERRIDES = _load_local_overrides()
+
+
+def _resolve_external_path(key: str, default: Path) -> Path:
+    """外部资源路径解析：本地覆盖文件 > 环境变量 > 应用根相对默认值。
+
+    key 为覆盖文件中的键名，对应环境变量名 BIRD_<KEY大写>；
+    默认值相对应用根（安装后随包数据即此布局），保证零配置可用。
+    """
+    value = _LOCAL_OVERRIDES.get(key) or os.environ.get("BIRD_" + key.upper())
+    return Path(value) if value else default
+
+
+VIT_BIRD_525_DIR = _resolve_external_path(                     # 525 类鸟类 ViT（出厂预置）
+    "vit_bird_525_dir", APP_ROOT / "data" / "bird_species_image_detection")
+RESNET200_CHECKPOINT = _resolve_external_path(                 # 200 类 ResNet50（项目自训，可不存在）
+    "resnet200_checkpoint", APP_ROOT / "data" / "model_output" / "best_model.pth")
+SPECIES_DATASET_DIR = _resolve_external_path(                  # 200 类数据集根（含 train/val/test）
+    "species_dataset_dir",
+    APP_ROOT / "data" / "train_datasets" / "鸟类训练数据集_压缩版")
 PART_IMAGES_DIR = SPECIES_DATASET_DIR / "部位检测数据集" / "train" / "images"    # 部位图片库（803 张，无人工框标注）
 
 # ============ 模型下载源（国内网络优先） ============
@@ -552,37 +590,56 @@ def get_all_species_models(root=None) -> dict:
 
 
 def get_shared_part_models(root=None) -> dict:
-    """读取共享模型库中的部位检测模型，转为与 PART_MODELS 同构的 dict。
+    """读取共享模型库中的部位检测/分割模型，转为与 PART_MODELS 同构的 dict。
 
-    合格条目判定：记录的架构为 faster_rcnn（检测类），且模型目录下存在可用
-    权重文件（best_detector.pth / last_detector.pth / best_model.pt / 其余
-    .pt/.pth）。分类或分割等其它架构不属于部位检测器，一律跳过。
+    合格条目判定（双架构）：
+        - faster_rcnn：检测器产物（best_detector.pth / last_detector.pth …）
+        - segformer_part：v7 部位分割器产物（best_segpart.pth / last_segpart.pth …）
+    其余架构（分类/语义分割/通用）不属于部位模型，一律跳过。
 
     部位名称沿用本系统 config.PART_TO_DETECTOR_IDX 约定的 15 部位索引，
-    因此共享库条目应为同一套部位标注体系训练的检测器（管线 B 产物）。
+    因此共享库条目应为同一套部位标注体系训练（管线 B / v7 分割项目产物）。
     库缺失/损坏/无合格条目时返回 {}（绝不抛异常）。
     """
     records = _load_shared_registry_records(root)
     if not records:
         return {}
     # 惰性导入适配器（与 _build_registries 一致，规避循环引用）
-    from model_adapters import TrainedFrcnnAdapter
+    from model_adapters import (HFDetPartAdapter, HFSegPartAdapter,
+                                SegFormerPartAdapter, TrainedFrcnnAdapter)
+
+    # 架构 → 适配器类；未登记的架构视为「仅入库管理」，不接入推理
+    part_architectures = {
+        "faster_rcnn": TrainedFrcnnAdapter,
+        "segformer_part": SegFormerPartAdapter,
+        "hf_seg_part": HFSegPartAdapter,
+        "hf_det_part": HFDetPartAdapter,
+    }
+    # 各架构的权重文件候选（按优先级排列）
+    weight_candidates = {
+        "faster_rcnn": ("best_detector.pth", "last_detector.pth",
+                        "best_model.pt", "last_model.pt"),
+        "segformer_part": ("best_segpart.pth", "last_segpart.pth",
+                           "best_model.pt", "last_model.pt"),
+        "hf_seg_part": ("best_generic_seg.pth", "last_generic_seg.pth"),
+        "hf_det_part": ("best_generic_det.pth", "last_generic_det.pth"),
+    }
 
     shared: dict = {}
     for record in records:
         if not isinstance(record, dict):
             continue
-        # 仅接入检测类架构；其余架构（分类/分割/通用）不属于部位检测器
-        if str(record.get("architecture") or "").strip() != "faster_rcnn":
-            continue
+        arch = str(record.get("architecture") or "").strip()
+        adapter_cls = part_architectures.get(arch)
+        if adapter_cls is None:
+            continue  # 仅接入部位模型架构，其余（分类/分割/通用）跳过
         name = str(record.get("name") or "").strip()
         model_dir = Path(str(record.get("path") or ""))
         if not name or not model_dir.is_dir():
             continue  # 记录缺名字或目录不存在，跳过
-        # 权重文件：检测器产物优先，兼容分类式命名与其余候选
+        # 权重文件：按架构候选名依次查找，均缺失时扫描任意 .pt/.pth
         weights_path = None
-        for cand_name in ("best_detector.pth", "last_detector.pth",
-                          "best_model.pt", "last_model.pt"):
+        for cand_name in weight_candidates[arch]:
             cand = model_dir / cand_name
             if cand.is_file():
                 weights_path = cand
@@ -597,24 +654,23 @@ def get_shared_part_models(root=None) -> dict:
                 weights_path = None
         if weights_path is None:
             continue  # 无可用权重文件，非合格条目
-        # 条目 id：与已登记共享条目重名时追加后缀（出厂条目 id 无需避让，
-        # 因为检测类条目与出厂 owlvit/trained_frcnn 不会同名）
+        # 条目 id：与已登记共享条目重名时追加后缀
         entry_id = name if name not in shared else f"{name}（共享库）"
         if entry_id in shared:
             continue
-        # 显示名：模型名 + 主指标（部位检测默认 mAP@0.5）
+        # 显示名：模型名 + 主指标（检测默认 mAP@0.5，分割默认 mIoU）
         display_name = name
         value = record.get("accuracy")
         if isinstance(value, (int, float)) and 0 < value <= 1:
             metric_name = str(record.get("metric_name") or "map50")
-            label = {"map50": "mAP@0.5", "map": "mAP",
-                     "mAP": "mAP"}.get(metric_name, metric_name)
+            label = {"map50": "mAP@0.5", "map": "mAP", "mAP": "mAP",
+                     "miou": "mIoU"}.get(metric_name, metric_name)
             display_name = f"{name}（{label} {value * 100:.1f}%）"
         params = {"weights_path": str(weights_path)}   # 实例级权重路径覆盖
         if record.get("class_count"):
             params["num_classes"] = int(record["class_count"])
         shared[entry_id] = {
-            "adapter": TrainedFrcnnAdapter,
+            "adapter": adapter_cls,
             "params": params,
             "display_name": display_name,
         }

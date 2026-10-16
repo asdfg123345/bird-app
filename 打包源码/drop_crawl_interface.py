@@ -48,18 +48,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import argparse
 import hashlib
 import json
@@ -73,7 +61,7 @@ from datetime import datetime
 from pathlib import Path
 
 # 路径相对脚本目录解析，避免硬编码
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_DIR = DATA_DIR / "db"
 DEFAULT_INBOX = DATA_DIR / "drop_inbox"
@@ -95,7 +83,31 @@ FALLBACK_NAME_BLACKLIST = {
     "train", "val", "valid", "validation", "test", "eval",
     "images", "image", "imgs", "photos", "photo", "pictures",
     "labels", "label", "annotations", "dataset", "data", "raw",
+    # 常见非物种含义的目录/桌面路径名：作为回退候选只会误匹配无关类群
+    "drop_inbox", "processed_已处理", "desktop", "downloads",
+    "documents", "照片", "图片", "备份", "新建文件夹",
 }
+
+
+def _dragged_root_ancestors(path: Path, max_levels: int = 3) -> list[str]:
+    """收集拖入根目录的上级文件夹名（自近及远，最多 max_levels 层）。
+
+    拖入的叶层文件夹常以「BIRD1445照片」等编号命名，真正的物种名
+    （如「青藏喜鹊_Pica bottanensis」）在其上级目录；这些上级名不在
+    collect_leaf_kinds 的层级路径内，需单独提取参与回退解析。
+    黑名单名与盘符根自动跳过。
+    """
+    ancestors: list[str] = []
+    for parent in path.absolute().parents:
+        name = parent.name.strip()
+        if not name:  # 已到盘符根（如 D:\）
+            break
+        if name.lower() in FALLBACK_NAME_BLACKLIST:
+            continue
+        ancestors.append(name)
+        if len(ancestors) >= max_levels:
+            break
+    return ancestors
 
 
 def _open_json_with_retry(api: str, timeout: int = 15,
@@ -143,11 +155,16 @@ def resolve_taxon_id(token: str, timeout: int = 15) -> tuple[int | None, str]:
         return None, f"解析「{token}」失败: {exc}"
 
 
-def resolve_taxon_info(token: str, timeout: int = 15) -> tuple[int | None, str, str, str]:
+def resolve_taxon_info(token: str, timeout: int = 15,
+                       strict: bool = False) -> tuple[int | None, str, str, str]:
     """将名称/ID 解析为完整类群信息（用于图片按种类入库）。
 
     返回 (类群ID, 学名, 俗名, 说明文字)。
     纯数字按 ID 查询官方接口补全名称，保证与主爬虫目录命名一致。
+    strict=True 时启用严格匹配校验（回退候选专用）：接口返回结果必须与
+    候选名语义相关（学名/俗名互相包含）才接受，防止「fix」「train」等
+    非物种含义的名字被模糊匹配到无关类群；同时带 locale=zh-CN 请求，
+    使中文俗名参与校验。纯数字 ID 不受严格校验限制。
     """
     token = token.strip()
     if not token:
@@ -157,28 +174,57 @@ def resolve_taxon_info(token: str, timeout: int = 15) -> tuple[int | None, str, 
     else:
         api = ("https://api.inaturalist.org/v1/taxa/autocomplete?q="
                + urllib.parse.quote(token))
+        if strict:
+            api += "&locale=zh-CN"
     try:
         data = _open_json_with_retry(api, timeout=timeout)
         results = data.get("results") or []
         if not results:
             return None, "", "", f"未找到与「{token}」匹配的类群"
-        first = results[0]
-        taxon_id = int(first["id"])
-        sci = first.get("name") or ""
-        common = first.get("preferred_common_name") or ""
-        rank = first.get("rank") or ""
+        chosen = None
+        for item in results:
+            if not strict:
+                chosen = item
+                break
+            # 严格校验（词级匹配，忽略大小写），满足其一才算相关：
+            # 1) 候选名与学名/俗名整词相等（如「青藏喜鹊」= 俗名）；
+            # 2) 候选名是学名或俗名中的一个完整单词（如「Pica」为
+            #    「Pica bottanensis」的单词；「fix」不是「Fixsenia」的
+            #    单词，被拒绝——防子串误匹配）；
+            # 3) 完整学名/俗名短语包含在候选名里（如「青藏喜鹊_Pica
+            #    bottanensis」包含学名短语「Pica bottanensis」）。
+            name = (item.get("name") or "").casefold()
+            common = (item.get("preferred_common_name") or "").casefold()
+            tok = token.casefold()
+            name_words = name.split()
+            common_words = common.split()
+            if (tok == name or tok == common
+                    or tok in name_words or tok in common_words
+                    or (name and name in tok) or (common and common in tok)):
+                chosen = item
+                break
+        if chosen is None:
+            return None, "", "", (
+                f"「{token}」的候选结果均与名称不符，严格校验拒绝（防误匹配）")
+        taxon_id = int(chosen["id"])
+        sci = chosen.get("name") or ""
+        common = chosen.get("preferred_common_name") or ""
+        rank = chosen.get("rank") or ""
         note = f"「{token}」→ {sci} / {common} (id={taxon_id}, rank={rank})"
         return taxon_id, sci, common, note
     except Exception as exc:  # 重试后仍失败才放弃，不中断整体流程
         return None, "", "", f"解析「{token}」失败: {exc}"
 
 
-def _taxon_name_candidates(kind_name: str, rel_path: str) -> list[str]:
+def _taxon_name_candidates(kind_name: str, rel_path: str,
+                           root_ancestors: list[str] | None = None) -> list[str]:
     """构造叶名未命中时的回退候选类群名序列（自近及远）。
 
-    顺序：叶名按下划线拆分 → 层级路径上层文件夹名自近及远，每个名字先整名、
-    再按下划线拆分（如「青藏喜鹊_Pica bottanensis」→ 青藏喜鹊、Pica bottanensis）。
-    自动剔除空白、含盘符冒号与重复的候选；叶名整名已试过故不重复列入。
+    顺序：叶名按下划线拆分 → 层级路径上层文件夹名自近及远 → 拖入根目录的
+    上级文件夹名自近及远（叶层以编号命名时物种名在拖入根之外），每个名字
+    先整名、再按下划线拆分（如「青藏喜鹊_Pica bottanensis」→ 青藏喜鹊、
+    Pica bottanensis）。自动剔除空白、含盘符冒号与重复的候选；
+    叶名整名已试过故不重复列入。
     """
     candidates: list[str] = []
 
@@ -198,6 +244,12 @@ def _taxon_name_candidates(kind_name: str, rel_path: str) -> list[str]:
         _push(seg)
         for part in (p.strip() for p in seg.split("_")):
             if part != seg:
+                _push(part)
+    # 拖入根之外的上级目录名（同样整名 + 下划线拆分，自近及远）
+    for anc in (root_ancestors or []):
+        _push(anc)
+        for part in (p.strip() for p in anc.split("_")):
+            if part != anc:
                 _push(part)
     return candidates
 
@@ -369,7 +421,9 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
                             rel_path: str = "",
                             texts: str = "",
                             progress_base: int = 0,
-                            progress_total: int = 0) -> tuple[int, int, int, int]:
+                            progress_total: int = 0,
+                            root_ancestors: list[str] | None = None,
+                            ) -> tuple[int, int, int, int]:
     """将一个种类的图片依次指纹编码入库（种类内部复用一条本地观察）。
 
     rel_path 为纲-目-科层级路径，texts 为种文件夹内的说明文本，
@@ -403,8 +457,11 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
     if taxon_id is None:
         # 叶名（直接含图片的最深层文件夹名）未命中时按层级回退解析，
         # 适应「物种_学名/来源子文件夹/图片」等以来源命名叶层的组织方式
-        for cand in _taxon_name_candidates(kind_name, rel_path):
-            tid, s2, c2, n2 = resolve_taxon_info(cand)
+        # （含拖入根之外的上级目录名，适应叶层以编号命名的拖入结构）
+        for cand in _taxon_name_candidates(kind_name, rel_path, root_ancestors):
+            # 回退候选一律用严格匹配校验：解析结果必须与候选名相关，
+            # 防止路径中的非物种名（fix/train/编号等）被模糊匹配到无关类群
+            tid, s2, c2, n2 = resolve_taxon_info(cand, strict=True)
             if tid is not None:
                 taxon_id, sci, common = tid, s2, c2
                 report_lines.append(f"  回退层级名「{cand}」命中: {n2}")
@@ -537,6 +594,9 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
     batch_id = manager.create_batch_run(
         quality_grade="local_import", photo_size="original",
         output_dir=str(out_dir))
+    # 拖入根目录的上级文件夹名：叶层以编号命名（如 BIRD1445照片）时，
+    # 物种名在拖入根之外，作为回退解析的最后一级候选
+    root_ancestors = _dragged_root_ancestors(path)
     try:
         seen: set[str] = set()
         total_new = total_dup = total_fail = total_skip = 0
@@ -550,16 +610,23 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
             new, dup, fail, skip = _import_images_for_kind(
                 kind_name, images, manager, batch_id, out_dir, seen, report_lines,
                 rel_path=rel_path, texts=texts,
-                progress_base=photo_base, progress_total=total_photos)
+                progress_base=photo_base, progress_total=total_photos,
+                root_ancestors=root_ancestors)
             photo_base += len(images)
             total_new += new
             total_dup += dup
             total_fail += fail
             total_skip += skip
-        manager.update_batch_run(
-            batch_id, taxa_succeeded=len(kinds),
-            total_photos=total_new + total_dup,
-            total_downloaded=total_new, total_failed=total_fail)
+        if total_new + total_dup == 0:
+            # 本次未入库任何照片（全部未匹配/失败）：不保留空批次记录，
+            # 避免健康检查反复报告 C4 空批次
+            manager.delete_batch_run(batch_id)
+            report_lines.append("本次未导入任何照片，已自动清除空批次记录。")
+        else:
+            manager.update_batch_run(
+                batch_id, taxa_succeeded=len(kinds),
+                total_photos=total_new + total_dup,
+                total_downloaded=total_new, total_failed=total_fail)
     finally:
         manager.close()
 
@@ -627,10 +694,16 @@ def process_drop_images(paths: list[Path], out_dir: Path, db_dir: Path,
             total_dup += dup
             total_fail += fail
             total_skip += skip
-        manager.update_batch_run(
-            batch_id, taxa_succeeded=len(kinds),
-            total_photos=total_new + total_dup,
-            total_downloaded=total_new, total_failed=total_fail)
+        if total_new + total_dup == 0:
+            # 本次未入库任何照片（全部未匹配/失败）：不保留空批次记录，
+            # 避免健康检查反复报告 C4 空批次
+            manager.delete_batch_run(batch_id)
+            report_lines.append("本次未导入任何照片，已自动清除空批次记录。")
+        else:
+            manager.update_batch_run(
+                batch_id, taxa_succeeded=len(kinds),
+                total_photos=total_new + total_dup,
+                total_downloaded=total_new, total_failed=total_fail)
     finally:
         manager.close()
 

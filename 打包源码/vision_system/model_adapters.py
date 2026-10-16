@@ -9,11 +9,13 @@ model_adapters.py —— 出厂预置模型适配器（仅默认配置，非架�
 - ResNet50_200Adapter：200 类 ResNet50 checkpoint——项目自训模型
 - OwlViTAdapter：开放词汇零样本检测——部位定位默认
 - TrainedFrcnnAdapter：管线 B 产物 Faster R-CNN——训练后的升级项
+- SegFormerPartAdapter：v7 增强 SegFormer 部位分割——分割式部位定位升级项
 
 更换模型：继承抽象基类写新适配器 → config 注册表登记 → 改激活项，核心链路零修改。
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -642,9 +644,12 @@ class OwlViTAdapter(PartDetectorBackend):
                 "MODEL_DOWNLOAD_SOURCE（modelscope / hf 镜像）。")
         self._loaded = True
 
-    def _query(self, pil_image: Image.Image,
-               prompts: List[str]) -> List[Tuple[Box, float]]:
-        """一组英文提示词 → 高于阈值的 (框, 置信度) 列表。
+    def _query_grouped(self, pil_image: Image.Image,
+                       prompts: List[str]) -> List[List[Tuple[Box, float]]]:
+        """一组英文提示词 → 按提示词分组的 (框, 置信度) 结果列表。
+
+        与 _query 的区别：保留批次维度，第 i 项对应该批次第 i 条提示词的
+        独立检出结果（批量检测全部位时用于把检出框映射回所属部位）。
 
         注意：OWL-ViT 的多提示词须拆成 batch（每条提示词一个批次项、单图广播），
         返回结果每条提示词独立成项；若把多提示词塞进单批次，后处理会把
@@ -661,11 +666,21 @@ class OwlViTAdapter(PartDetectorBackend):
             outputs = self._model(**inputs)
         target_sizes = torch.tensor([image.size[::-1]])
         results = _owlvit_post_process(self._processor, outputs, self.threshold, target_sizes)
-        detected: List[Tuple[Box, float]] = []
+        grouped: List[List[Tuple[Box, float]]] = []
         for entry in results:
+            items: List[Tuple[Box, float]] = []
             for box, score in zip(entry["boxes"], entry["scores"]):
                 x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-                detected.append((Box(x1, y1, x2, y2), float(score)))
+                items.append((Box(x1, y1, x2, y2), float(score)))
+            grouped.append(items)
+        return grouped
+
+    def _query(self, pil_image: Image.Image,
+               prompts: List[str]) -> List[Tuple[Box, float]]:
+        """一组英文提示词 → 高于阈值的 (框, 置信度) 扁平列表。"""
+        detected: List[Tuple[Box, float]] = []
+        for items in self._query_grouped(pil_image, prompts):
+            detected.extend(items)
         return detected
 
     def detect(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
@@ -678,11 +693,125 @@ class OwlViTAdapter(PartDetectorBackend):
         # 对称部位天然返回左右多实例，统一取并集框覆盖整体区域
         return union_boxes([box for box, _ in detected])
 
+    def detect_best(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
+        """取该部位置信度最高的单个实例框（多实例不合并）。
+
+        一键全部位检测使用：并集框会让多部位标记重叠为同一大框，
+        单实例框保证各部位定位点彼此区分、可独立点击。
+        """
+        prompts = config.PART_PROMPTS.get(part_en)
+        if not prompts:
+            return None
+        detected = self._query(pil_image, prompts)
+        if not detected:
+            return None
+        return max(detected, key=lambda item: item[1])[0]
+
     def detect_bird(self, pil_image: Image.Image) -> Optional[Box]:
         detected = self._query(pil_image, list(config.BIRD_PROMPTS))
         if not detected:
             return None
         return union_boxes([box for box, _ in detected])
+
+    def detect_parts_batch(self, pil_image: Image.Image, part_ens, progress=None):
+        """全部位 + 鸟体合并为一次批量前向（13 次前向 → 1 次，大幅提速）。
+
+        实现说明：OWL-ViT 单图 + N 条提示词时输出 logits 形状为
+        (1, 候选框数, N)，官方 post_process 会跨全部提示词取最大值，
+        无法把候选框按提示词分组；因此这里直接从原始输出手工后处理——
+        按各部位提示词切片取最大值，与逐部位单独前向的打分口径完全
+        等价（同一提示词对同一图像的 logits 值与批次组成无关）。
+        部位取置信度最高的单实例框（口径同 detect_best），鸟体取全部
+        检出框并集（口径同 detect_bird）。显存不足（OOM）时自动清理
+        缓存并回退基类逐部位实现，保证可用性。
+        """
+        try:
+            from transformers.image_transforms import center_to_corners_format
+        except ImportError:
+            # 老版本 transformers 缺少坐标转换工具：回退逐部位串行实现
+            return PartDetectorBackend.detect_parts_batch(
+                self, pil_image, part_ens, progress=progress)
+
+        try:
+            if not self._loaded:
+                self.load()
+            image = pil_image.convert("RGB")
+
+            # 批次项：各部位全部提示词 + 鸟体提示词（单图广播，一次前向）
+            prompts: List[str] = []
+            prompt_owner: List[Optional[str]] = []   # 与提示词对应：部位名/None=鸟体
+            for part_en in part_ens:
+                for prompt in config.PART_PROMPTS.get(part_en, []):
+                    prompts.append(prompt)
+                    prompt_owner.append(part_en)
+            bird_start = len(prompts)                # 鸟体提示词的起始索引
+            for prompt in config.BIRD_PROMPTS:
+                prompts.append(prompt)
+                prompt_owner.append(None)
+
+            inputs = self._processor(
+                text=[[p] for p in prompts], images=image, return_tensors="pt")
+            inputs = {k: v.to(get_device()) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+
+            # ---- 手工后处理（与逐部位前向数学等价） ----
+            probs = torch.sigmoid(outputs.logits[0])          # (Q, N) 各提示词置信度
+            boxes_cc = center_to_corners_format(
+                outputs.pred_boxes[0])                        # (Q, 4) 角点相对坐标
+            img_w, img_h = image.size
+            scale = torch.tensor([img_w, img_h, img_w, img_h],
+                                 dtype=boxes_cc.dtype, device=boxes_cc.device)
+            boxes_px = boxes_cc * scale                        # (Q, 4) 像素角点坐标
+
+            boxes = {}
+            for part_en in part_ens:
+                idx = [i for i, owner in enumerate(prompt_owner)
+                       if owner == part_en]
+                best = self._best_box_of_prompts(probs, boxes_px, idx)
+                boxes[part_en] = best[0] if best is not None else None
+            bird_scores = probs[:, bird_start:].max(dim=1).values
+            bird_mask = bird_scores > self.threshold
+            bird_box = None
+            if bool(bird_mask.any()):
+                bird_box = union_boxes([
+                    Box(*[float(v) for v in row.tolist()])
+                    for row in boxes_px[bird_mask]
+                ])
+
+            if progress:
+                try:
+                    progress(len(part_ens))
+                except Exception:
+                    pass
+            return boxes, bird_box
+        except Exception as exc:
+            # 显存不足时回退逐部位串行实现（批量大图可能超出低显存 GPU）
+            if "out of memory" not in str(exc).lower():
+                raise
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return PartDetectorBackend.detect_parts_batch(
+                self, pil_image, part_ens, progress=progress)
+
+    def _best_box_of_prompts(self, probs, boxes_px, prompt_idx):
+        """一组提示词索引 → 阈值之上置信度最高的 (Box, 置信度) 或 None。
+
+        口径与 detect_best 一致：候选框按该组提示词的最高分打分，
+        超过阈值者中取分数最高的单实例框。
+        """
+        if not prompt_idx:
+            return None
+        group = probs[:, prompt_idx]                 # (Q, 组内提示词数)
+        scores = group.max(dim=1).values             # 每个候选框的组内最高分
+        keep = scores > self.threshold
+        if not bool(keep.any()):
+            return None
+        best = int(scores.argmax())
+        x1, y1, x2, y2 = [float(v) for v in boxes_px[best].tolist()]
+        return Box(x1, y1, x2, y2), float(scores[best])
 
 
 class TrainedFrcnnAdapter(PartDetectorBackend):
@@ -767,6 +896,21 @@ class TrainedFrcnnAdapter(PartDetectorBackend):
         ]
         return union_boxes(selected)
 
+    def detect_best(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
+        """取该部位置信度最高的单个实例框（多实例不合并，供全部位检测）。"""
+        want = set(config.PART_TO_DETECTOR_IDX.get(part_en, []))
+        if not want:
+            return None
+        boxes, labels, scores = self._infer(pil_image)
+        best_box, best_score = None, -1.0
+        for box, label, score in zip(boxes, labels, scores):
+            if int(label) in want and float(score) >= self.score_threshold:
+                if float(score) > best_score:
+                    best_box, best_score = box, float(score)
+        if best_box is None:
+            return None
+        return Box(*[float(v) for v in best_box.tolist()])
+
     def detect_bird(self, pil_image: Image.Image) -> Optional[Box]:
         boxes, _, scores = self._infer(pil_image)
         selected = [
@@ -775,3 +919,386 @@ class TrainedFrcnnAdapter(PartDetectorBackend):
             if float(score) >= self.score_threshold
         ]
         return union_boxes(selected)
+
+
+class SegFormerPartAdapter(PartDetectorBackend):
+    """v7 增强 SegFormer 部位分割适配器（分割式部位定位）。
+
+    模型代码位于 v7 部位分割项目（含 MSFPA / BA-MSR 增强模块），
+    通过动态导入复用其推理器 SegPartPredictor：
+    - 权重参数优先（模型库登记路径）
+    - 环境变量 SEGPART_PROJECT_DIR 次之
+    - 相邻 v7部位分割模型_* 项目目录通配兜底
+    """
+
+    def __init__(self, weights_path: Optional[str] = None,
+                 num_classes: Optional[int] = None, **kwargs):
+        super().__init__()
+        self.weights_path = weights_path
+        self.num_classes = num_classes
+        self._predictor = None
+        self._seg_project_dir = self._resolve_project_dir()
+
+    @staticmethod
+    def _resolve_project_dir() -> Optional[Path]:
+        """定位 v7 部位分割项目目录（模型定义与推理器所在）。"""
+        env_dir = os.environ.get("SEGPART_PROJECT_DIR")
+        if env_dir and (Path(env_dir) / "model_segpart.py").is_file():
+            return Path(env_dir)
+        base = Path(__file__).resolve()
+        for parent in base.parents:
+            for cand in parent.glob("v7部位分割模型_*"):
+                if (cand / "model_segpart.py").is_file():
+                    return cand
+        return None
+
+    def load(self):
+        """加载 v7 项目推理器（权重路径缺省时取项目内 training_output）。"""
+        if self._predictor is not None:
+            return
+        if self._seg_project_dir is None:
+            raise ModelLoadError(
+                "未找到 v7 部位分割项目目录（含 model_segpart.py），"
+                "请设置环境变量 SEGPART_PROJECT_DIR 或将项目放在同级目录。")
+        if self.weights_path is None:
+            weights = self._seg_project_dir / "training_output" / "best_segpart.pth"
+            if not weights.is_file():
+                raise ModelLoadError(
+                    f"未指定权重且默认路径不存在：{weights}")
+            self.weights_path = str(weights)
+        if not Path(self.weights_path).is_file():
+            raise ModelLoadError(f"权重文件不存在：{self.weights_path}")
+        # 动态导入 v7 项目推理器（插入 sys.path 后复用，避免复制代码）
+        if str(self._seg_project_dir) not in sys.path:
+            sys.path.insert(0, str(self._seg_project_dir))
+        try:
+            from infer_segpart import SegPartPredictor
+        except ImportError as exc:
+            raise ModelLoadError(
+                f"导入 v7 部位分割推理器失败：{exc}") from exc
+        self._predictor = SegPartPredictor(self.weights_path)
+
+    def is_available(self) -> bool:
+        """权重文件存在性检查（未指定时查项目默认产物）。"""
+        if self.weights_path:
+            return Path(self.weights_path).is_file()
+        if self._seg_project_dir is None:
+            return False
+        return (self._seg_project_dir / "training_output"
+                / "best_segpart.pth").is_file()
+
+    def detect_bird(self, pil_image: Image.Image) -> Optional[Box]:
+        """全部位框并集 → 整鸟覆盖框（供整鸟检测链路复用）。"""
+        parts = self._parts(pil_image)
+        boxes = [Box(*[float(v) for v in box[:4]]) for box in parts.values()]
+        return union_boxes(boxes) if boxes else None
+
+    def _parts(self, pil_image: Image.Image,
+               prob_threshold: float = 0.5) -> dict:
+        """分割 → 逐部位外接框（对称部位已合并，像素坐标 + 置信度）。"""
+        self.load()
+        return self._predictor.predict_parts(pil_image,
+                                             prob_threshold=prob_threshold)
+
+    def detect(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
+        want = config.PART_TO_DETECTOR_IDX.get(part_en, [])
+        if not want:
+            return None
+        parts = self._parts(pil_image)
+        boxes = []
+        for det_class in want:
+            det_name = config.DETECTOR_CLASSES[det_class]
+            box = parts.get(det_name)
+            if box is not None:
+                boxes.append(Box(*[float(v) for v in box[:4]]))
+        return union_boxes(boxes) if boxes else None
+
+
+# ==================== 通用部位模型适配器（HF/魔搭底座微调产物） ====================
+# checkpoint 约定（part_model_training 通用训练器输出）：
+#   {model_state, task_type, hub_model_id, class_names, metrics, input_size}
+
+# 对称部位 → 左右独立类别名（分割/检测输出需合并为语义部位）
+_SYMMETRIC_PART_MAP = {
+    "wing": ("left_wing", "right_wing"),
+    "eye": ("left_eye", "right_eye"),
+    "leg": ("left_leg", "right_leg"),
+}
+
+
+def _merge_symmetric_parts(boxes: dict) -> dict:
+    """把左右独立部位的框合并为语义部位（wing/eye/leg），其余原样保留。"""
+    merged, consumed = {}, set()
+    for semantic, members in _SYMMETRIC_PART_MAP.items():
+        present = [boxes[m] for m in members if m in boxes]
+        consumed.update(m for m in members if m in boxes)
+        if present:
+            merged[semantic] = (
+                min(b[0] for b in present), min(b[1] for b in present),
+                max(b[2] for b in present), max(b[3] for b in present),
+                float(sum(b[4] for b in present) / len(present)),
+            )
+    for name, box in boxes.items():
+        if name not in consumed:
+            merged[name] = box
+    return merged
+
+
+class HFSegPartAdapter(PartDetectorBackend):
+    """通用部位分割适配器（HuggingFace/魔搭任意分割底座微调产物）。
+
+    按 checkpoint 记录的 hub_model_id 重建 AutoModelForSemanticSegmentation
+    （分类头 16 类），分割 → 逐部位外接框（对称部位并集）。
+    支持经典逐像素头与查询式头（Mask2Former 族，自动走后处理）。
+    """
+
+    def __init__(self, weights_path: Optional[str] = None,
+                 num_classes: Optional[int] = None, **kwargs):
+        super().__init__()
+        self.weights_path = weights_path
+        self.num_classes = num_classes
+        self._model = None
+        self._processor = None
+        self._class_names: list = []
+        self._query_based = False
+        self._input_size = 512
+
+    def _load_checkpoint(self) -> dict:
+        """读取并校验通用分割 checkpoint（含 hub_model_id 标记）。"""
+        if not self.weights_path or not Path(self.weights_path).is_file():
+            raise ModelLoadError(f"权重文件不存在：{self.weights_path}")
+        ckpt = torch.load(str(self.weights_path), map_location="cpu",
+                          weights_only=False)
+        if not isinstance(ckpt, dict) or not ckpt.get("hub_model_id"):
+            raise ModelLoadError(
+                f"权重缺少 hub_model_id 标记，不是通用部位分割模型："
+                f"{self.weights_path}")
+        return ckpt
+
+    def load(self):
+        """重建底座模型并加载微调权重（底座经魔搭/HF 镜像解析）。"""
+        if self._model is not None:
+            return
+        # 先解析底座再导入 transformers：resolve_model_path 会设置
+        # HF_ENDPOINT 镜像环境变量，而 huggingface_hub 在导入时读取该
+        # 变量，顺序颠倒会导致镜像失效直连 huggingface.co 超时
+        ckpt = self._load_checkpoint()
+        hub_id = str(ckpt["hub_model_id"])
+        resolved = resolve_model_path(hub_id)
+        from transformers import (AutoImageProcessor,
+                                  AutoModelForSemanticSegmentation)
+        try:
+            processor = AutoImageProcessor.from_pretrained(resolved)
+            names = list(ckpt.get("class_names") or [])
+            model = AutoModelForSemanticSegmentation.from_pretrained(
+                resolved, num_labels=len(names),
+                ignore_mismatched_sizes=True)
+        except Exception as exc:
+            raise ModelLoadError(
+                f"重建通用分割底座失败（{hub_id}）：{exc}") from exc
+        for attr in ("do_resize", "do_center_crop", "do_pad", "crop_size"):
+            if hasattr(processor, attr):
+                try:
+                    setattr(processor, attr, False)
+                except Exception:
+                    pass
+        state = ckpt.get("model_state", {})
+        state = {str(k)[7:] if str(k).startswith("module.") else str(k): v
+                 for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+        model.to(get_device()).eval()
+        self._model = model
+        self._processor = processor
+        self._class_names = names
+        self._query_based = hasattr(model, "post_process_semantic_segmentation")
+        self._input_size = int(ckpt.get("input_size", 512))
+
+    def is_available(self) -> bool:
+        return bool(self.weights_path) and Path(self.weights_path).is_file()
+
+    def detect_bird(self, pil_image: Image.Image) -> Optional[Box]:
+        """全部位框并集 → 整鸟覆盖框。"""
+        parts = self._parts(pil_image)
+        boxes = [Box(*[float(v) for v in box[:4]]) for box in parts.values()]
+        return union_boxes(boxes) if boxes else None
+
+    def _parts(self, pil_image: Image.Image,
+               prob_threshold: float = 0.5) -> dict:
+        """分割 → 逐部位外接框（像素坐标 + 平均置信度，对称部位并集）。"""
+        self.load()
+        import torch.nn.functional as TF
+        orig_w, orig_h = pil_image.size
+        image = pil_image.convert("RGB").resize(
+            (self._input_size, self._input_size), Image.BILINEAR)
+        pixel_values = self._processor(
+            images=image, return_tensors="pt")["pixel_values"].to(
+                next(self._model.parameters()).device)
+
+        with torch.no_grad():
+            outputs = self._model(pixel_values=pixel_values)
+
+        boxes = {}
+        min_area = 1e-4 * orig_w * orig_h
+        if self._query_based:
+            maps = self._model.post_process_semantic_segmentation(
+                outputs, target_sizes=[(orig_h, orig_w)])
+            seg = maps[0].to("cpu")
+            for idx, name in enumerate(self._class_names):
+                if idx == 0:
+                    continue  # 跳过背景
+                mask = seg == idx
+                if int(mask.sum()) < min_area:
+                    continue
+                ys, xs = torch.nonzero(mask, as_tuple=True)
+                boxes[name] = (float(xs.min()), float(ys.min()),
+                               float(xs.max()), float(ys.max()), 1.0)
+        else:
+            import torch.nn.functional as TF2
+            probs = TF2.softmax(outputs.logits.float(), dim=1)
+            probs = TF2.interpolate(probs, size=(orig_h, orig_w),
+                                    mode="bilinear", align_corners=False)[0]
+            pred = probs.argmax(dim=0)
+            for idx, name in enumerate(self._class_names):
+                if idx == 0:
+                    continue
+                mask = (pred == idx) & (probs[idx] >= prob_threshold)
+                if int(mask.sum()) < min_area:
+                    continue
+                ys, xs = torch.nonzero(mask, as_tuple=True)
+                conf = float(probs[idx][mask].mean())
+                boxes[name] = (float(xs.min()), float(ys.min()),
+                               float(xs.max()), float(ys.max()), conf)
+        return _merge_symmetric_parts(boxes)
+
+    def detect(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
+        want = config.PART_TO_DETECTOR_IDX.get(part_en, [])
+        if not want:
+            return None
+        parts = self._parts(pil_image)
+        boxes = []
+        for det_class in want:
+            det_name = config.DETECTOR_CLASSES[det_class]
+            box = parts.get(det_name)
+            if box is not None:
+                boxes.append(Box(*[float(v) for v in box[:4]]))
+        return union_boxes(boxes) if boxes else None
+
+
+class HFDetPartAdapter(PartDetectorBackend):
+    """通用部位检测适配器（HuggingFace/魔搭任意检测底座微调产物）。
+
+    按 checkpoint 记录的 hub_model_id 重建 AutoModelForObjectDetection
+    （15 部位），检测框经后处理直接输出（对称部位并集）。
+    """
+
+    def __init__(self, weights_path: Optional[str] = None,
+                 num_classes: Optional[int] = None, **kwargs):
+        super().__init__()
+        self.weights_path = weights_path
+        self.num_classes = num_classes
+        self._model = None
+        self._processor = None
+        self._class_names: list = []
+        self._input_size = 512
+
+    def _load_checkpoint(self) -> dict:
+        """读取并校验通用检测 checkpoint（含 hub_model_id 标记）。"""
+        if not self.weights_path or not Path(self.weights_path).is_file():
+            raise ModelLoadError(f"权重文件不存在：{self.weights_path}")
+        ckpt = torch.load(str(self.weights_path), map_location="cpu",
+                          weights_only=False)
+        if not isinstance(ckpt, dict) or not ckpt.get("hub_model_id"):
+            raise ModelLoadError(
+                f"权重缺少 hub_model_id 标记，不是通用部位检测模型："
+                f"{self.weights_path}")
+        return ckpt
+
+    def load(self):
+        """重建底座模型并加载微调权重（底座经魔搭/HF 镜像解析）。"""
+        if self._model is not None:
+            return
+        # 先解析底座再导入 transformers：resolve_model_path 会设置
+        # HF_ENDPOINT 镜像环境变量，而 huggingface_hub 在导入时读取该
+        # 变量，顺序颠倒会导致镜像失效直连 huggingface.co 超时
+        ckpt = self._load_checkpoint()
+        hub_id = str(ckpt["hub_model_id"])
+        resolved = resolve_model_path(hub_id)
+        from transformers import (AutoImageProcessor,
+                                  AutoModelForObjectDetection)
+        try:
+            processor = AutoImageProcessor.from_pretrained(resolved)
+            names = list(ckpt.get("class_names") or [])
+            model = AutoModelForObjectDetection.from_pretrained(
+                resolved, num_labels=len(names),
+                ignore_mismatched_sizes=True)
+        except Exception as exc:
+            raise ModelLoadError(
+                f"重建通用检测底座失败（{hub_id}）：{exc}") from exc
+        for attr in ("do_resize", "do_center_crop", "do_pad", "crop_size"):
+            if hasattr(processor, attr):
+                try:
+                    setattr(processor, attr, False)
+                except Exception:
+                    pass
+        state = ckpt.get("model_state", {})
+        state = {str(k)[7:] if str(k).startswith("module.") else str(k): v
+                 for k, v in state.items()}
+        model.load_state_dict(state, strict=True)
+        model.to(get_device()).eval()
+        self._model = model
+        self._processor = processor
+        self._class_names = names
+        self._input_size = int(ckpt.get("input_size", 512))
+
+    def is_available(self) -> bool:
+        return bool(self.weights_path) and Path(self.weights_path).is_file()
+
+    def detect_bird(self, pil_image: Image.Image) -> Optional[Box]:
+        """全部位框并集 → 整鸟覆盖框。"""
+        parts = self._parts(pil_image)
+        boxes = [Box(*[float(v) for v in box[:4]]) for box in parts.values()]
+        return union_boxes(boxes) if boxes else None
+
+    def _parts(self, pil_image: Image.Image,
+               score_threshold: float = 0.5) -> dict:
+        """检测 → 逐部位最优框（每类取最高置信度，对称部位并集）。"""
+        self.load()
+        orig_w, orig_h = pil_image.size
+        image = pil_image.convert("RGB").resize(
+            (self._input_size, self._input_size), Image.BILINEAR)
+        pixel_values = self._processor(
+            images=image, return_tensors="pt")["pixel_values"].to(
+                next(self._model.parameters()).device)
+        with torch.no_grad():
+            outputs = self._model(pixel_values=pixel_values)
+        post = getattr(self._processor, "post_process_object_detection", None)
+        if post is None:
+            raise ModelLoadError("当前 transformers 缺少检测后处理方法。")
+        results = post(outputs, threshold=score_threshold,
+                       target_sizes=[(orig_h, orig_w)])[0]
+
+        best: dict = {}
+        for box, score, label in zip(results["boxes"], results["scores"],
+                                     results["labels"]):
+            idx = int(label.item())
+            if idx < 0 or idx >= len(self._class_names):
+                continue
+            name = self._class_names[idx]
+            conf = float(score.item())
+            if name not in best or conf > best[name][4]:
+                best[name] = (float(box[0]), float(box[1]),
+                              float(box[2]), float(box[3]), conf)
+        return _merge_symmetric_parts(best)
+
+    def detect(self, pil_image: Image.Image, part_en: str) -> Optional[Box]:
+        want = config.PART_TO_DETECTOR_IDX.get(part_en, [])
+        if not want:
+            return None
+        parts = self._parts(pil_image)
+        boxes = []
+        for det_class in want:
+            det_name = config.DETECTOR_CLASSES[det_class]
+            box = parts.get(det_name)
+            if box is not None:
+                boxes.append(Box(*[float(v) for v in box[:4]]))
+        return union_boxes(boxes) if boxes else None

@@ -16,18 +16,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import os
 import shutil
 import sqlite3
@@ -361,7 +349,7 @@ def main() -> int:
     """命令行入口：可传入原始库与主库路径。"""
     import sys
 
-    base_dir = _frozen_base(__file__)
+    base_dir = Path(__file__).resolve().parent
     default_db_dir = base_dir / "data" / "db"
     raw_db = sys.argv[1] if len(sys.argv) > 1 else default_db_dir / "raw_data.db"
     main_db = sys.argv[2] if len(sys.argv) > 2 else default_db_dir / "bird_observations.db"

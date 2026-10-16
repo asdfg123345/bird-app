@@ -29,18 +29,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import json
 import os
 import re
@@ -58,7 +46,7 @@ except ImportError:
 # ============================================================
 # 路径常量（相对脚本所在目录推导，不硬编码盘符）
 # ============================================================
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 MODEL_LIBRARY_DIR = BASE_DIR / "data" / "model_library"   # 模型库根目录
 REGISTRY_PATH = MODEL_LIBRARY_DIR / "registry.json"        # 注册表
 SETTINGS_PATH = MODEL_LIBRARY_DIR / "settings.json"        # 设置（视觉系统目录定位用，本任务只预留读写）
@@ -73,28 +61,102 @@ _NAME_PATTERN = re.compile(r"^(?P<base>.+)_(?P<month>\d{1,2})月(?P<day>\d{1,2})
 # 训练模式预设（GUI 与训练脚本共用；纯数据常量，无 torch 依赖）
 # 说明：batch 为 None 表示「按设备自适应/由训练脚本推导」；
 #       amp 取值：True/False 强制开关，"auto" 表示自动判断。
+#       epochs/optimizer/patience/lr 为 None 表示「模式不预设固定值，
+#       由用户在 GUI/命令行自定义；未填写时训练脚本回退内置默认值」。
 # ============================================================
 TRAINING_MODE_PRESETS = {
-    "adaptive": {"label": "适应模式（ad）", "epochs": 30, "optimizer": "adamw",
-                 "patience": 10, "batch": None, "lr": 1e-3, "amp": "auto",
+    "adaptive": {"label": "适应模式（ad）", "epochs": None, "optimizer": None,
+                 "patience": None, "batch": None, "lr": None, "amp": "auto",
                  "workers_hint": "自动（按CPU核数2~8）",
-                 "description": "读取设备配置（GPU显存/内存/磁盘），在安全限制内自适应配置；安全优先，效果优先，允许以时间换效果"},
-    "low":      {"label": "低速模式", "epochs": 20, "optimizer": "adamw",
-                 "patience": 6, "batch": 8, "lr": 1e-3, "amp": True,
+                 "description": "读取设备配置（GPU显存/内存/磁盘）自适应推导批大小等资源参数；轮数/优化器/耐心值/学习率由用户自定义；安全优先，效果优先，允许以时间换效果"},
+    "low":      {"label": "低速模式", "epochs": None, "optimizer": None,
+                 "patience": None, "batch": 8, "lr": None, "amp": True,
                  "workers_hint": "2（低占用后台加载）",
-                 "description": "低资源占用，训练慢但稳定，适合配置较低或需后台轻度训练；混合精度降低显存占用"},
-    "high":     {"label": "高速模式", "epochs": 10, "optimizer": "adamw",
-                 "patience": 4, "batch": None, "lr": 1e-3, "amp": True,
+                 "description": "低资源占用，训练慢但稳定，适合配置较低或需后台轻度训练；混合精度降低显存占用；轮数/优化器/耐心值/学习率由用户自定义"},
+    "high":     {"label": "高速模式", "epochs": None, "optimizer": None,
+                 "patience": None, "batch": None, "lr": None, "amp": True,
                  "workers_hint": "自动（按CPU核数4~12）",
-                 "description": "大批量+混合精度，快速出结果，资源占用较高"},
-    "custom":   {"label": "自定义模式", "epochs": None, "optimizer": "adamw",
-                 "patience": None, "batch": None, "lr": 1e-3, "amp": False,
+                 "description": "大批量+混合精度，快速出结果，资源占用较高；轮数/优化器/耐心值/学习率由用户自定义"},
+    "custom":   {"label": "自定义模式", "epochs": None, "optimizer": None,
+                 "patience": None, "batch": None, "lr": None, "amp": False,
                  "workers_hint": "随线程设置（0=自动）",
-                 "description": "用户自行设置轮数/优化器/耐心值/批大小/学习率/混合精度"},
+                 "description": "用户自行设置轮数/优化器/耐心值/批大小/学习率/混合精度；未填写的参数回退训练脚本内置默认值"},
 }
 
 # 训练模式key到界面显示名的映射（方便 GUI 下拉框直接使用）
 TRAINING_MODE_LABELS = {key: value["label"] for key, value in TRAINING_MODE_PRESETS.items()}
+
+
+# ============================================================
+# 各模式可自定义参数的推荐值计算（GUI 使用；纯数据函数，无 torch 依赖）
+# 输入：模式 key、架构 key、数据集图片总数、是否有 GPU、GPU 显存 GB
+# 输出：{"epochs", "optimizer", "patience", "lr", "reasons": [中文说明...]}
+# 说明：各模式均不预设固定值，推荐值按「模式基调 × 架构 × 数据量 × 硬件」
+#       四个维度逐步修正，GUI 据此自动填表并展示推导理由，用户可改。
+# ============================================================
+def recommend_train_params(mode: str, architecture: str,
+                            dataset_count: int | None,
+                            has_gpu: bool, gpu_mem_gb: float = 0.0) -> dict:
+    arch_key = str(architecture or "resnet50")
+    reasons = []
+
+    # 1) 模式基调：训练节奏的出发点
+    if mode == "low":
+        epochs, patience, optimizer, lr = 15, 6, "adamw", 1e-3
+        reasons.append("低速模式基调：轻量节奏，减少训练时长")
+    elif mode == "high":
+        epochs, patience, optimizer, lr = 10, 4, "adamw", 1e-3
+        reasons.append("高速模式基调：短轮数快出结果，耐心值收紧")
+    else:
+        # 适应模式与自定义模式共用均衡基调
+        epochs, patience, optimizer, lr = 30, 10, "adamw", 1e-3
+        reasons.append("均衡基调：30轮+耐心值10，安全优先、效果优先")
+
+    # 2) 架构修正：不同网络收敛特性不同
+    if arch_key.startswith("vit"):
+        # ViT 对学习率敏感（骨干自动 0.1× 分层），注意力模型收敛略慢
+        epochs = round(epochs * 1.2)
+        patience = max(patience, 8)
+        reasons.append(f"ViT 架构：轮数上调 20% 至 {epochs}，耐心值至少 8")
+    elif arch_key == "resnest101":
+        # ResNeSt101 配套策略为 SGD（动量0.9）+差异化学习率，SGD 需更大学习率
+        optimizer, lr = "sgd", 0.01
+        epochs = round(epochs * 1.1)
+        reasons.append("ResNeSt101 架构：推荐 SGD 优化器+学习率 0.01，轮数上调 10%")
+    elif arch_key == "hf_image":
+        # 通用 HF 图像分类（Swin/ConvNeXt/BEiT/DeiT 等）：迁移策略与 ViT 一致
+        epochs = round(epochs * 1.2)
+        patience = max(patience, 8)
+        reasons.append(f"通用 HF 图像分类：差异化学习率迁移，轮数上调 20% 至 {epochs}，耐心值至少 8")
+    else:
+        reasons.append("ResNet 系架构：标准迁移学习参数即可")
+
+    # 3) 数据量修正：小数据多轮、大数据少轮
+    if dataset_count is not None and dataset_count > 0:
+        if dataset_count < 5000:
+            epochs = round(epochs * 1.5)
+            patience = round(patience * 1.5)
+            reasons.append(f"小数据集（{dataset_count} 张）：轮数上调 50% 至 {epochs}，"
+                           f"耐心值上调至 {patience}，防止过早停止")
+        elif dataset_count > 50000:
+            epochs = max(6, round(epochs * 0.7))
+            reasons.append(f"大数据集（{dataset_count} 张）：单轮信息量大，轮数下调 30% 至 {epochs}")
+        else:
+            reasons.append(f"中等数据集（{dataset_count} 张）：维持基准轮数")
+
+    # 4) 硬件修正：无 GPU 时截断轮数（CPU 训练过慢），小显存提示资源紧张
+    if not has_gpu:
+        capped = min(epochs, 15)
+        if capped < epochs:
+            reasons.append(f"未检测到 GPU：轮数由 {epochs} 截断至 {capped}（CPU 训练过慢）")
+            epochs = capped
+        reasons.append("无 GPU：批大小等资源参数由训练脚本按 CPU 安全值推导")
+    elif gpu_mem_gb and gpu_mem_gb < 6:
+        reasons.append(f"GPU 显存仅 {gpu_mem_gb:.1f}GB：资源偏紧，"
+                       "批大小将由实测探测收敛到安全值")
+
+    return {"epochs": max(1, epochs), "optimizer": optimizer,
+            "patience": max(0, patience), "lr": lr, "reasons": reasons}
 
 # ============================================================
 # 架构注册表与模型识别（多架构模型库支持）
@@ -123,6 +185,12 @@ ARCHITECTURE_REGISTRY = {
         "inference_supported": True,
         "adapter": "vit_hf",
     },
+    "hf_image": {
+        "display_name": "HuggingFace 图像分类（通用）",
+        "task_type": "classification",
+        "inference_supported": False,
+        "adapter": None,
+    },
     "resnest101": {
         "display_name": "ResNeSt101（timm）",
         "task_type": "classification",
@@ -140,6 +208,24 @@ ARCHITECTURE_REGISTRY = {
         "task_type": "classification",
         "inference_supported": False,
         "adapter": None,
+    },
+    "segformer_part": {
+        "display_name": "SegFormer 部位分割器（v7 架构，可推理）",
+        "task_type": "detection",
+        "inference_supported": True,
+        "adapter": "segformer_part",
+    },
+    "hf_seg_part": {
+        "display_name": "通用部位分割器（HuggingFace/魔搭底座微调，可推理）",
+        "task_type": "detection",
+        "inference_supported": True,
+        "adapter": "hf_seg_part",
+    },
+    "hf_det_part": {
+        "display_name": "通用部位检测器（HuggingFace/魔搭底座微调，可推理）",
+        "task_type": "detection",
+        "inference_supported": True,
+        "adapter": "hf_det_part",
     },
     "segformer_seg": {
         "display_name": "SegFormer（语义分割，仅管理）",
@@ -180,6 +266,7 @@ def detect_architecture(weights) -> str:
     """按权重键名特征识别模型架构，返回 ARCHITECTURE_REGISTRY 的键名。
 
     识别规则（从特殊到一般依次判定）：
+        - msfpa. / ba_msr. / aux_head.     → segformer_part（v7 部位分割器）
         - segformer.*                        → segformer_seg（语义分割）
         - 含 roi_heads.box_predictor         → faster_rcnn（目标检测）
         - backbone.*.attn.qkv.*              → vit_mmpretrain（mmpretrain 融合QKV）
@@ -193,7 +280,17 @@ def detect_architecture(weights) -> str:
     keys = _normalize_weight_keys(weights)
     if not keys:
         return "generic"
-    # 语义分割优先（键名特征最显著）
+    # 通用部位模型（HF/魔搭底座微调）：checkpoint 顶层携带 hub_model_id 标记，
+    # 按任务类型区分通用分割器 / 通用检测器（优先级最高，先于键名规则）
+    if isinstance(weights, dict) and weights.get("hub_model_id"):
+        return ("hf_seg_part"
+                if str(weights.get("task_type")) == "segmentation"
+                else "hf_det_part")
+    # v7 部位分割器：MSFPA / BA-MSR / 辅助头为增强模块独有键名，优先于普通
+    # SegFormer 判定（部位分割器同样含 segformer. 前缀键，必须先判增强模块）
+    if any(k.startswith(("msfpa.", "ba_msr.", "aux_head.")) for k in keys):
+        return "segformer_part"
+    # 语义分割（键名特征最显著）
     if any(k.startswith("segformer.") for k in keys):
         return "segformer_seg"
     # 目标检测（torchvision Faster R-CNN：RPN + RoI 头 + 框预测器）
@@ -211,6 +308,43 @@ def detect_architecture(weights) -> str:
     # torchvision 风格卷积网络（ResNet 等）
     if any(k.endswith("fc.weight") for k in keys):
         return "resnet50"
+    # HuggingFace 通用图像分类：classifier 分类头 + 未识别骨干
+    # （Swin/ConvNeXt/BEiT/DeiT/EfficientNet 等主流 HF 图像分类架构）
+    if any(k == "classifier.weight" or k == "classifier.bias"
+           or k.startswith("classifier.") for k in keys):
+        return "hf_image"
+    return "generic"
+
+
+def detect_hf_config_architecture(model_dir) -> str:
+    """读 HuggingFace config.json 的 model_type 字段推断架构键（无 torch 时兜底）。
+
+    ViT 返回 vit_hf（兼容既有推理适配器）；其余主流图像分类架构返回
+    hf_image（通用加载）；无法判断返回 generic。
+    """
+    cfg_path = Path(model_dir) / "config.json"
+    if not cfg_path.is_file():
+        return "generic"
+    try:
+        import json
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "generic"
+    model_type = str(cfg.get("model_type") or "").lower()
+    if model_type == "vit":
+        return "vit_hf"
+    # transformers 支持的主流图像分类 model_type
+    image_models = {
+        "swin", "convnext", "convnextv2", "beit", "deit", "efficientnet",
+        "mobilenet_v1", "mobilenet_v2", "resnet", "cvt", "poolformer",
+        "mobilevit", "mobilevitv2", "imagegpt",
+    }
+    if model_type in image_models:
+        return "hf_image"
+    # architectures 字段兜底（如 ["SwinForImageClassification"]）
+    archs = cfg.get("architectures") or []
+    if archs and any("ForImageClassification" in str(a) for a in archs):
+        return "hf_image"
     return "generic"
 
 
@@ -452,6 +586,7 @@ ARCH_STRATEGY_SUMMARY = {
     "resnet50": "ResNet50 标准策略：等学习率 + 余弦退火（与原训练行为一致）",
     "vit_bird_525": "ViT 迁移策略：骨干0.1×差异化学习率 + 2轮升温 + 余弦退火 + 标签平滑0.1",
     "vit_hf": "ViT 迁移策略：骨干0.1×差异化学习率 + 2轮升温 + 余弦退火 + 标签平滑0.1",
+    "hf_image": "通用 HF 图像分类迁移策略：差异化学习率 + 2轮升温 + 余弦退火 + 标签平滑0.1",
     "resnest101": "ResNeSt101 策略：SGD(动量0.9) + 差异化学习率 + 1轮升温 + 余弦退火",
 }
 

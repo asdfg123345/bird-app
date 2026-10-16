@@ -129,6 +129,46 @@ class PartDetectorBackend(ABC):
         对称部位（wing/eye/leg）由适配器内部合并左右实例后返回并集框。
         """
 
+    def detect_best(self, pil_image, part_en: str) -> Optional[Box]:
+        """检测部位的最佳单实例框（置信度最高，多实例不合并）。
+
+        供一键全部位检测使用：并集框会让多部位标记重叠为同一大框，
+        单实例框保证各部位定位点彼此区分、可独立点击。
+        基类默认退化为 detect()（并集框），由各适配器按能力覆写。
+        """
+        return self.detect(pil_image, part_en)
+
+    def detect_parts_batch(self, pil_image, part_ens, progress=None):
+        """批量检测多个部位与鸟体整框，返回 (部位框字典, 鸟体框)。
+
+        参数：
+            part_ens  部位英文名列表
+            progress  可选回调 progress(done)：每完成一个部位后以
+                      已完成数调用一次（供界面推进进度条）
+
+        返回：
+            ({部位英文名: 像素框或 None}, 鸟体整框或 None)
+
+        基类默认逐部位串行实现（正确性优先）；支持单次批量前向的
+        适配器（如 OWL-ViT）可覆写为本多合一推理，大幅缩短检测耗时。
+        """
+        try:
+            bird_box = self.detect_bird(pil_image)
+        except Exception:
+            bird_box = None
+        boxes = {}
+        for idx, part_en in enumerate(part_ens):
+            try:
+                boxes[part_en] = self.detect_best(pil_image, part_en)
+            except Exception:
+                boxes[part_en] = None    # 单部位异常按未检出处理，不中断整体
+            if progress:
+                try:
+                    progress(idx + 1)
+                except Exception:
+                    pass                 # 进度回调异常不影响检测流程
+        return boxes, bird_box
+
     @abstractmethod
     def detect_bird(self, pil_image) -> Optional[Box]:
         """检测鸟体整框（部位未检出时回退链使用）。"""

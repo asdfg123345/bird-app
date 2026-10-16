@@ -146,3 +146,78 @@ def annotate(image_path, box: Box, label_cn: str, style: str = "frame", out_dir=
         raise RuntimeError("标记图编码失败，无法写出。")
     buf.tofile(str(out_path))
     return out_path
+
+
+def annotate_multi(image_path, items, style: str = "frame", out_dir=None) -> Path:
+    """在一张图上绘制多个部位标记并输出为新文件，返回输出文件路径。
+
+    一键全部位检测使用：把多个部位框与中文标签一次性绘制到同一张图上，
+    只输出一个文件；绘制参数与单框 annotate() 完全一致，区别仅在框数量。
+
+    参数：
+        image_path  原图路径（str/Path，支持中文路径；原图只读，绝不写回）
+        items       [(Box, 中文标签), ...] 列表，至少 1 项；空列表直接抛 ValueError
+        style       标记样式："frame" 方框 / "circle" 圆圈
+        out_dir     输出目录，None 时用 config.OUTPUT_DIR（自动创建）
+    """
+    if not items:
+        raise ValueError("items 不能为空：多框标注至少需要一个 (框, 标签) 项")
+
+    src_path = Path(image_path)
+    if not src_path.is_file():
+        raise FileNotFoundError(f"图片文件不存在：{src_path}")
+    target_dir = Path(out_dir) if out_dir else config.OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # 读取原图：字节读入 + 内存解码，兼容中文路径；解码结果即内存副本，原文件不动
+    raw = np.fromfile(str(src_path), dtype=np.uint8)
+    image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"图片解码失败：{src_path}")
+    img_h, img_w = image.shape[:2]
+
+    color = tuple(int(c) for c in config.ANNOTATOR["color_bgr"])
+    thickness = int(config.ANNOTATOR["thickness"])
+    font = _load_font()
+    pad = int(config.ANNOTATOR["label_bg_pad"])
+
+    # 每个框先在 OpenCV 图像上绘制形状，并记下标签落点，供后续统一绘制中文标签
+    label_jobs = []                 # [(标签文本, 标签左上角 x, y), ...]
+    for box, label_cn in items:
+        x1, y1, x2, y2 = _clamp_box_int(box, img_w, img_h)
+        text_w, text_h, _, _ = _measure_text(font, str(label_cn))
+        if style == "frame":
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+            label_x = x1
+            label_y = y1 - text_h - 2 * pad
+            if label_y < 0:
+                # 框上方放不下时改放框内顶部
+                label_y = y1 + pad
+        elif style == "circle":
+            center_x = int(round((x1 + x2) / 2))
+            center_y = int(round((y1 + y2) / 2))
+            radius = int(min(x2 - x1, y2 - y1) / 2 * float(config.ANNOTATOR["circle_pad"]))
+            radius = max(radius, 1)
+            cv2.circle(image, (center_x, center_y), radius, color, thickness)
+            label_x = center_x - text_w // 2
+            label_y = center_y - radius - text_h - 2 * pad - 2
+            if label_y < 0:
+                # 圆圈上方越界时放到圆心下方（圆圈底部之外）
+                label_y = center_y + radius + 2
+        else:
+            raise ValueError(f"未知标记样式：{style}（可选 frame/circle）")
+        label_jobs.append((str(label_cn), label_x, label_y))
+
+    # 转 PIL 一次性绘制全部中文标签（白字红底），底色用配置红色（BGR 转 RGB）
+    pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    for text, label_x, label_y in label_jobs:
+        _draw_label(pil_img, text, label_x, label_y, color[::-1])
+    marked = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+
+    # 写盘：编码为 PNG 后按字节写出，兼容中文路径；同名自动追加序号
+    out_path = _next_output_path(target_dir, src_path.stem)
+    ok, buf = cv2.imencode(".png", marked)
+    if not ok:
+        raise RuntimeError("标记图编码失败，无法写出。")
+    buf.tofile(str(out_path))
+    return out_path

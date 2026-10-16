@@ -35,25 +35,13 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import json
 import shutil
 from datetime import datetime
 from pathlib import Path
 
 # 路径相对脚本目录解析，避免硬编码
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 DATASETS_DIR = BASE_DIR / "data" / "train_datasets"
 REGISTRY_PATH = DATASETS_DIR / "registry.json"
 

@@ -19,18 +19,6 @@
 
 from __future__ import annotations
 
-
-# ============================================================
-# 冻结环境适配：打包为 exe 后，数据目录固定到 exe 所在目录
-# ============================================================
-def _frozen_base(src_file):
-    """打包后返回 exe 所在目录；源码运行返回脚本所在目录。"""
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).resolve().parent
-    return Path(src_file).resolve().parent
-
-
 import argparse
 import csv
 import json
@@ -45,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 # 路径相对脚本目录解析，避免硬编码
-BASE_DIR = _frozen_base(__file__)
+BASE_DIR = Path(__file__).resolve().parent
 
 # 三个标准数据划分集合
 SPLIT_NAMES = ("train", "val", "test")
@@ -410,9 +398,33 @@ def export_dataset(args: argparse.Namespace) -> int:
             for oid in obs_ids[n_train + n_val:]:
                 obs_split[oid] = "test"
 
+        # 图片级兜底：观察数太少导致验证集为空时，退化为图片级划分，
+        # 保证该类在 train/val/test 三集合均有样本，从源头避免训练时出现空验证集
+        # （观察级防泄漏优先；观察不足无法防泄漏时，以「保证可评估」为更高优先级）
+        img_split_override: dict[int, str] = {}
+        val_imgs = sum(len(obs_map[o]) for o, s in obs_split.items() if s == "val")
+        if val_imgs == 0:
+            flat_rows = [r for oid in sorted(obs_map) for r in obs_map[oid]]
+            if len(flat_rows) >= 3:
+                rng.shuffle(flat_rows)
+                n_img = len(flat_rows)
+                n_img_val = max(1, round(n_img * ratios[1]))
+                n_img_test = max(1, round(n_img * ratios[2])) if n_img >= 6 else 0
+                # 保证训练集至少保留 1 张
+                n_img_test = min(n_img_test, n_img - n_img_val - 1)
+                for idx, r in enumerate(flat_rows):
+                    if idx < n_img_val:
+                        img_split_override[id(r)] = "val"
+                    elif idx < n_img_val + n_img_test:
+                        img_split_override[id(r)] = "test"
+                    else:
+                        img_split_override[id(r)] = "train"
+
         # 逐照片落盘
         for oid, split in obs_split.items():
             for row in obs_map[oid]:
+                if img_split_override:
+                    split = img_split_override.get(id(row), split)
                 src: Path = row["src"]
                 ext = src.suffix.lower()
                 filename = f"obs_{oid}_p{row['photo_id']}{ext}"
@@ -513,7 +525,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-ROOT = _frozen_base(__file__)
+ROOT = Path(__file__).resolve().parent
 
 # 方式一：ImageFolder 直接加载（train/val/test 目录即类别目录）
 # from torchvision.datasets import ImageFolder

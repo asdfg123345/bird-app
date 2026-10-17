@@ -1,6 +1,9 @@
 # bird-app 鸟类
 
 iNaturalist 鸟类数据采集、训练与视觉分析桌面应用（Python / Tkinter）。
+> **小白快速上手**：无需 Git——前往 [Releases 页面](https://github.com/asdfg123345/bird-app/releases/latest)
+> 下载 `鸟类_v1.7.0_源码.zip`，解压后按包内《下载后先看我.txt》三步即可运行
+> （装 Python → 解压 → 命令行运行 `python main.py gui`）。
 
 ## 功能一览
 

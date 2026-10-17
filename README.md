@@ -4,6 +4,8 @@ iNaturalist 鸟类数据采集、训练与视觉分析桌面应用（Python / Tk
 > **小白快速上手**：无需 Git——前往 [Releases 页面](https://github.com/asdfg123345/bird-app/releases/latest)
 > 下载 `鸟类_v1.7.0_源码.zip`，解压后按包内《下载后先看我.txt》三步即可运行
 > （装 Python → 解压 → 命令行运行 `python main.py gui`）。
+>
+> **完整操作手册**：[docs/操作手册_鸟类_v1.7.0_20261018_001.md](docs/操作手册_鸟类_v1.7.0_20261018_001.md)
 
 ## 功能一览
 
@@ -88,7 +90,7 @@ python -m venv .venv-train
 ├── src/          最新版源码（主入口 main.py，GUI、爬虫、数据库、训练、视觉系统）
 ├── dev/          开发主线工作区快照（含 README、requirements、tests）
 ├── packaging/    打包脚本（iss/spec/ps1/封面）
-├── docs/         开发系统日志（2026-09-05 起全量）
+├── docs/         开发系统日志与使用文档（2026-09-05 起全量）
 ├── LICENSE       MIT 许可证
 └── README.md
 ```

@@ -3,6 +3,39 @@
 # 项目：iNaturalist 鸟类数据采集与图像下载系统
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # ============================================================
+"""清理拖入导入时因「回退层级名」误匹配而错误入库的观察/照片数据。
+
+背景（2026-10-14 用户反馈）：
+    拖入「鸟类训练数据集_压缩版」时，数据集类群文件夹名
+    （如「中亚鸽同属（英文名：Bolle's Pigeon）」）无法被
+    iNaturalist 接口解析，程序回退用上层分割目录名
+    （train/val/test）解析，被误匹配到真菌 Trainwrecker
+    （id=351629）等无关类群，导致数据浏览/统计看不到真实类群。
+
+判定依据（两条线索合并，按观察 ID 去重）：
+    1. 数据库侧：本地观察的来源文件夹名（species_guess）形如
+       「xx同属（英文名：xxx）」——数据集按属级分组的文件夹名，
+       不可能正确对应单一物种，全部属误导入（覆盖历史会话无报告的情况）；
+    2. 报告侧：种类块内出现「回退层级名「train」命中」等回退行，
+       且回退候选是 train/val/test 等数据集分割目录名 —— 属误入库。
+       注意：回退候选为物种名（如「青藏喜鹊_Pica bottanensis」）是
+       设计允许的合法回退（来源子文件夹组织方式），不在清理范围。
+
+清理范围（仅删误入库部分，正确导入的数据不受影响）：
+    1. 主库 photos 表中该观察的照片行 + 磁盘上的照片文件；
+    2. 主库 observations 表中该本地观察行；
+    3. 主库 batch_observations 关联行；
+    4. 原始层 raw_data.db 的 raw_observations / raw_photos 留存行；
+    5. 清理后若某类群再无任何观察，删除 taxa / taxon_tree 行，
+       并删除已无照片的 taxon_* 目录。
+
+用法：
+    预览模式（不写库，只打印将删除什么）：
+        python cleanup_misimported_observations.py --db 主库.db ^
+            --raw-db 原始库.db --reports processed_已处理目录 ^
+            --data-dir taxon_目录所在的数据目录
+    执行模式：追加 --apply 参数。
+"""
 
 from __future__ import annotations
 
@@ -15,23 +48,30 @@ from pathlib import Path
 
 # 报告行解析正则
 # 种类块头：[3/14] 种类「黑顶蛙口夜鹰」共 19 张
-_v0d720ecc = re.compile(r"^\[(\d+)/(\d+)\] 种类「(.+?)」共 (\d+) 张")
+KIND_HEAD_RE = re.compile(r"^\[(\d+)/(\d+)\] 种类「(.+?)」共 (\d+) 张")
 # 小结行：小计 taxon_351629_Neolentinus_lepideus_Trainwrecker: 新入库 56, 重复 0, 失败 0, 本地观察ID -213
-_v1b945b10 = re.compile(
+SUMMARY_RE = re.compile(
     r"小计 taxon_(\d+?)_.+: 新入库 (\d+), 重复 (\d+), 失败 (\d+), 本地观察ID (-?\d+)")
 # 回退命中行：回退层级名「train」命中: ...
-_v181cc191 = re.compile(r"回退层级名「(.+?)」命中")
+FALLBACK_RE = re.compile(r"回退层级名「(.+?)」命中")
 # 数据集分割/功能目录名黑名单（与 drop_crawl_interface 保持一致）
-_v754e9f8e = {
+FALLBACK_NAME_BLACKLIST = {
     "train", "val", "valid", "validation", "test", "eval",
     "images", "image", "imgs", "photos", "photo", "pictures",
     "labels", "label", "annotations", "dataset", "data", "raw",
 }
 # 数据集按属级分组的文件夹名特征（如「中亚鸽同属（英文名：Bolle's Pigeon）」）
-_v8380df01 = "同属（英文名"
+GENUS_GROUP_MARK = "同属（英文名"
 
 
-def _vaaaec1bf(reports_dir: Path) -> list[dict]:
+def parse_reports(reports_dir: Path) -> list[dict]:
+    """解析全部导入报告，返回误匹配入库的种类块列表。
+
+    仅统计「回退候选为分割目录名（train/val/test 等）」的块；
+    回退候选为物种名属设计允许的合法回退，不计入。
+    每个元素含：报告文件、种类名、类群 ID、本地观察 ID、新入库数。
+    同一观察在多份报告中复现时按观察 ID 去重。
+    """
     found: dict[int, dict] = {}
     for report in sorted(reports_dir.glob("*_导入报告_*.txt")):
         try:
@@ -42,17 +82,17 @@ def _vaaaec1bf(reports_dir: Path) -> list[dict]:
         cur_kind = None
         cur_fallback = False
         for line in text.splitlines():
-            head = _v0d720ecc.match(line.strip())
+            head = KIND_HEAD_RE.match(line.strip())
             if head:
                 cur_kind = head.group(3)
                 cur_fallback = False
                 continue
-            fb = _v181cc191.search(line)
+            fb = FALLBACK_RE.search(line)
             if fb:
                 # 仅回退到分割目录名（train/val/test 等）才视为误匹配
-                cur_fallback = fb.group(1).strip().lower() in _v754e9f8e
+                cur_fallback = fb.group(1).strip().lower() in FALLBACK_NAME_BLACKLIST
                 continue
-            m = _v1b945b10.search(line)
+            m = SUMMARY_RE.search(line)
             if m and cur_fallback and cur_kind:
                 taxon_id = int(m.group(1))
                 obs_id = int(m.group(5))
@@ -72,17 +112,18 @@ def _vaaaec1bf(reports_dir: Path) -> list[dict]:
     return list(found.values())
 
 
-def _v640546a2(conn: sqlite3.Connection) -> list[dict]:
+def scan_db_genus_groups(conn: sqlite3.Connection) -> list[dict]:
+    """扫描主库中来源名含「同属（英文名」特征的本地观察（历史误导入）。"""
     rows = conn.execute(
         "SELECT observation_id, taxon_id, species_guess FROM observations "
         "WHERE observation_id < 0 AND species_guess LIKE ?",
-        (f"%{_v8380df01}%",)).fetchall()
+        (f"%{GENUS_GROUP_MARK}%",)).fetchall()
     return [{"report": "（数据库扫描：同属分组文件夹）",
              "kind": r[2], "taxon_id": r[1], "obs_id": r[0],
              "new_photos": -1} for r in rows]
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="清理拖入导入时回退误匹配入库的观察与照片")
     parser.add_argument("--db", required=True, help="主库 bird_observations.db 路径")
@@ -104,8 +145,8 @@ def _v6f5fe057() -> int:
     raw_conn = sqlite3.connect(raw_path)
 
     # 两条线索合并：报告解析（回退到分割名）+ 数据库扫描（同属分组文件夹）
-    entries = _vaaaec1bf(reports_dir)
-    db_entries = _v640546a2(conn)
+    entries = parse_reports(reports_dir)
+    db_entries = scan_db_genus_groups(conn)
     merged: dict[int, dict] = {}
     for e in entries + db_entries:
         merged.setdefault(e["obs_id"], e)
@@ -229,4 +270,4 @@ def _v6f5fe057() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

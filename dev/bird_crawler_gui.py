@@ -5,6 +5,23 @@
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # ============================================================
 
+"""鸟类爬虫桌面控制台（Windows 弹窗界面，Tkinter 标准库实现）。
+
+功能：
+    1. 下载控制：选择类群 → 一键启动/停止爬虫（子进程方式，不影响原有脚本）；
+    2. 拖入文件爬取：选择或监视 txt/csv 文件，自动解析类群 ID/物种名并爬取入库；
+    3. 数据浏览：按关键词/类群查询已入库的观察记录，双击跳转 iNaturalist 原页；
+    4. 照片浏览：按种类浏览已下载的照片缩略图，双击用系统看图工具打开大图；
+    5. 模型训练：选择训练模式与模型基名启动训练子进程，实时显示终端日志；
+    6. 模型库：浏览已注册模型、预览缩略图、设为激活模型、导入外部模型；
+    7. 视觉分析：嵌入鸟类视觉分析系统的问答面板（首次切到该页时惰性加载）；
+    8. 统计与说明：查看数据库总量、各类群分布、批次记录，并展示数据库设计说明。
+
+数据库设计完全遵循《数据库结构提取_爬虫项目复用_20260907.md》：
+    - 两层库：raw_data.db（原始留存）+ bird_observations.db（规范化主库）；
+    - SHA-256 指纹去重 + UNIQUE 约束 + upsert（已在 inaturalist_db_manager.py 实现）；
+    - 照片按种类分文件夹存储：data/taxon_<id>_<名称>/photos/。
+"""
 
 from __future__ import annotations
 
@@ -29,18 +46,18 @@ import model_library as ml
 import dataset_registry
 
 # 路径均相对脚本目录解析，避免硬编码
-_vfca465fc = Path(__file__).resolve().parent
-_v2c5114ec = _vfca465fc / "data"
-_v1fbee72f = _v2c5114ec / "db"
-_vab59131b = _v1fbee72f / "raw_data.db"
-_v3cd6b562 = _v1fbee72f / "bird_observations.db"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DB_DIR = DATA_DIR / "db"
+DEFAULT_RAW_DB = DB_DIR / "raw_data.db"
+DEFAULT_MAIN_DB = DB_DIR / "bird_observations.db"
 
 # 模型训练默认使用的 Python 解释器（训练需 torch/torchvision，GUI 默认解释器不一定具备）。
 # 默认优先用 anaconda 的「框架一_GPU」conda 环境；可用 --train-python 覆盖。
-_v385397c4 = Path(
+DEFAULT_TRAIN_PYTHON = Path(
     r"C:\Users\MECHREVO\anaconda3\envs\框架一_GPU\python.exe")
 # 模型训练默认数据根目录（训练数据集压缩版，脚本会自动下钻一层外壳）
-_vc88e724b = Path(r"d:\鸟类\鸟类训练数据集_压缩版")
+DEFAULT_TRAIN_DATA = Path(r"d:\鸟类\鸟类训练数据集_压缩版")
 # 训练产物不再使用散装输出目录：统一由训练脚本注册进模型库
 # （模型库根目录见 model_library.MODEL_LIBRARY_DIR，即 data/model_library）
 
@@ -52,7 +69,7 @@ except ImportError:
     HAS_PIL = False
 
 # 默认鸟类类群（与 batch_download_birds.py 的 DEFAULT_TAXA 保持一致）
-_vc9275948 = [
+DEFAULT_TAXA = [
     (574, "雉科"), (6912, "鸭科"), (5067, "鹰科"), (19728, "鸱鸮科"),
     (17599, "啄木鸟科"), (2715, "鸠鸽科"), (1627, "杜鹃科"), (13685, "雀科"),
     (12704, "鹟科"), (15977, "鸫科"), (4929, "鹭科"), (4342, "鸥科"),
@@ -66,19 +83,20 @@ _vc9275948 = [
 # 「解释器 + 脚本路径」方式拉起子进程——exe 形态下 sys.executable
 # 是主程序自身，脚本路径会被主程序 argparse 判为非法子命令
 # （invalid choice 错误），必须改走主程序内置的同名子命令。
-_v1f8c4c40 = {
+_SCRIPT_TO_SUBCOMMAND = {
     "drop_crawl_interface.py": "drop",
     "dataset_exporter.py": "dataset",
     "batch_download_birds.py": "batch",
 }
 
 
-def _v673c7f29(script_name: str, script_args: list[str]) -> list[str]:
+def _script_run_args(script_name: str, script_args: list[str]) -> list[str]:
+    """构造脚本运行命令：exe 打包形态走主程序子命令，源码形态用解释器加脚本。"""
     if getattr(sys, "frozen", False):
         # 打包形态：主程序内置同名子命令（drop/dataset/batch）
-        return [sys.executable, _v1f8c4c40[script_name], *script_args]
+        return [sys.executable, _SCRIPT_TO_SUBCOMMAND[script_name], *script_args]
     # 源码形态：当前解释器直接运行脚本文件
-    return [sys.executable, str(_vfca465fc / script_name), *script_args]
+    return [sys.executable, str(BASE_DIR / script_name), *script_args]
 
 
 # 子进程 stdout 解码编码（2026-10-14 乱码修复）：
@@ -87,20 +105,33 @@ def _v673c7f29(script_name: str, script_args: list[str]) -> list[str]:
 # 重定向下遵循 Windows ANSI 代码页（简中系统为 GBK/cp936）；源码形态
 # 子进程经 PYTHONIOENCODING=utf-8 输出 UTF-8。读取端必须按形态取对应
 # 编码，否则打包版中文报告必现乱码。
-_v9feff973 = "gbk" if getattr(sys, "frozen", False) else "utf-8"
+_SUBPROC_OUTPUT_ENCODING = "gbk" if getattr(sys, "frozen", False) else "utf-8"
 
 # 拖入子进程的进度行解析（drop_crawl_interface 以 print 输出，仅供进度条消费，
 # 不落入处理报告文本框，避免刷屏）：
 #   [进度] 种类 3/14「黑顶蛙口夜鹰」 —— 种类级：刷新进度标签，爬取模式下也驱动进度条
 #   [进度] 照片 45/3600             —— 照片级：导入模式下驱动进度条（细粒度）
-_v6dbf9c60 = re.compile(r"^\[进度\] 种类 (\d+)/(\d+)「(.+?)」")
-_v755deaf1 = re.compile(r"^\[进度\] 照片 (\d+)/(\d+)")
+_DROP_PROGRESS_KIND_RE = re.compile(r"^\[进度\] 种类 (\d+)/(\d+)「(.+?)」")
+_DROP_PROGRESS_PHOTO_RE = re.compile(r"^\[进度\] 照片 (\d+)/(\d+)")
 
 
 # ============================================================
 # 鸟类视觉分析系统目录定位（供「视觉分析」页签惰性嵌入使用）
 # ============================================================
-def _vb38c154b() -> Path | None:
+def _find_vision_system_dir() -> Path | None:
+    """定位「鸟类视觉分析系统」项目目录（不硬编码盘符路径）。
+
+    探测顺序：
+      1. 模型库设置文件（data/model_library/settings.json）中的
+         vision_system_dir 键——要求该目录下存在 gui_app.py；
+      2. 安装包内置目录：BASE_DIR\\vision_system（随 v1.3 安装包一起
+         释放，含 gui_app.py 即视为命中）；
+      3. 项目根目录（BASE_DIR.parent.parent，即鸟类总目录）下 glob
+         「鸟类视觉分析系统_*」文件夹，取修改时间最新且含 gui_app.py 的一个。
+
+    第 2、3 步命中后把路径写回设置文件，下次启动直接命中第 1 步；
+    均未命中返回 None。
+    """
     # 第 1 步：读取设置文件中已记录的视觉系统目录
     try:
         recorded = ml.read_settings().get("vision_system_dir")
@@ -111,11 +142,11 @@ def _vb38c154b() -> Path | None:
         if (p / "gui_app.py").is_file():
             return p
     # 第 2 步：安装包内置目录（随发布单元一起装入，开箱零配置）
-    builtin = _vfca465fc / "vision_system"
+    builtin = BASE_DIR / "vision_system"
     if (builtin / "gui_app.py").is_file():
         return builtin
     # 第 3 步：在项目根目录下探测「鸟类视觉分析系统_*」目录
-    project_root = _vfca465fc.parent.parent
+    project_root = BASE_DIR.parent.parent
     try:
         found = [d for d in project_root.glob("鸟类视觉分析系统_*")
                  if d.is_dir() and (d / "gui_app.py").is_file()]
@@ -134,7 +165,8 @@ def _vb38c154b() -> Path | None:
     return latest
 
 
-class _v31affc09:
+class BirdCrawlerGUI:
+    """桌面控制台主窗口。"""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -146,7 +178,7 @@ class _v31affc09:
         self.train_queue: queue.Queue = queue.Queue()    # 模型训练日志队列
         self.train_lock = threading.Lock()               # 训练子进程并发启动锁
         self.train_python_var = tk.StringVar(
-            value=str(_v385397c4))             # 训练用 Python 解释器
+            value=str(DEFAULT_TRAIN_PYTHON))             # 训练用 Python 解释器
         # 含 torch 解释器的自动探测缓存（探测一次后复用，避免重复扫描）
         self._torch_python: str = ""
         self._torch_python_probed: bool = False
@@ -176,6 +208,7 @@ class _v31affc09:
 
     # ================= 界面构建 =================
     def _build_banner(self) -> None:
+        """顶部签名横幅（深色底，展示项目名与作者签名）。"""
         banner = tk.Frame(self.root, bg="#22384e", height=58)
         banner.pack(fill=tk.X)
         banner.pack_propagate(False)
@@ -188,13 +221,15 @@ class _v31affc09:
             side=tk.RIGHT, padx=16)
 
     def _build_status_bar(self) -> None:
+        """底部状态栏（数据库路径 + 就绪标识）。"""
         bar = ttk.Frame(self.root, padding=(10, 3))
         bar.pack(fill=tk.X, side=tk.BOTTOM)
-        ttk.Label(bar, text=f"数据库：{_v3cd6b562}",
+        ttk.Label(bar, text=f"数据库：{DEFAULT_MAIN_DB}",
                   foreground="#6b7683").pack(side=tk.LEFT)
         ttk.Label(bar, text="就绪", foreground="#6b7683").pack(side=tk.RIGHT)
 
     def _build_notebook(self) -> None:
+        """构建各功能标签页（模型库页插在模型训练页之后）并应用统一样式。"""
         style = ttk.Style(self.root)
         # 优先使用 Windows 原生主题，观感与系统一致
         for theme in ("vista", "xpnative", "clam"):
@@ -233,7 +268,7 @@ class _v31affc09:
         group.pack(fill=tk.BOTH, expand=True)
         self.taxon_listbox = tk.Listbox(group, selectmode=tk.EXTENDED,
                                         height=14, exportselection=False)
-        for tid, name in _vc9275948:
+        for tid, name in DEFAULT_TAXA:
             self.taxon_listbox.insert(tk.END, f"{tid}   {name}")
         self.taxon_listbox.pack(fill=tk.BOTH, expand=True)
 
@@ -278,7 +313,7 @@ class _v31affc09:
                                    state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="打开数据目录",
-                   command=lambda: os.startfile(str(_v2c5114ec))).pack(side=tk.LEFT, padx=6)  # noqa: S606
+                   command=lambda: os.startfile(str(DATA_DIR))).pack(side=tk.LEFT, padx=6)  # noqa: S606
 
         # 右侧：运行日志
         right = ttk.Frame(page, padding=(0, 8, 8, 8))
@@ -290,6 +325,7 @@ class _v31affc09:
 
     # ---------- 标签页 2：拖入文件爬取 ----------
     def _build_drop_tab(self) -> None:
+        """构建拖入文件爬取标签页（对接 drop_crawl_interface.py 接口）。"""
         page = ttk.Frame(self.notebook)
         self.notebook.add(page, text=" 拖入文件爬取 ")
 
@@ -370,6 +406,7 @@ class _v31affc09:
         self.drop_report.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
 
     def _choose_drop_file(self) -> None:
+        """选择要处理的 txt/csv 清单或图片文件（可多选）。"""
         paths = filedialog.askopenfilenames(
             title="选择清单文件或图片（可多选）",
             filetypes=[("支持的文件", "*.txt;*.csv;*.list;*.jpg;*.jpeg;*.png;*.webp;*.gif"),
@@ -382,6 +419,7 @@ class _v31affc09:
             self.drop_start_btn.config(state=tk.NORMAL)
 
     def _choose_drop_folder(self) -> None:
+        """选择要导入的图片文件夹（文件夹名/子文件夹名即物种名或类群 ID）。"""
         path = filedialog.askdirectory(title="选择图片文件夹（按文件夹名解析种类）")
         if path:
             self._drop_paths = [Path(path)]
@@ -389,6 +427,7 @@ class _v31affc09:
             self.drop_start_btn.config(state=tk.NORMAL)
 
     def _drop_common_args(self) -> list[str]:
+        """组装拖入接口的通用命令行参数。"""
         extra: list[str] = ["--max-per-taxon", str(self.drop_max_var.get()),
                             "--workers", str(self.drop_workers_var.get()),
                             "--photo-size", self.drop_size_var.get(),
@@ -399,12 +438,13 @@ class _v31affc09:
         return extra
 
     def _spawn_drop_proc(self, extra: list[str]) -> None:
+        """启动 drop_crawl_interface 子进程（--file 单文件或 --watch 监视模式）。"""
         if self.drop_proc and self.drop_proc.poll() is None:
             messagebox.showinfo("提示", "拖入处理进程正在运行中，请先停止。")
             return
-        cmd = _v673c7f29(
+        cmd = _script_run_args(
             "drop_crawl_interface.py",
-            [*extra, *self._drop_common_args(), "--inbox", str(_v2c5114ec / "drop_inbox")])
+            [*extra, *self._drop_common_args(), "--inbox", str(DATA_DIR / "drop_inbox")])
         # 复位用户终止标志：每轮启动重新判定
         self._drop_stop_requested = False
         # 子进程用 UTF-8 输出，避免中文报告乱码
@@ -413,7 +453,7 @@ class _v31affc09:
         env["PYTHONUNBUFFERED"] = "1"
         self.drop_proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding=_v9feff973, errors="replace", env=env, cwd=str(_vfca465fc))
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
         self._append_drop_report(f"\n===== 启动拖入处理：{' '.join(cmd[1:])} =====\n")
         # 复位进度条与标签：每轮启动重新从 0 开始
         self.drop_progress_var.set(0.0)
@@ -423,6 +463,7 @@ class _v31affc09:
         threading.Thread(target=self._read_drop_output, daemon=True).start()
 
     def _start_drop_file(self) -> None:
+        """处理选中的清单/图片/文件夹。"""
         paths = getattr(self, "_drop_paths", [])
         if not paths:
             messagebox.showinfo("提示", "请先选择文件或文件夹。")
@@ -430,6 +471,7 @@ class _v31affc09:
         self._spawn_drop_proc(["--file", *[str(p) for p in paths]])
 
     def _toggle_drop_watch(self) -> None:
+        """启动/停止常驻监视（按钮文字随状态切换）。"""
         if self.drop_proc and self.drop_proc.poll() is None:
             self._stop_drop()
             return
@@ -438,6 +480,7 @@ class _v31affc09:
         self.drop_watch_btn.config(text="停止监视")
 
     def _stop_drop(self) -> None:
+        """终止拖入处理子进程。"""
         if self.drop_proc and self.drop_proc.poll() is None:
             # 记录用户主动终止标志：结束时按此分支提示，不误报为异常失败
             self._drop_stop_requested = True
@@ -445,11 +488,13 @@ class _v31affc09:
             self._append_drop_report("[用户] 已请求终止拖入处理进程。\n")
 
     def _open_drop_inbox(self) -> None:
-        inbox = _v2c5114ec / "drop_inbox"
+        """打开投放目录（不存在则先创建）。"""
+        inbox = DATA_DIR / "drop_inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         os.startfile(str(inbox))  # noqa: S606
 
     def _read_drop_output(self) -> None:
+        """后台线程：读取拖入处理子进程输出，结束后投递带返回码的结束标记。"""
         proc = self.drop_proc
         assert proc is not None and proc.stdout is not None
         for line in proc.stdout:
@@ -457,11 +502,12 @@ class _v31affc09:
         self.drop_queue.put(f"\n[拖入处理进程已结束 rc={proc.wait()}]\n")
 
     def _poll_drop_queue(self) -> None:
+        """主循环定时器：刷新处理报告并在进程结束后复位按钮状态。"""
         try:
             while True:
                 line = self.drop_queue.get_nowait()
                 # 进度行只驱动进度条，不落入报告文本框（避免逐种类/逐照片刷屏）
-                m = _v6dbf9c60.match(line)
+                m = _DROP_PROGRESS_KIND_RE.match(line)
                 if m:
                     cur, total = int(m.group(1)), int(m.group(2))
                     # 照片级行尚未出现时（爬取模式或导入初期）由种类级驱动进度条
@@ -472,7 +518,7 @@ class _v31affc09:
                         text=f"种类 {cur}/{total}「{m.group(3)}」",
                         foreground="#1d7a34")
                     continue
-                m = _v755deaf1.match(line)
+                m = _DROP_PROGRESS_PHOTO_RE.match(line)
                 if m:
                     # 照片级行出现后接管进度条（细粒度），标签保留最近种类名
                     self._drop_progress_photo_mode = True
@@ -516,6 +562,7 @@ class _v31affc09:
         self.root.after(200, self._poll_drop_queue)
 
     def _append_drop_report(self, text: str) -> None:
+        """向处理报告框追加文本并滚动到底部。"""
         self.drop_report.config(state=tk.NORMAL)
         self.drop_report.insert(tk.END, text)
         self.drop_report.see(tk.END)
@@ -523,6 +570,12 @@ class _v31affc09:
 
     # ---------- 标签页 3：训练数据集 ----------
     def _build_dataset_tab(self) -> None:
+        """构建训练数据集标签页（库内类群勾选 → 一键生成已划分数据集）。
+
+        数据流：拖入/爬取入库的照片在左侧按类群聚合展示，勾选后经
+        dataset_exporter.py 子进程导出为 train/val/test 标准数据集，
+        登记进 data/train_datasets/registry.json，训练页下拉即可选用。
+        """
         page = ttk.Frame(self.notebook)
         self.notebook.add(page, text=" 训练数据集 ")
 
@@ -659,6 +712,11 @@ class _v31affc09:
         self.root.after(200, self._poll_ds_queue)
 
     def _load_dataset_taxa(self) -> None:
+        """从主库按类群聚合本地照片数，刷新左侧勾选列表（保留勾选状态）。
+
+        只列有本地照片文件的类群（爬取与拖入的数据统一展示），
+        支持按中文名/学名/类群 ID 关键词过滤。
+        """
         keyword = ""
         if hasattr(self, "ds_taxon_search_var"):
             keyword = self.ds_taxon_search_var.get().strip()
@@ -706,6 +764,7 @@ class _v31affc09:
             f"[类群列表] 共 {len(rows)} 个类群有本地照片，当前勾选 {checked} 个。\n")
 
     def _on_taxon_click(self, event) -> None:
+        """点击勾选列时切换该类群的勾选状态。"""
         if self.ds_taxon_tree.identify("region", event.x, event.y) != "cell":
             return
         if self.ds_taxon_tree.identify_column(event.x) != "#1":
@@ -724,6 +783,7 @@ class _v31affc09:
         self.ds_taxon_tree.item(iid, values=values)
 
     def _set_all_taxa_checked(self, checked: bool) -> None:
+        """全选/全不选当前列表中的全部类群。"""
         for iid in self.ds_taxon_tree.get_children():
             if checked:
                 self.ds_checked.add(iid)
@@ -734,6 +794,7 @@ class _v31affc09:
             self.ds_taxon_tree.item(iid, values=values)
 
     def _start_dataset_export(self) -> None:
+        """校验参数后启动 dataset_exporter 子进程导出勾选类群。"""
         if self.ds_export_proc and self.ds_export_proc.poll() is None:
             messagebox.showinfo("提示", "数据集生成进程正在运行中，请稍候。")
             return
@@ -769,7 +830,7 @@ class _v31affc09:
             "min_per_class": self.ds_min_var.get(),
             "max_per_class": self.ds_max_var.get(),
             "label_scheme": scheme, "seed": self.ds_seed_var.get()}
-        cmd = _v673c7f29("dataset_exporter.py", [
+        cmd = _script_run_args("dataset_exporter.py", [
             "--out", str(out_dir),
             "--taxon-ids", ",".join(str(t) for t in taxon_ids),
             "--splits", splits,
@@ -786,10 +847,11 @@ class _v31affc09:
             f"\n===== 开始生成数据集「{name}」：勾选 {len(taxon_ids)} 个类群 =====\n")
         self.ds_export_proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding=_v9feff973, errors="replace", env=env, cwd=str(_vfca465fc))
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
         threading.Thread(target=self._read_ds_output, daemon=True).start()
 
     def _read_ds_output(self) -> None:
+        """后台线程：读取数据集生成子进程输出，结束后投递完成标记（带返回码）。"""
         proc = self.ds_export_proc
         assert proc is not None and proc.stdout is not None
         for line in proc.stdout:
@@ -797,6 +859,7 @@ class _v31affc09:
         self.ds_export_queue.put(f"__数据集生成结束__ rc={proc.wait()}\n")
 
     def _poll_ds_queue(self) -> None:
+        """主循环定时器：刷新生成日志并处理完成/失败标记。"""
         try:
             while True:
                 line = self.ds_export_queue.get_nowait()
@@ -813,6 +876,7 @@ class _v31affc09:
         self.root.after(200, self._poll_ds_queue)
 
     def _on_ds_export_done(self, rc: int) -> None:
+        """生成子进程结束：成功登记注册表并刷新联动，失败清理半成品目录。"""
         self.ds_generate_btn.config(state=tk.NORMAL)
         out_dir = self._ds_export_out_dir
         name = dataset_registry.clean_name(self.ds_name_var.get())
@@ -844,6 +908,7 @@ class _v31affc09:
                 f"请检查上方日志中的错误提示。\n")
 
     def _refresh_dataset_list(self) -> None:
+        """刷新已生成数据集列表与训练页「已生成数据集」下拉。"""
         items = dataset_registry.list_available()
         names = [d["name"] for d in items]
         self.ds_list_tree.delete(*self.ds_list_tree.get_children())
@@ -860,6 +925,7 @@ class _v31affc09:
                 self.train_dataset_var.set("")
 
     def _selected_dataset(self) -> dict | None:
+        """返回数据集列表当前选中行的登记条目（未选中时提示并返回 None）。"""
         sel = self.ds_list_tree.selection()
         if not sel:
             messagebox.showinfo("提示", "请先在列表中选择一个数据集。")
@@ -871,6 +937,7 @@ class _v31affc09:
         return None
 
     def _use_dataset_for_training(self) -> None:
+        """把选中的数据集填入训练页数据目录并切换到训练页。"""
         d = self._selected_dataset()
         if d is None:
             return
@@ -882,6 +949,7 @@ class _v31affc09:
             f"划分方式请选「使用目录既有划分（默认）」。\n")
 
     def _open_dataset_dir(self) -> None:
+        """打开选中数据集的导出目录。"""
         d = self._selected_dataset()
         if d is None:
             return
@@ -893,6 +961,7 @@ class _v31affc09:
                 "提示", "数据集目录不存在（可能已被手动移动或删除）。")
 
     def _delete_dataset(self) -> None:
+        """删除选中的数据集（登记条目+导出目录；训练运行中禁止）。"""
         # 训练进程运行中禁止删除，避免训练中途数据目录被移除
         if self.train_proc and self.train_proc.poll() is None:
             messagebox.showwarning(
@@ -910,6 +979,7 @@ class _v31affc09:
         self._append_ds_log(f"[删除] 数据集「{d['name']}」已删除。\n")
 
     def _append_ds_log(self, text: str) -> None:
+        """向生成日志框追加文本并滚动到底部。"""
         self.ds_log.config(state=tk.NORMAL)
         self.ds_log.insert(tk.END, text)
         self.ds_log.see(tk.END)
@@ -917,6 +987,11 @@ class _v31affc09:
 
     # ---------- 标签页 4：模型训练 ----------
     def _build_train_tab(self) -> None:
+        """构建模型训练标签页（对接 model_trainer.py，实时显示终端进程）。
+
+        训练页内容较多（环境/模式/参数/划分/指标表/日志），外层套一层纵向滚动
+        容器：窗口不够高时可拖动滚动条查看全部区域，避免底部区域被裁掉。
+        """
         outer = ttk.Frame(self.notebook)
         self.notebook.add(outer, text=" 模型训练 ")
         # 记录训练页容器引用，供「训练数据集」页签「用于训练」按钮切换页签
@@ -931,15 +1006,18 @@ class _v31affc09:
         window_id = canvas.create_window((0, 0), window=page, anchor="nw")
 
         def _sync_scrollregion(_event=None) -> None:
+            """内容尺寸变化时刷新滚动范围。"""
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         def _stretch_width(event) -> None:
+            """画布宽度变化时让内容框跟随等宽，避免横向留白。"""
             canvas.itemconfigure(window_id, width=event.width)
 
         page.bind("<Configure>", _sync_scrollregion)
         canvas.bind("<Configure>", _stretch_width)
 
         def _on_wheel(event) -> None:
+            """鼠标滚轮滚动训练页（仅在本页范围内生效）。"""
             canvas.yview_scroll(int(-event.delta / 120), "units")
 
         outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
@@ -963,7 +1041,7 @@ class _v31affc09:
 
         row_data = ttk.Frame(env); row_data.pack(fill=tk.X, pady=2)
         ttk.Label(row_data, text="数据目录:").pack(side=tk.LEFT)
-        self.train_data_var = tk.StringVar(value=str(_vc88e724b))
+        self.train_data_var = tk.StringVar(value=str(DEFAULT_TRAIN_DATA))
         ttk.Entry(row_data, textvariable=self.train_data_var, width=52).pack(
             side=tk.LEFT, padx=4)
         ttk.Button(row_data, text="浏览…",
@@ -1034,22 +1112,21 @@ class _v31affc09:
         ttk.Label(row_base, text="（用于训练产物命名：基名_月日_版本）",
                   foreground="#8a95a1").pack(side=tk.LEFT)
 
-        # 模式说明区：只读文本，随单选切换即时刷新（含推荐依据共 9 行）
+        # 模式说明区：只读文本，随单选切换即时刷新
         self.train_mode_desc = tk.Text(
-            mode, height=9, wrap="word", relief="flat", bd=0,
+            mode, height=6, wrap="word", relief="flat", bd=0,
             bg="#f4f6f9", font=("Microsoft YaHei UI", 9), state=tk.DISABLED)
         self.train_mode_desc.pack(fill=tk.X, pady=(4, 0))
         self.train_mode_desc.tag_configure(
             "mode_hl", foreground="#b04818",
             font=("Microsoft YaHei UI", 9, "bold"))
 
-        # 训练参数：轮数/优化器/耐心值/学习率各模式均可自定义（自动填入推荐值）
+        # 训练参数：自定义模式专属参数 + 通用线程数
         params = ttk.LabelFrame(
-            page, text=" 训练参数（轮数/优化器/耐心值/学习率各模式可改；批大小/混合精度仅自定义模式生效） ",
-            padding=6)
+            page, text=" 训练参数（轮数/优化器等仅自定义模式生效） ", padding=6)
         params.pack(fill=tk.X, padx=8, pady=6)
 
-        # 参数行：轮数/优化器/耐心值/学习率全模式可用；批大小/混合精度仅自定义模式启用
+        # 自定义参数行：选中「自定义模式」时启用，其余模式置灰禁用
         self.train_epochs_var = tk.IntVar(value=15)
         self.train_optimizer_var = tk.StringVar(value="adamw")
         self.train_patience_var = tk.IntVar(value=6)
@@ -1081,14 +1158,9 @@ class _v31affc09:
         self.cb_amp = ttk.Checkbutton(row_custom, text="混合精度(AMP)",
                                       variable=self.train_amp_var)
         self.cb_amp.pack(side=tk.LEFT, padx=(10, 0))
-        # 控件分组：通用组（全模式可用）与自定义组（仅自定义模式启用）
-        self._common_param_widgets = [sb_epochs, cb_optimizer,
-                                       sb_patience, en_lr]
-        self._custom_param_widgets = [sb_batch, self.cb_amp]
-        # 硬件/数据量探测缓存与最新推荐结果（供说明区展示推导理由）
-        self._train_hw_cache = None          # (has_gpu, gpu_mem_gb) 元组
-        self._dataset_count_cache = {}      # 目录路径 -> 图片总数
-        self._last_recommend = None         # 最近一次推荐参数（含理由）
+        # 记录自定义参数控件，便于随模式切换统一启用/禁用
+        self._custom_param_widgets = [sb_epochs, cb_optimizer,
+                                      sb_patience, sb_batch, en_lr, self.cb_amp]
 
         # 线程数（与模式无关，始终可用）
         # Windows 下多线程 DataLoader 易出问题，默认 0（主进程加载，最稳）
@@ -1197,12 +1269,16 @@ class _v31affc09:
         self.train_log.pack(fill=tk.X, padx=8, pady=(2, 10))
 
     def _on_train_mode_changed(self) -> None:
-        # 先计算推荐值（说明区展示推导理由），再刷新说明与控件可用状态
-        self._fill_recommended_params()
+        """训练模式切换回调：刷新说明区文字并切换自定义参数可用状态。"""
         self._update_mode_description()
         self._apply_custom_param_state()
 
     def _refresh_base_model_options(self) -> None:
+        """重建基础模型下拉选项：内置预置在前，模型库已训练模型按时间倒序在后。
+
+        模型库读取失败时仅保留内置两项，不影响训练界面可用性。
+        调用时机：训练页初始化、训练正常结束（新模型入库后）。
+        """
         options = [("resnet50", "ResNet50（ImageNet 预训练）[内置预置]"),
                    ("vit_bird_525", "525类鸟类ViT（本地预置）[内置预置]")]
         try:
@@ -1238,6 +1314,7 @@ class _v31affc09:
         self._update_train_strategy_label()
 
     def _on_base_model_selected(self, _event=None) -> None:
+        """基础模型选中回调：记录 id，并把模型基名自动填为其基名（用户可再手改）。"""
         display = self.train_base_model_var.get()
         for model_id, disp in getattr(self, "_base_model_options", []):
             if disp == display:
@@ -1253,11 +1330,9 @@ class _v31affc09:
         if base_name:
             self.train_model_base_var.set(base_name)
         self._update_train_strategy_label()
-        # 架构变化影响推荐参数：重算推荐值并刷新说明
-        self._fill_recommended_params()
-        self._update_mode_description()
 
     def _update_train_strategy_label(self) -> None:
+        """按所选基础模型的架构刷新「训练策略」说明文字。"""
         label = getattr(self, "train_strategy_label", None)
         if label is None:
             return
@@ -1276,6 +1351,7 @@ class _v31affc09:
 
     # ---------- 中断续训 ----------
     def _load_last_interrupted(self) -> dict | None:
+        """读取模型库目录下的中断提示文件（断点目录缺失或无效时返回 None）。"""
         path = ml.MODEL_LIBRARY_DIR / "last_interrupted.json"
         if not path.is_file():
             return None
@@ -1292,6 +1368,7 @@ class _v31affc09:
         return data
 
     def _refresh_resume_state(self) -> None:
+        """刷新「从中断处续训」的可用状态与断点信息提示。"""
         check = getattr(self, "train_resume_check", None)
         label = getattr(self, "train_resume_label", None)
         if check is None or label is None:
@@ -1311,6 +1388,7 @@ class _v31affc09:
             label.config(text="暂无中断记录", foreground="#8a95a1")
 
     def _on_resume_toggled(self) -> None:
+        """续训勾选回调：展示断点信息并确认续训语义。"""
         if not self.train_resume_var.get():
             return
         info = self._load_last_interrupted()
@@ -1327,6 +1405,7 @@ class _v31affc09:
             f"「轮数」表示总目标轮数。")
 
     def _open_train_log(self) -> None:
+        """用系统默认程序打开当前训练的日志文件。"""
         path = getattr(self, "_train_log_path", None)
         if not path or not Path(path).is_file():
             messagebox.showinfo("提示", "暂无训练日志文件（先启动一次训练）。")
@@ -1338,11 +1417,13 @@ class _v31affc09:
 
     # ---------- 每轮验证指标表 ----------
     def _clear_metric_table(self) -> None:
+        """清空每轮验证指标表。"""
         tree = getattr(self, "train_metric_tree", None)
         if tree is not None:
             tree.delete(*tree.get_children())
 
     def _append_metric_row(self, payload: dict) -> None:
+        """把一条 [METRIC] 结构化指标追加到每轮验证指标表。"""
         tree = getattr(self, "train_metric_tree", None)
         if tree is None:
             return
@@ -1362,6 +1443,7 @@ class _v31affc09:
             tree.see(children[-1])
 
     def _replay_metric_history(self, out_dir: Path) -> None:
+        """续训时回放断点目录中的 training_history.json 到指标表。"""
         hist_path = out_dir / "training_history.json"
         if not hist_path.is_file():
             return
@@ -1383,23 +1465,22 @@ class _v31affc09:
             })
 
     def _update_mode_description(self) -> None:
+        """把当前模式的预设信息（轮数/优化器/耐心值/批大小/学习率/说明）写入说明区。"""
         key = self.train_mode_var.get()
         preset = ml.TRAINING_MODE_PRESETS.get(key, {})
-        # 推荐值：轮数/优化器/耐心值/学习率按「模式×架构×数据量×硬件」推导
-        rec = getattr(self, "_last_recommend", None) or {}
-        epochs_text = str(rec.get("epochs", "—"))
-        optimizer_text = str(rec.get("optimizer", "—"))
-        patience_text = str(rec.get("patience", "—"))
-        lr_value = rec.get("lr")
-        lr_text = f"{lr_value:g}" if isinstance(lr_value, (int, float)) else "—"
-        # 批大小：自定义模式由用户填写；low 预设固定 8；adaptive/high 按设备自适应推导
-        batch_value = preset.get("batch")
         if key == "custom":
+            # 自定义模式：预设不提供固定值，提示在下方参数区填写
+            epochs_text = "自定义（在下方填写）"
+            patience_text = "自定义（在下方填写）"
             batch_text = "自定义（在下方填写）"
-        elif batch_value is None:
-            batch_text = "按设备自适应"
         else:
-            batch_text = str(batch_value)
+            epochs_text = str(preset.get("epochs", "—"))
+            patience_text = str(preset.get("patience", "—"))
+            batch_value = preset.get("batch")
+            # batch 为 None 表示按设备自适应（由训练脚本推导）
+            batch_text = "按设备自适应" if batch_value is None else str(batch_value)
+        lr_value = preset.get("lr")
+        lr_text = f"{lr_value:g}" if isinstance(lr_value, (int, float)) else "—"
         # 混合精度显示：True=固定开启；auto=有 GPU 时自动开启；False=关闭
         amp_value = preset.get("amp")
         if amp_value is True:
@@ -1410,15 +1491,14 @@ class _v31affc09:
             amp_text = "关闭（自定义模式可勾选）" if key == "custom" else "关闭"
         workers_text = preset.get("workers_hint", "—")
         lines = [
-            f"轮数：{epochs_text}（推荐值，可在下方修改）",
-            f"优化器：{optimizer_text}（推荐值，可在下方修改）",
-            f"耐心值：{patience_text}（推荐值，可在下方修改）",
-            f"学习率：{lr_text}（推荐值，可在下方修改）",
+            f"轮数：{epochs_text}",
+            f"优化器：{preset.get('optimizer', '—')}",
+            f"耐心值：{patience_text}",
             f"批大小：{batch_text}",
+            f"学习率：{lr_text}",
             f"混合精度：{amp_text}",
             f"数据加载线程：{workers_text}",
             f"说明：{preset.get('description', '')}",
-            "推荐依据：" + "；".join(rec.get("reasons", ["尚未计算"])),
         ]
         box = self.train_mode_desc
         box.config(state=tk.NORMAL)
@@ -1433,102 +1513,16 @@ class _v31affc09:
         box.config(state=tk.DISABLED)
 
     def _apply_custom_param_state(self) -> None:
-        # 轮数/优化器/耐心值/学习率：所有模式均可编辑（模式不预设固定值）
-        for widget in getattr(self, "_common_param_widgets", []):
-            try:
-                widget.config(state=tk.NORMAL)
-            except tk.TclError:
-                pass  # 控件已销毁时忽略
-        # 批大小/混合精度：仅自定义模式启用（其余模式按设备推导/预设固定）
+        """自定义模式时启用参数输入，其余模式置灰禁用。"""
         state = tk.NORMAL if self.train_mode_var.get() == "custom" else tk.DISABLED
-        for widget in getattr(self, "_custom_param_widgets", []):
+        for widget in self._custom_param_widgets:
             try:
                 widget.config(state=state)
             except tk.TclError:
                 pass  # 控件已销毁时忽略
 
-    # ---------- 推荐参数：按「模式×架构×数据量×硬件」推导并自动填表 ----------
-
-    def _detect_train_hardware(self) -> tuple[bool, float]:
-        """用训练解释器查询 CUDA 可用性与 GPU 显存（结果缓存，避免重复探测）。"""
-        if self._train_hw_cache is not None:
-            return self._train_hw_cache
-        has_gpu, gpu_mem_gb = False, 0.0
-        py = self._train_python()
-        if py:
-            probe = (
-                "import torch\n"
-                "avail = torch.cuda.is_available()\n"
-                "print(1 if avail else 0)\n"
-                "print(torch.cuda.get_device_properties(0).total_memory / 2**30"
-                " if avail else 0)\n"
-            )
-            try:
-                import subprocess as _sp
-                result = _sp.run([py, "-c", probe], capture_output=True,
-                                 timeout=60, creationflags=0x08000000)
-                lines = result.stdout.decode("utf-8", "replace").split()
-                if lines and lines[0] == "1":
-                    has_gpu = True
-                    gpu_mem_gb = float(lines[1])
-            except Exception:
-                pass  # 探测失败按无 GPU 处理，训练脚本内部还会做设备推导
-        self._train_hw_cache = (has_gpu, gpu_mem_gb)
-        return self._train_hw_cache
-
-    def _count_dataset_images(self, data_dir: str) -> int | None:
-        """统计数据目录内的图片总数（按目录缓存；失败返回 None 不参与修正）。"""
-        if not data_dir:
-            return None
-        path = str(Path(data_dir))
-        if path in self._dataset_count_cache:
-            return self._dataset_count_cache[path]
-        count = 0
-        try:
-            exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-            for p in Path(data_dir).rglob("*"):
-                if p.suffix.lower() in exts:
-                    count += 1
-                    if count > 500000:   # 超大目录封顶，避免统计耗时过长
-                        break
-        except OSError:
-            return None
-        self._dataset_count_cache[path] = count
-        return count
-
-    def _current_train_architecture(self) -> str:
-        """当前所选基础模型对应的架构 key（与训练策略联动）。"""
-        model_id = getattr(self, "_base_model_id", "resnet50")
-        if model_id == "resnet50":
-            return "resnet50"
-        if model_id == "vit_bird_525":
-            return "vit_bird_525"
-        try:
-            record = ml.get_model(model_id)
-        except Exception:
-            record = None
-        return str((record or {}).get("architecture") or "resnet50")
-
-    def _fill_recommended_params(self) -> None:
-        """按「模式×架构×数据量×硬件」计算推荐值并自动填入参数输入框。
-
-        模式/基础模型/数据目录变化时调用；用户仍可在填入后手动修改。
-        """
-        mode = self.train_mode_var.get()
-        arch = self._current_train_architecture()
-        has_gpu, gpu_mem_gb = self._detect_train_hardware()
-        dataset_count = self._count_dataset_images(self.train_data_var.get().strip())
-        rec = ml.recommend_train_params(mode, arch, dataset_count, has_gpu, gpu_mem_gb)
-        self._last_recommend = rec
-        try:
-            self.train_epochs_var.set(rec["epochs"])
-            self.train_optimizer_var.set(rec["optimizer"])
-            self.train_patience_var.set(rec["patience"])
-            self.train_lr_var.set(f"{rec['lr']:g}")
-        except tk.TclError:
-            pass  # 控件已销毁时忽略
-
     def _browse_train_python(self) -> None:
+        """选择训练用 Python 解释器。"""
         path = filedialog.askopenfilename(
             title="选择训练用 python.exe",
             filetypes=[("Python 解释器", "python.exe"), ("可执行文件", "*.exe"),
@@ -1537,11 +1531,13 @@ class _v31affc09:
             self.train_python_var.set(path)
 
     def _browse_train_data(self) -> None:
+        """选择训练数据根目录。"""
         path = filedialog.askdirectory(title="选择数据目录（含 train/val/test）")
         if path:
             self.train_data_var.set(path)
 
     def _on_train_dataset_selected(self, _event=None) -> None:
+        """下拉选中已生成数据集时，自动填入其导出路径。"""
         name = self.train_dataset_var.get()
         for d in dataset_registry.list_available():
             if d["name"] == name:
@@ -1549,6 +1545,11 @@ class _v31affc09:
                 break
 
     def _train_python(self) -> str:
+        """取训练解释器路径；默认不存在时回退到当前解释器。
+
+        打包 exe 形态下 sys.executable 是主程序自身（不能运行外部脚本），
+        若此时无可用的外部解释器则返回空串，由调用方给出中文提示。
+        """
         p = self.train_python_var.get().strip()
         if p and Path(p).exists():
             return p
@@ -1558,6 +1559,14 @@ class _v31affc09:
         return ""
 
     def _detect_torch_python(self) -> str:
+        """自动探测本机装有 torch 的 Python 解释器（冻结形态兜底）。
+
+        背景：安装版 exe 不含 torch，视觉分析与模型训练依赖外部解释器
+        以子进程运行；默认解释器路径是开发机路径，其他设备不存在，
+        故按常见安装位置（conda 环境 / 系统 Python / PATH）逐一探测，
+        以 importlib.find_spec 快速验证是否含 torch（不实际加载）。
+        找到返回完整路径并缓存；找不到返回空串（同样缓存，避免重复探测）。
+        """
         if self._torch_python_probed:
             return self._torch_python
         self._torch_python_probed = True   # 无论成败只探测一次
@@ -1613,6 +1622,7 @@ class _v31affc09:
         return self._torch_python
 
     def _check_train_deps(self) -> None:
+        """检测训练依赖（torch/torchvision/PIL）是否就绪，结果显示在标签上。"""
         py = self._train_python()
         if not py:
             # 冻结形态下无可用外部解释器：明确提示而非执行报错
@@ -1647,6 +1657,7 @@ class _v31affc09:
             self.train_dep_label.config(text=f"检测失败: {exc}", foreground="#b03030")
 
     def _scan_train_data(self) -> None:
+        """扫描数据目录并打印类别/张数统计到训练日志。"""
         data_dir = self.train_data_var.get().strip()
         if not data_dir or not Path(data_dir).exists():
             messagebox.showinfo("提示", "请先选择有效的数据目录。")
@@ -1657,11 +1668,17 @@ class _v31affc09:
                 "错误", "未找到可用的训练用 Python 解释器，"
                 "请在「训练解释器」中选择安装了 torch 的 python.exe。")
             return
-        cmd = [py, str(_vfca465fc / "model_trainer.py"),
+        cmd = [py, str(BASE_DIR / "model_trainer.py"),
                "--data-dir", data_dir, "--list-only"]
         self._run_train_subprocess(cmd, label="扫描数据")
 
     def _start_train(self) -> None:
+        """启动模型训练子进程（model_trainer.py），实时捕获终端输出。
+
+        启动参数按训练模式组装：--mode <模式> --model-name <基名>；
+        自定义模式额外追加轮数/优化器/耐心值/批大小/学习率（先校验合法性）。
+        训练产物由训练脚本统一注册进模型库，因此不再传递 --out-dir。
+        """
         if self.train_proc and self.train_proc.poll() is None:
             messagebox.showinfo("提示", "训练进程正在运行中。")
             return
@@ -1718,7 +1735,7 @@ class _v31affc09:
                 "错误", "未找到可用的训练用 Python 解释器，"
                 "请在「训练解释器」中选择安装了 torch 的 python.exe。")
             return
-        cmd = [py, str(_vfca465fc / "model_trainer.py"),
+        cmd = [py, str(BASE_DIR / "model_trainer.py"),
                "--data-dir", data_dir,
                "--base-model", getattr(self, "_base_model_id", "resnet50"),
                "--workers", str(self.train_workers_var.get())]
@@ -1737,48 +1754,45 @@ class _v31affc09:
             cmd += ["--auto-split", "--split-ratio", ratio_arg]
         if metric_key:
             cmd += ["--select-metric", metric_key]
-        # 所有模式：轮数/优化器/耐心值/学习率均由界面传入（模式不预设固定值）
-        # 续训：只传轮数（总目标轮数），其余参数从断点快照恢复
-        try:
-            epochs = int(self.train_epochs_var.get())
-            patience = int(self.train_patience_var.get())
-            lr = float(self.train_lr_var.get())
-        except (ValueError, tk.TclError):
-            messagebox.showerror("错误", "训练参数必须是有效数字（学习率如 1e-3）。")
-            return
-        if epochs < 1:
-            messagebox.showerror("错误", "轮数必须 ≥ 1。")
-            return
-        if patience < 0:
-            messagebox.showerror("错误", "耐心值必须 ≥ 0。")
-            return
-        if lr <= 0:
-            messagebox.showerror("错误", "学习率必须大于 0。")
-            return
-        # 批大小仅自定义模式由界面传入；其余模式按预设/设备自适应推导
-        batch_arg = None
-        if mode == "custom" and not resume_dir:
+        if mode == "custom" or resume_dir:
+            # 自定义模式：校验并传入轮数/优化器/耐心值/批大小/学习率
+            # 续训：只传轮数（总目标轮数），其余参数从断点快照恢复
             try:
-                batch_arg = int(self.train_batch_var.get())
+                epochs = int(self.train_epochs_var.get())
+                patience = int(self.train_patience_var.get())
+                batch = int(self.train_batch_var.get())
+                lr = float(self.train_lr_var.get())
             except (ValueError, tk.TclError):
-                messagebox.showerror("错误", "批大小必须是有效数字。")
+                messagebox.showerror("错误", "自定义参数必须是有效数字（学习率如 1e-3）。")
                 return
-            if batch_arg < 1:
+            if epochs < 1:
+                messagebox.showerror("错误", "轮数必须 ≥ 1。")
+                return
+            if patience < 0:
+                messagebox.showerror("错误", "耐心值必须 ≥ 0。")
+                return
+            if batch < 1:
                 messagebox.showerror("错误", "批大小必须 ≥ 1。")
                 return
-        cmd += ["--epochs", str(epochs)]
-        if not resume_dir:
-            cmd += ["--optimizer", self.train_optimizer_var.get(),
-                    "--patience", str(patience),
-                    "--lr", str(lr)]
-            if batch_arg is not None:
-                cmd += ["--batch-size", str(batch_arg)]
+            if lr <= 0:
+                messagebox.showerror("错误", "学习率必须大于 0。")
+                return
+            cmd += ["--epochs", str(epochs)]
+            if not resume_dir:
+                cmd += ["--optimizer", self.train_optimizer_var.get(),
+                        "--patience", str(patience),
+                        "--batch-size", str(batch),
+                        "--lr", str(lr)]
         # 自定义模式：勾选混合精度时显式传 --amp（其余模式按预设固定，不由 GUI 传参）
         if mode == "custom" and self.train_amp_var.get():
             cmd += ["--amp"]
         self._run_train_subprocess(cmd, label="续训" if resume_dir else "开始训练")
 
     def _run_train_subprocess(self, cmd: list[str], label: str) -> None:
+        """启动训练相关子进程并接管道，后台线程把输出放入队列。
+
+        加锁防止扫描/训练按钮被连点导致多个训练子进程并发启动。
+        """
         with self.train_lock:
             if self.train_proc and self.train_proc.poll() is None:
                 messagebox.showinfo("提示", "训练/扫描进程正在运行中，请先停止或等待结束。")
@@ -1789,7 +1803,7 @@ class _v31affc09:
             try:
                 self.train_proc = subprocess.Popen(  # noqa: S603
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                    encoding="utf-8", errors="replace", env=env, cwd=str(_vfca465fc))
+                    encoding="utf-8", errors="replace", env=env, cwd=str(BASE_DIR))
             except OSError as exc:
                 self._append_train_log(f"[错误] 无法启动训练进程: {exc}\n")
                 return
@@ -1804,6 +1818,7 @@ class _v31affc09:
             threading.Thread(target=self._read_train_output, daemon=True).start()
 
     def _read_train_output(self) -> None:
+        """后台线程：读取训练子进程输出放入队列，并带上返回码标记结束原因。"""
         proc = self.train_proc
         assert proc is not None and proc.stdout is not None
         for line in proc.stdout:
@@ -1813,6 +1828,10 @@ class _v31affc09:
         self.train_queue.put(f"\n[训练进程已结束 rc={rc}]\n")
 
     def _poll_train_queue(self) -> None:
+        """主循环定时器：刷新训练日志并在进程结束后复位按钮状态。
+
+        [METRIC] 前缀行是结构化指标输出（不写入文本日志区，转为核心指标表刷新）。
+        """
         try:
             while True:
                 line = self.train_queue.get_nowait()
@@ -1860,15 +1879,18 @@ class _v31affc09:
         self.root.after(200, self._poll_train_queue)
 
     def _stop_train(self) -> None:
+        """请求终止训练子进程。"""
         if self.train_proc and self.train_proc.poll() is None:
             self.train_proc.terminate()
             self._append_train_log("[用户] 已请求终止训练进程。\n")
 
     def _open_train_out(self) -> None:
+        """打开模型库根目录（训练产物统一入库，目录不存在则创建）。"""
         ml.MODEL_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
         os.startfile(str(ml.MODEL_LIBRARY_DIR))  # noqa: S606
 
     def _locate_latest_train_log(self) -> None:
+        """定位模型库中最新产物目录的 train_log.txt，供「打开日志文件」使用。"""
         try:
             candidates = list(ml.MODEL_LIBRARY_DIR.glob("*/train_log.txt"))
         except OSError:
@@ -1884,6 +1906,7 @@ class _v31affc09:
             self.train_log_btn.config(state=tk.NORMAL)
 
     def _append_train_log(self, text: str) -> None:
+        """向训练日志框追加文本并滚动到底部。"""
         self.train_log.config(state=tk.NORMAL)
         self.train_log.insert(tk.END, text)
         self.train_log.see(tk.END)
@@ -1891,6 +1914,7 @@ class _v31affc09:
 
     # ---------- 标签页 4：模型库 ----------
     def _build_models_tab(self) -> None:
+        """构建模型库标签页（列表/预览/激活/删除/导入，数据来自 model_library）。"""
         page = ttk.Frame(self.notebook)
         self.notebook.add(page, text=" 模型库 ")
 
@@ -1911,11 +1935,11 @@ class _v31affc09:
                   foreground="#8a95a1").pack(side=tk.RIGHT)
 
         # 主体：左侧列表 + 右侧预览
-        _v6f5fe057 = ttk.Frame(page)
-        _v6f5fe057.pack(fill=tk.BOTH, expand=True)
+        main = ttk.Frame(page)
+        main.pack(fill=tk.BOTH, expand=True)
 
         # 列表区：模型名称/类别数/架构/主指标/日期版本/来源/激活标记
-        left = ttk.Frame(_v6f5fe057)
+        left = ttk.Frame(main)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=(0, 6))
         columns = ("name", "classes", "architecture", "accuracy", "date_ver", "source", "active")
         headers = ("模型名称", "类别数", "架构", "主指标", "日期版本", "来源", "激活")
@@ -1937,7 +1961,7 @@ class _v31affc09:
         self.model_tree.bind("<<TreeviewSelected>>", self._on_model_selected)
 
         # 预览区：固定 248×248 容器 + 详情标签
-        right = ttk.LabelFrame(_v6f5fe057, text=" 预览 ", padding=8)
+        right = ttk.LabelFrame(main, text=" 预览 ", padding=8)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=6, pady=(0, 6))
         preview_box = tk.Frame(right, width=248, height=248,
                                bg="#eef1f5", relief="groove", bd=1)
@@ -1960,6 +1984,7 @@ class _v31affc09:
         self.refresh_models()
 
     def refresh_models(self) -> None:
+        """重新加载模型库列表（供工具栏刷新与训练完成联动调用）。"""
         tree = getattr(self, "model_tree", None)
         if tree is None:
             return
@@ -2015,6 +2040,7 @@ class _v31affc09:
         self._refresh_base_model_options()
 
     def _selected_model_name(self) -> str | None:
+        """取列表当前选中行的模型名称；未选中返回 None。"""
         tree = getattr(self, "model_tree", None)
         if tree is None:
             return None
@@ -2025,6 +2051,7 @@ class _v31affc09:
         return str(values[0]) if values else None
 
     def _clear_model_preview(self) -> None:
+        """清空预览图与详情（无 Pillow 或未选中模型时显示占位文字）。"""
         self._model_preview_ref = None  # 释放旧图引用，允许垃圾回收
         if not HAS_PIL:
             self.model_preview_label.config(
@@ -2034,6 +2061,7 @@ class _v31affc09:
         self.model_info_label.config(text="")
 
     def _on_model_selected(self, _event=None) -> None:
+        """列表选中事件：显示该模型的预览缩略图与详情。"""
         name = self._selected_model_name()
         if not name or name == "（模型库为空）":
             self._clear_model_preview()
@@ -2069,6 +2097,7 @@ class _v31affc09:
             self.model_info_label.config(text="")
 
     def _show_model_preview(self, record) -> None:
+        """按模型记录显示预览缩略图（缺失时生成默认占位图）。"""
         # 无 Pillow 时降级为文字提示（列表功能不受影响）
         if not HAS_PIL:
             self.model_preview_label.config(
@@ -2103,6 +2132,7 @@ class _v31affc09:
         self.model_preview_label.config(image=photo, text="")
 
     def _delete_selected_model(self) -> None:
+        """删除选中的模型（连同目录与注册表记录），删除后刷新列表。"""
         name = self._selected_model_name()
         if not name:
             messagebox.showinfo("提示", "请先在列表中选择要删除的模型。")
@@ -2130,6 +2160,7 @@ class _v31affc09:
             messagebox.showinfo("提示", "模型已删除；该模型为激活项，激活项已回退。")
 
     def _activate_selected_model(self) -> None:
+        """把选中的模型设为激活物种模型（写注册表后刷新列表）。"""
         name = self._selected_model_name()
         if not name:
             messagebox.showinfo("提示", "请先在列表中选择要激活的模型。")
@@ -2143,6 +2174,7 @@ class _v31affc09:
         messagebox.showinfo("提示", f"已将「{name}」设为激活物种模型。")
 
     def _open_selected_model_dir(self) -> None:
+        """用资源管理器打开选中模型的目录。"""
         name = self._selected_model_name()
         if not name:
             messagebox.showinfo("提示", "请先在列表中选择模型。")
@@ -2158,6 +2190,14 @@ class _v31affc09:
             messagebox.showerror("错误", "模型目录不存在或已被移动。")
 
     def _import_external_model(self) -> None:
+        """导入外部模型：选目录或单文件 → 探测架构/标签 → 确认后注册入库。
+
+        支持三类来源（任一即可）：
+          ① 训练产物目录（含 best_model.pt / last_model.pt）；
+          ② HuggingFace 模型目录（config.json + 权重文件）；
+          ③ 任意 .pt/.pth/.safetensors/.bin 权重文件（自动在模型库建目录归档）。
+        识别出的架构可在确认对话框中手动改选；不支持的架构仅入库管理。
+        """
         src = filedialog.askdirectory(
             title="选择外部模型目录（支持训练产物 / HuggingFace目录 / 含权重文件的目录）")
         if not src:
@@ -2242,6 +2282,14 @@ class _v31affc09:
                             f"架构：{info['display_name']}{extra}")
 
     def _stage_weight_file(self, picked: Path) -> Path | None:
+        """把单个权重文件归档到模型库新建目录，返回目录路径（失败返回 None）。
+
+        目录名按 基名_M月D日_NNN 规则取号；.safetensors 保持标准名
+        model.safetensors，其余统一复制为 best_model.pt，便于视觉系统按既有
+        约定（best_model.pt / model.safetensors）定位权重。
+        同时复制同目录下的标签/配置旁路文件（labels.json、label_mapping.txt、
+        config.json 等），以便自动生成类别映射。
+        """
         if not picked.is_file():
             messagebox.showerror("错误", f"权重文件不存在：{picked}")
             return None
@@ -2271,6 +2319,11 @@ class _v31affc09:
         return target_dir
 
     def _probe_architecture(self, src_dir: Path, weight_path) -> tuple:
+        """尽力探测模型架构，返回 (架构键, 说明文本)。
+
+        优先按权重键名精确识别（safetensors 无需 torch；.pt/.pth 需 torch）；
+        GUI 进程通常无 torch，此时退化为目录特征启发式。
+        """
         # 1. safetensors：safe_open 可直接读键名，不依赖 torch
         if weight_path is not None and str(weight_path).lower().endswith(".safetensors"):
             try:
@@ -2306,6 +2359,10 @@ class _v31affc09:
 
     def _ask_import_confirm(self, model_dir: Path, arch_key: str,
                             arch_note: str, class_count) -> tuple | None:
+        """导入确认对话框：架构下拉 + 类别数输入；取消或关闭返回 None。
+
+        返回 (架构键, 类别数)。
+        """
         keys = list(ml.ARCHITECTURE_REGISTRY.keys())
         display_to_key = {ml.ARCHITECTURE_REGISTRY[k]["display_name"]: k for k in keys}
         names = [ml.ARCHITECTURE_REGISTRY[k]["display_name"] for k in keys]
@@ -2335,6 +2392,7 @@ class _v31affc09:
                   justify=tk.LEFT).pack(anchor=tk.W)
 
         def _update_tip(*_args) -> None:
+            """按当前所选架构刷新提示文本。"""
             info = ml.ARCHITECTURE_REGISTRY.get(
                 display_to_key.get(arch_var.get(), "generic"), {})
             if info.get("inference_supported"):
@@ -2359,6 +2417,7 @@ class _v31affc09:
         result: dict = {"value": None}
 
         def _confirm() -> None:
+            """确定：校验类别数为正整数后关闭对话框。"""
             try:
                 value = int(count_var.get().strip())
             except ValueError:
@@ -2384,6 +2443,7 @@ class _v31affc09:
 
     # ================= Pillow 可选依赖 =================
     def _prompt_pillow_install(self) -> None:
+        """启动早期检测 Pillow：缺失时弹窗说明并提供一键安装（可跳过）。"""
         if HAS_PIL:
             return
         dialog = tk.Toplevel(self.root)
@@ -2404,12 +2464,14 @@ class _v31affc09:
         dialog.grab_set()
 
     def _install_pillow(self, dialog: tk.Toplevel) -> None:
+        """后台执行 pip 安装 Pillow（用当前解释器），完成后提示重启。"""
         # 禁用按钮防止重复点击
         self._set_pillow_dialog_buttons(dialog, tk.DISABLED)
         ttk.Label(dialog, text="正在后台安装 Pillow，请稍候…",
                   foreground="#1d7a34").pack()
 
         def _worker() -> None:
+            """后台线程：执行 pip 安装并把结果回投到主线程。"""
             try:
                 if getattr(sys, "frozen", False):
                     # 打包形态：exe 无法执行 pip 安装，给出明确指引而非执行报错
@@ -2433,6 +2495,7 @@ class _v31affc09:
 
     def _install_pillow_done(self, dialog: tk.Toplevel,
                              ok: bool, detail: str) -> None:
+        """Pillow 安装结束回调：成功提示重启，失败展示输出片段并允许重试。"""
         if ok:
             dialog.destroy()
             messagebox.showinfo(
@@ -2444,6 +2507,7 @@ class _v31affc09:
 
     @staticmethod
     def _set_pillow_dialog_buttons(dialog: tk.Toplevel, state: str) -> None:
+        """统一设置 Pillow 安装对话框内全部按钮的可用状态。"""
         for child in dialog.winfo_children():
             if isinstance(child, ttk.Frame):
                 for widget in child.winfo_children():
@@ -2452,6 +2516,11 @@ class _v31affc09:
 
     # ---------- 标签页 5：视觉分析（惰性构建） ----------
     def _build_vision_tab(self) -> None:
+        """注册「视觉分析」占位页签（内容在首次切到该页时才惰性构建）。
+
+        目的：避免启动时立刻导入视觉系统模块（其依赖 Pillow/深度学习库），
+        拖慢控制台启动速度；页签顺序位于「模型库」之后。
+        """
         self._vision_tab = ttk.Frame(self.notebook)
         self.notebook.add(self._vision_tab, text=" 视觉分析 ")
         self._vision_built = False      # 是否已完成惰性构建（仅构建一次）
@@ -2459,15 +2528,17 @@ class _v31affc09:
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
+        """页签切换回调：首次切到「视觉分析」页时触发惰性构建。"""
         if self._vision_built:
             return                      # 已构建过，直接返回（仅构建一次）
         if self.notebook.select() == str(self._vision_tab):
             self._build_vision_tab_content()
 
     def _build_vision_tab_content(self) -> None:
+        """构建「视觉分析」页内容：定位视觉系统目录并嵌入问答面板。"""
         self._vision_built = True       # 无论成败只构建一次，避免重复覆盖
         page = self._vision_tab
-        vision_dir = _vb38c154b()
+        vision_dir = _find_vision_system_dir()
         if vision_dir is None:
             # 未找到视觉系统目录：页内显示中文指引，不弹窗、不崩溃
             hint = (
@@ -2476,7 +2547,7 @@ class _v31affc09:
                 "  1. 设置文件 data/model_library/settings.json 中的 vision_system_dir 键"
                 "（当前未配置或指向的目录不含 gui_app.py）；\n"
                 "  2. 安装包内置目录 vision_system\\（本机未发现，安装包应为完整版）；\n"
-                f"  3. 项目根目录 {_vfca465fc.parent.parent} 下名称以"
+                f"  3. 项目根目录 {BASE_DIR.parent.parent} 下名称以"
                 "「鸟类视觉分析系统_」开头的文件夹。\n\n"
                 "处理办法（任选其一）：\n"
                 "  - 将鸟类视觉分析系统目录放到上述项目根目录下（目录名以"
@@ -2655,21 +2726,24 @@ class _v31affc09:
 
     # ================= 数据库辅助 =================
     def _ensure_databases(self) -> None:
-        if not _v3cd6b562.exists() or not _vab59131b.exists():
+        """数据库不存在时自动初始化（两层数据库一次性建齐）。"""
+        if not DEFAULT_MAIN_DB.exists() or not DEFAULT_RAW_DB.exists():
             try:
-                from inaturalist_db_initializer import _ve49f7201
-                _ve49f7201(str(_vab59131b), str(_v3cd6b562))
-                self._append_log(f"[初始化] 已自动创建数据库：{_v3cd6b562.parent}\n")
+                from inaturalist_db_initializer import init_all_databases
+                init_all_databases(str(DEFAULT_RAW_DB), str(DEFAULT_MAIN_DB))
+                self._append_log(f"[初始化] 已自动创建数据库：{DEFAULT_MAIN_DB.parent}\n")
             except Exception as exc:
                 messagebox.showerror("数据库初始化失败", str(exc))
         self._refresh_taxon_filters()
 
     def _connect_main(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(f"file:{_v3cd6b562.as_posix()}?mode=ro", uri=True)
+        """只读连接主数据库，保证界面操作不会破坏爬虫写入的数据。"""
+        conn = sqlite3.connect(f"file:{DEFAULT_MAIN_DB.as_posix()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _refresh_taxon_filters(self) -> None:
+        """从数据库读取类群列表，填充两个筛选下拉框。"""
         values = ["全部类群"]
         try:
             with self._connect_main() as conn:
@@ -2688,6 +2762,7 @@ class _v31affc09:
 
     @staticmethod
     def _parse_taxon_filter(text: str) -> int | None:
+        """从下拉框文本（如 '20967  戴胜科'）解析 taxon_id。"""
         if not text or text == "全部类群":
             return None
         try:
@@ -2696,18 +2771,19 @@ class _v31affc09:
             return None
 
     def _resolve_photo_path(self, local_path: str) -> Path | None:
+        """将数据库中的照片相对路径解析为实际文件（文件名索引缓存）。"""
         if not local_path:
             return None
         path = Path(local_path)
         if path.is_absolute() and path.is_file():
             return path
-        candidate = _v2c5114ec / path
+        candidate = DATA_DIR / path
         if candidate.is_file():
             return candidate
         # 相对类群文件夹的路径（photos\\obs_xxx.jpg）→ 按文件名全盘索引
         if self.photo_index is None:
             index: dict = {}
-            for item in _v2c5114ec.rglob("*"):
+            for item in DATA_DIR.rglob("*"):
                 if item.is_file() and item.suffix.lower() in (
                         ".jpg", ".jpeg", ".png", ".webp", ".gif"):
                     index.setdefault(item.name, item)
@@ -2716,6 +2792,7 @@ class _v31affc09:
 
     # ================= 下载控制 =================
     def _start_download(self) -> None:
+        """启动爬虫子进程（复用 batch_download_birds.py，去重逻辑在库管理器内）。"""
         if self.proc and self.proc.poll() is None:
             messagebox.showinfo("提示", "下载进程正在运行中。")
             return
@@ -2742,10 +2819,10 @@ class _v31affc09:
             "--photo-size", self.size_var.get(),
             "--quality-grade", self.grade_var.get(),
             "--workers", str(self.workers_var.get()),
-            "--out-dir", str(_v2c5114ec),
-            "--db-dir", str(_v1fbee72f),
+            "--out-dir", str(DATA_DIR),
+            "--db-dir", str(DB_DIR),
         ]
-        cmd = _v673c7f29("batch_download_birds.py", dl_args)
+        cmd = _script_run_args("batch_download_birds.py", dl_args)
 
         # 子进程用 UTF-8 输出，避免中文日志乱码
         env = os.environ.copy()
@@ -2753,7 +2830,7 @@ class _v31affc09:
         env["PYTHONUNBUFFERED"] = "1"
         self.proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding=_v9feff973, errors="replace", env=env, cwd=str(_vfca465fc))
+            encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
 
         self._append_log(f"\n===== 启动下载：{' '.join(cmd[1:])} =====\n")
         self.start_btn.config(state=tk.DISABLED)
@@ -2761,17 +2838,20 @@ class _v31affc09:
         threading.Thread(target=self._read_proc_output, daemon=True).start()
 
     def _read_proc_output(self) -> None:
+        """后台线程：读取子进程输出放入队列。"""
         assert self.proc is not None and self.proc.stdout is not None
         for line in self.proc.stdout:
             self.log_queue.put(line)
         self.log_queue.put("\n[下载进程已结束]\n")
 
     def _stop_download(self) -> None:
+        """终止爬虫子进程。"""
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             self._append_log("[用户] 已请求终止下载进程。\n")
 
     def _poll_log_queue(self) -> None:
+        """主循环定时器：把子进程日志刷到界面。"""
         try:
             while True:
                 line = self.log_queue.get_nowait()
@@ -2785,6 +2865,7 @@ class _v31affc09:
         self.root.after(200, self._poll_log_queue)
 
     def _append_log(self, text: str) -> None:
+        """向日志框追加文本并滚动到底部。"""
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, text)
         self.log_text.see(tk.END)
@@ -2792,14 +2873,17 @@ class _v31affc09:
 
     # ================= 数据浏览 =================
     def _search_observations(self) -> None:
+        """点击查询：重置到第一页。"""
         self._obs_offset = 0
         self._load_observations()
 
     def _page_observations(self, direction: int) -> None:
+        """翻页。"""
         self._obs_offset = max(0, self._obs_offset + direction * 50)
         self._load_observations()
 
     def _load_observations(self) -> None:
+        """按筛选条件加载观察记录到表格。"""
         q = self.obs_search_var.get().strip()
         taxon_id = self._parse_taxon_filter(self.obs_taxon_var.get())
         where, params = [], []
@@ -2838,6 +2922,7 @@ class _v31affc09:
         self.obs_page_label.config(text=f"第 {page_no}/{total_pages} 页，共 {total} 条")
 
     def _open_observation_uri(self, event) -> None:
+        """双击表格行：浏览器打开该观察记录。"""
         item = self.obs_tree.identify_row(event.y)
         if not item:
             return
@@ -2854,6 +2939,7 @@ class _v31affc09:
         self._load_photos()
 
     def _load_photos(self) -> None:
+        """加载照片缩略图网格（每页 24 张，按类群筛选）。"""
         taxon_id = self._parse_taxon_filter(self.ph_taxon_var.get())
         where, params = ["p.download_ok = 1"], []
         if taxon_id is not None:
@@ -2904,6 +2990,7 @@ class _v31affc09:
 
     def _create_thumb_widget(self, parent: ttk.Frame,
                              path: Path | None, row: sqlite3.Row) -> None:
+        """创建单个缩略图控件（有 Pillow 用图片，无则用按钮）。"""
         if path is None:
             ttk.Label(parent, text="文件缺失", foreground="#b06818",
                       padding=10).pack()
@@ -2925,6 +3012,7 @@ class _v31affc09:
 
     # ================= 统计与说明 =================
     def _load_stats(self) -> None:
+        """汇总数据库统计并展示设计说明。"""
         lines = ["=== 数据库统计 ===\n"]
         try:
             with self._connect_main() as conn:
@@ -2969,6 +3057,7 @@ class _v31affc09:
 
     # ================= 数据库健康检查 =================
     def _show_stats_text(self, text: str) -> None:
+        """线程安全地向统计页文本框写入内容（工作线程经 root.after 调度）。"""
         def _write() -> None:
             self.stats_text.config(state=tk.NORMAL)
             self.stats_text.delete("1.0", tk.END)
@@ -2977,6 +3066,13 @@ class _v31affc09:
         self.root.after(0, _write)
 
     def _run_health_check(self, apply_fix: bool = False) -> None:
+        """后台运行数据库健康检查（只读扫描；apply_fix=True 时执行安全修复）。
+
+        检查/修复逻辑由 db_health_check 模块提供：
+        - 检查项覆盖 .part 残留、未入库散图、孤儿记录、空批次、
+          重复指纹、路径可解析性、同名歧义、两库一致性；
+        - 修复前自动整库备份，修复动作与 GUI 界面的只读访问互不影响。
+        """
         # 修复属于写库操作，下载/拖入/训练运行中时禁止执行，避免并发写冲突
         if apply_fix:
             busy = ((self.proc and self.proc.poll() is None)
@@ -2998,15 +3094,15 @@ class _v31affc09:
 
         def worker() -> None:
             try:
-                from db_health_check import _v3ec64384, _vf141c0fd
-                rep = _v3ec64384(_v2c5114ec, _v3cd6b562, _vab59131b)
+                from db_health_check import run_checks, apply_fixes
+                rep = run_checks(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB)
                 out = [rep.render()]
                 if apply_fix and rep.issues:
                     out.append("\n=== 执行修复 ===")
-                    for line in _vf141c0fd(_v2c5114ec, _v3cd6b562, _vab59131b, rep):
+                    for line in apply_fixes(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB, rep):
                         out.append(f"  {line}")
                     out.append("\n=== 修复后复查 ===")
-                    rep2 = _v3ec64384(_v2c5114ec, _v3cd6b562, _vab59131b)
+                    rep2 = run_checks(DATA_DIR, DEFAULT_MAIN_DB, DEFAULT_RAW_DB)
                     out.append(rep2.render())
                 self._show_stats_text("\n".join(out))
                 # 类群列表可能因清理而变化，刷新筛选下拉框
@@ -3017,10 +3113,12 @@ class _v31affc09:
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_health_fixes(self) -> None:
+        """执行安全修复入口（先弹确认，再复用健康检查流程）。"""
         self._run_health_check(apply_fix=True)
 
     # ================= 关闭处理 =================
     def _on_close(self) -> None:
+        """关闭窗口时终止仍在运行的下载/拖入处理/训练子进程。"""
         if self.proc and self.proc.poll() is None:
             if not messagebox.askokcancel("退出", "下载仍在进行，确定终止并退出？"):
                 return
@@ -3052,15 +3150,17 @@ class _v31affc09:
 
 
 def run() -> int:
+    """启动桌面界面（供 main.py 调用）。"""
     root = tk.Tk()
-    _v31affc09(root)
+    BirdCrawlerGUI(root)
     root.mainloop()
     return 0
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """独立运行入口。"""
     return run()
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

@@ -6,6 +6,33 @@
 # ============================================================
 
 # 天咏 2026-09-27
+"""训练数据集导入工具：把「类别文件夹 + 划分目录」结构的图片数据集
+按种类指纹编码导入鸟类观察数据库。
+
+目录结构约定（常见训练数据集布局）：
+    数据集根目录/
+        train/<类别名>/*.jpg     训练集（类别名即物种名或标注名）
+        val/<类别名>/*.jpg       验证集
+        test/<类别名>/*.jpg      测试集
+        （其他目录与散文件一律忽略，例如部位检测数据集、labels.txt）
+
+导入规则：
+    1. 类别名形如「XX同属（英文名：Bolle's Pigeon）」时优先用括号内的
+       英文名查询 iNaturalist 官方接口；否则直接用类别名全称查询。
+    2. 同一类别在 train/val/test 中的图片合并为一条本地观察记录
+       （与拖入接口一致：同一「类群 + 来源名」只建一条观察），
+       观察备注中记录各划分的张数，划分信息不丢失。
+    3. 照片以内容 SHA-256 为指纹去重，复制到
+       data/taxon_<ID>_<名称>/photos/ 并登记负数本地照片 ID，
+       与主爬虫、拖入接口完全同一套存储规范。
+    4. 全程复用 inaturalist_db_manager 既有入库方法，不改动原库逻辑。
+    5. 支持中断续导：重复运行时已入库照片按指纹跳过，观察记录自动复用。
+
+用法示例：
+    python training_dataset_importer.py --root "D:/鸟类/鸟类训练数据集_压缩版"
+    python training_dataset_importer.py --root <数据集目录> --dry-run
+    python training_dataset_importer.py --root <数据集目录> --workers 12
+"""
 
 from __future__ import annotations
 
@@ -22,34 +49,42 @@ from pathlib import Path
 
 # 复用拖入接口的名称解析、层级登记、指纹与尺寸工具，保证行为一致
 from drop_crawl_interface import (
-    _vaa115322,
-    _v61f86667,
-    _v6129f938,
-    _v55bbbd86,
-    _v3808b166,
+    IMG_SUFFIXES,
+    _image_size,
+    _sha256_of_file,
+    fetch_taxon_tree_nodes,
+    resolve_taxon_info,
 )
-from download_inaturalist import _vca17059a
-from inaturalist_db_manager import _vc1f32a11
+from download_inaturalist import slugify
+from inaturalist_db_manager import INaturalistDatabaseManager
 
 # 匹配类别名中「（英文名：XXX）」括号内的英文名（全角冒号兼容半角）
-_vd80bf319 = re.compile(r"[（(]\s*英文名\s*[:：]\s*(.+?)\s*[）)]$")
+_EN_NAME_RE = re.compile(r"[（(]\s*英文名\s*[:：]\s*(.+?)\s*[）)]$")
 
 # 默认识别的划分目录名（小写比较），未匹配到的子目录一律忽略
-_vb0020a30 = {"train", "val", "test", "valid", "validation"}
+DEFAULT_SPLIT_NAMES = {"train", "val", "test", "valid", "validation"}
 
 
-def _v8fb63822() -> Path:
+def _base_dir() -> Path:
+    """返回脚本所在目录（导入输出根目录的定位基准，避免硬编码盘符）。"""
     return Path(__file__).resolve().parent
 
 
-def _vb732325c(class_name: str) -> str:
-    base = _vd80bf319.sub("", class_name.strip()).strip()
+def clean_class_base(class_name: str) -> str:
+    """清洗类别名得到基础中文名：去掉「（英文名：X）」括号与尾部「同属」。"""
+    base = _EN_NAME_RE.sub("", class_name.strip()).strip()
     if base.endswith("同属"):
         base = base[:-2].strip()
     return base
 
 
-def _v33cdb923(manifest_path: Path) -> dict[str, str]:
+def load_manifest(manifest_path: Path) -> dict[str, str]:
+    """读取物种清单文件，返回 {中文名: 拉丁名} 映射。
+
+    支持 xlsx（标准库解析，兼容内联字符串与共享字符串两种存储）与
+    csv（首列表头「中文名」、次列「拉丁名」）。中文名作为类别基名的
+    权威对照，拉丁名作为官方接口查询词，避免中文名多义导致误匹配。
+    """
     suffix = manifest_path.suffix.lower()
     result: dict[str, str] = {}
     if suffix == ".csv":
@@ -89,13 +124,20 @@ def _v33cdb923(manifest_path: Path) -> dict[str, str]:
     return result
 
 
-def _v12708093(root: Path) -> Path | None:
+def detect_manifest(root: Path) -> Path | None:
+    """在数据集根目录自动探测物种清单文件（唯一 xlsx/csv 时返回）。"""
     candidates = [p for p in sorted(root.iterdir())
                   if p.is_file() and p.suffix.lower() in {".xlsx", ".csv"}]
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _v56255404(root: Path, split_names: set[str]) -> Path:
+def _resolve_effective_root(root: Path, split_names: set[str]) -> Path:
+    """自动下钻定位真正的数据集根目录。
+
+    压缩包解压后常多包一层同名外壳文件夹；当当前层不存在划分目录、
+    且只有一个子目录时，自动进入该子目录继续查找（与拖入接口的
+    自动下钻理念一致），直到找到划分目录或无法继续下钻。
+    """
     current = root
     while True:
         has_split = any(
@@ -109,7 +151,12 @@ def _v56255404(root: Path, split_names: set[str]) -> Path:
         current = children[0]
 
 
-def _v30625e20(root: Path, split_names: set[str]) -> dict[str, dict[str, list[Path]]]:
+def collect_dataset(root: Path, split_names: set[str]) -> dict[str, dict[str, list[Path]]]:
+    """扫描数据集根目录，按类别聚合各划分的图片。
+
+    返回 {类别名: {划分名: [图片路径列表]}}；只识别 root 下名称匹配
+    划分名的子目录，类别文件夹内递归收集所有图片（兼容多层嵌套布局）。
+    """
     grouped: dict[str, dict[str, list[Path]]] = {}
     for split_dir in sorted(root.iterdir()):
         if not split_dir.is_dir() or split_dir.name.lower() not in split_names:
@@ -119,7 +166,7 @@ def _v30625e20(root: Path, split_names: set[str]) -> dict[str, dict[str, list[Pa
                 continue
             images = [
                 p for p in class_dir.rglob("*")
-                if p.is_file() and p.suffix.lower() in _vaa115322
+                if p.is_file() and p.suffix.lower() in IMG_SUFFIXES
             ]
             if images:
                 grouped.setdefault(class_dir.name, {})\
@@ -127,43 +174,55 @@ def _v30625e20(root: Path, split_names: set[str]) -> dict[str, dict[str, list[Pa
     return grouped
 
 
-def _v5f7a3991(class_name: str, manifest: dict[str, str] | None) -> str:
-    match = _vd80bf319.search(class_name.strip())
+def build_query(class_name: str, manifest: dict[str, str] | None) -> str:
+    """确定类别的官方接口查询词（三级优先）。
+
+    1. 类别名含「（英文名：X）」→ 用英文名 X（同属展开类的唯一标识）；
+    2. 清单中能按基名匹配到拉丁名 → 用拉丁名（权威，避免中文名多义、
+       修复「台湾噪鹛」等中文名在 iNat 与中文文献间指代不一致的问题）；
+    3. 兜底用类别名全称做中文名检索。
+    """
+    match = _EN_NAME_RE.search(class_name.strip())
     if match:
         return match.group(1).strip()
-    base = _vb732325c(class_name)
+    base = clean_class_base(class_name)
     if manifest and base in manifest and manifest[base].strip():
         return manifest[base].strip()
     return class_name.strip()
 
 
-def _vfc84a879(images: list[Path], workers: int) -> list[tuple[Path, str]]:
+def _hash_images(images: list[Path], workers: int) -> list[tuple[Path, str]]:
+    """多线程并行计算图片内容 SHA-256 指纹，保持与输入同序。"""
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        return list(pool.map(lambda p: (p, _v6129f938(p)), images))
+        return list(pool.map(lambda p: (p, _sha256_of_file(p)), images))
 
 
-def _v256da72c(class_name: str, split_map: dict[str, list[Path]],
+def import_one_class(class_name: str, split_map: dict[str, list[Path]],
                      manifest: dict[str, str],
-                     manager: _vc1f32a11, batch_id: int,
+                     manager: INaturalistDatabaseManager, batch_id: int,
                      out_dir: Path, seen_in_session: set[str],
                      report_lines: list[str],
                      workers: int) -> tuple[int, int, int]:
+    """导入一个类别在所有划分下的全部图片，汇入同一条本地观察。
+
+    返回 (新入库数, 重复跳过数, 失败数)；类别解析失败时跳过并记录。
+    """
     total = sum(len(v) for v in split_map.values())
-    query = _v5f7a3991(class_name, manifest)
-    taxon_id, sci, common, note = _v3808b166(query)
+    query = build_query(class_name, manifest)
+    taxon_id, sci, common, note = resolve_taxon_info(query)
     report_lines.append(f"{class_name} → {note}")
     if taxon_id is None:
         report_lines.append(f"    共 {total} 张全部跳过（类别解析失败）")
         return 0, 0, total
 
     # 与主爬虫、拖入接口一致的类群目录命名，保证多来源数据合并存储
-    folder_name = f"taxon_{taxon_id}_{_vca17059a(sci)}_{_vca17059a(common)}"
+    folder_name = f"taxon_{taxon_id}_{slugify(sci)}_{slugify(common)}"
     photo_dir = out_dir / folder_name / "photos"
     photo_dir.mkdir(parents=True, exist_ok=True)
 
     # 登记 iNaturalist 官方纲-目-科-种层级链（失败不中断导入）
     try:
-        tree_nodes = _v55bbbd86(taxon_id)
+        tree_nodes = fetch_taxon_tree_nodes(taxon_id)
         if tree_nodes:
             manager.upsert_taxon_tree_bulk(tree_nodes)
     except Exception:
@@ -182,7 +241,7 @@ def _v256da72c(class_name: str, split_map: dict[str, list[Path]],
     new = dup = fail = 0
     position = 0
     for split in sorted(split_map):
-        for img, sha in _vfc84a879(split_map[split], workers):
+        for img, sha in _hash_images(split_map[split], workers):
             position += 1
             seen_in_session.add(sha)
             if manager.has_photo_fingerprint(sha):
@@ -200,7 +259,7 @@ def _v256da72c(class_name: str, split_map: dict[str, list[Path]],
                 fail += 1
                 report_lines.append(f"    复制失败 {img.name}: {exc}")
                 continue
-            width, height = _v61f86667(dest)
+            width, height = _image_size(dest)
             status = manager.upsert_local_photo(
                 photo_id=base_photo_id, observation_id=obs_id, content_sha=sha,
                 original_name=img.name,
@@ -227,21 +286,22 @@ def _v256da72c(class_name: str, split_map: dict[str, list[Path]],
     return new, dup, fail
 
 
-def _v120146ff(args: argparse.Namespace) -> int:
+def run_import(args: argparse.Namespace) -> int:
+    """导入主流程：扫描 → 按类别聚合 → 指纹编码入库 → 批次汇总。"""
     root = Path(args.root).resolve()
     if not root.is_dir():
         print(f"数据集根目录不存在: {root}")
         return 1
     db_dir = Path(args.db_dir).resolve() if args.db_dir \
-        else _v8fb63822() / "data" / "db"
+        else _base_dir() / "data" / "db"
     out_dir = Path(args.out_dir).resolve() if args.out_dir \
-        else _v8fb63822() / "data"
+        else _base_dir() / "data"
 
     # 扫描并聚合数据集结构（压缩包外壳目录自动下钻）
-    split_names = (set(_vb0020a30) if args.splits == "auto"
+    split_names = (set(DEFAULT_SPLIT_NAMES) if args.splits == "auto"
                    else {s.strip() for s in args.splits.split(",") if s.strip()})
-    root = _v56255404(root, split_names)
-    grouped = _v30625e20(root, split_names)
+    root = _resolve_effective_root(root, split_names)
+    grouped = collect_dataset(root, split_names)
     if not grouped:
         print("未在根目录下发现 train/val/test 划分目录或任何图片，"
               "可用 --splits 指定划分目录名。")
@@ -253,20 +313,20 @@ def _v120146ff(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         # 试运行：只做名称解析，不复制文件、不写数据库
-        manifest = _v33cdb923(Path(args.manifest).resolve()) \
+        manifest = load_manifest(Path(args.manifest).resolve()) \
             if args.manifest else {}
-        detected = _v12708093(root)
+        detected = detect_manifest(root)
         if not manifest and detected:
-            manifest = _v33cdb923(detected)
+            manifest = load_manifest(detected)
             print(f"已自动加载物种清单: {detected}（{len(manifest)} 条）")
         print("=== 试运行模式：仅解析类别名，不写入任何数据 ===")
         cache: dict[str, str] = {}
         for index, class_name in enumerate(sorted(grouped), 1):
-            query = _v5f7a3991(class_name, manifest)
+            query = build_query(class_name, manifest)
             if query in cache:
                 note = cache[query]
             else:
-                _, _, _, note = _v3808b166(query)
+                _, _, _, note = resolve_taxon_info(query)
                 cache[query] = note
                 time.sleep(0.2)  # 试运行限速，避免请求过快
             count = sum(len(files) for files in grouped[class_name].values())
@@ -274,13 +334,13 @@ def _v120146ff(args: argparse.Namespace) -> int:
         return 0
 
     # 正式导入：创建批次，逐类入库，最后汇总批次统计
-    manifest = _v33cdb923(Path(args.manifest).resolve()) \
+    manifest = load_manifest(Path(args.manifest).resolve()) \
         if args.manifest else {}
-    detected = _v12708093(root)
+    detected = detect_manifest(root)
     if not manifest and detected:
-        manifest = _v33cdb923(detected)
+        manifest = load_manifest(detected)
         print(f"已自动加载物种清单: {detected}（{len(manifest)} 条）")
-    manager = _vc1f32a11(db_dir / "raw_data.db",
+    manager = INaturalistDatabaseManager(db_dir / "raw_data.db",
                                          db_dir / "bird_observations.db")
     batch_id = manager.create_batch_run(
         batch_time=datetime.now().isoformat(timespec="seconds"),
@@ -301,7 +361,7 @@ def _v120146ff(args: argparse.Namespace) -> int:
         for index, class_name in enumerate(sorted(grouped), 1):
             count = sum(len(files) for files in grouped[class_name].values())
             print(f"[{index}/{len(grouped)}] {class_name} ({count} 张)")
-            new, dup, fail = _v256da72c(
+            new, dup, fail = import_one_class(
                 class_name, grouped[class_name], manifest, manager,
                 batch_id, out_dir, seen_in_session, report_lines, args.workers)
             total_new += new
@@ -338,7 +398,8 @@ def _v120146ff(args: argparse.Namespace) -> int:
     return 0 if total_fail == 0 else 1
 
 
-def _v536f243a() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         description="训练数据集导入工具：train/val/test 划分目录按种类指纹编码入库")
     parser.add_argument("--root", required=True, help="数据集根目录路径")
@@ -358,13 +419,14 @@ def _v536f243a() -> argparse.ArgumentParser:
     return parser
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """命令行入口。"""
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    return _v120146ff(_v536f243a().parse_args())
+    return run_import(build_parser().parse_args())
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

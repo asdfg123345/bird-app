@@ -7,6 +7,24 @@
 # ============================================================
 
 # 天咏 2026-09-27
+"""鸟类图像分类模型训练脚本（PyTorch + torchvision，GPU 优先）。
+
+面向「模型训练」界面的后端：从固定 train/val/test 划分的数据集目录
+读取图片，微调预训练 ResNet50 做 200 类鸟类分类，全程向标准输出打印
+带时间戳的进度日志，供 GUI 子进程实时捕获显示。
+
+数据目录约定（与训练数据集压缩版一致，自动下钻一层外壳）：
+    数据根目录/
+        train/<类别文件夹>/*.jpg
+        val/<类别文件夹>/*.jpg
+        test/<类别文件夹>/*.jpg
+类别文件夹名即类别标签（同名自动合并，靠类别序号区分）。
+
+用法（一般由 GUI 调用，也可命令行独立运行）：
+    python model_trainer.py --data-dir <数据根目录> --epochs 15 --batch-size 32
+    python model_trainer.py --data-dir <数据根目录> --list-only   # 只扫描不训练
+    python model_trainer.py --data-dir <数据根目录> --mode low    # 模式预设训练，产物入库
+"""
 
 from __future__ import annotations
 
@@ -22,12 +40,12 @@ from datetime import datetime
 from pathlib import Path
 
 # 划分目录名（小写比较），未匹配到的子目录（如部位检测数据集）自动忽略
-_v4b2b067f = ("train", "val", "test")
-_vaa115322 = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+SPLIT_NAMES = ("train", "val", "test")
+IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 # 模型输出根目录（相对脚本所在目录，避免硬编码盘符，也不污染数据集目录）
-_vfca465fc = Path(__file__).resolve().parent
-_vb4b585b9 = _vfca465fc / "data" / "model_output"
+BASE_DIR = Path(__file__).resolve().parent
+BASE_OUTPUT_DIR = BASE_DIR / "data" / "model_output"
 
 # 可选依赖：torch / torchvision / PIL，缺失时给出明确安装提示后退出
 try:
@@ -64,15 +82,19 @@ except ImportError:
 # 旧版环境回退 torch.cuda.amp（已弃用但仍可用），对调用方统一封装 ----
 if HAS_TORCH and hasattr(torch.amp, "autocast") and hasattr(torch.amp, "GradScaler"):
     def _amp_autocast(enabled: bool):
+        """新版混合精度前向上下文（torch.amp.autocast）。"""
         return torch.amp.autocast("cuda", enabled=enabled)
 
     def _amp_grad_scaler(enabled: bool):
+        """新版梯度缩放器（torch.amp.GradScaler）。"""
         return torch.amp.GradScaler("cuda", enabled=enabled)
 elif HAS_TORCH and hasattr(torch.cuda, "amp"):
     def _amp_autocast(enabled: bool):
+        """旧版混合精度前向上下文（torch.cuda.amp.autocast，已弃用兜底）。"""
         return torch.cuda.amp.autocast(enabled=enabled)
 
     def _amp_grad_scaler(enabled: bool):
+        """旧版梯度缩放器（torch.cuda.amp.GradScaler，已弃用兜底）。"""
         return torch.cuda.amp.GradScaler(enabled=enabled)
 else:
     _amp_autocast = None
@@ -80,12 +102,13 @@ else:
 
 
 # 日志文件路径（main() 确定输出目录后设置；None 表示仅打印到标准输出）
-_vb8844621: Path | None = None
+_LOG_FILE_PATH: Path | None = None
 
 
-def _vaf3a6814(line: str) -> None:
+def _emit(line: str) -> None:
+    """把一行文本同时写到标准输出与日志文件（未启用日志文件时只打印）。"""
     print(line, flush=True)
-    path = _vb8844621
+    path = _LOG_FILE_PATH
     if path is None:
         return
     try:
@@ -95,23 +118,29 @@ def _vaf3a6814(line: str) -> None:
         pass
 
 
-def _v7552da09(msg: str) -> None:
-    _vaf3a6814(f"[{datetime.now():%H:%M:%S}] {msg}")
+def log(msg: str) -> None:
+    """向标准输出打印带时间戳的日志（GUI 子进程按行实时捕获），并写入日志文件。"""
+    _emit(f"[{datetime.now():%H:%M:%S}] {msg}")
 
 
-def _vccf31420(payload: dict) -> None:
+def log_metric(payload: dict) -> None:
+    """输出结构化指标行（GUI 解析用，不显示在文本日志区）。
+
+    格式：[METRIC] {json}；同时写入日志文件，便于事后复盘。
+    """
     try:
         body = json.dumps(payload, ensure_ascii=False)
     except (TypeError, ValueError):
         return
-    _vaf3a6814("[METRIC] " + body)
+    _emit("[METRIC] " + body)
 
 
 # ============================================================
 # 设备资源探测辅助（Task 2：适应模式 / 高速模式批大小推导）
 # ============================================================
 
-def _v676987b6() -> int | None:
+def get_gpu_memory_bytes() -> int | None:
+    """读取 0 号 GPU 的显存总量（字节）；无 GPU 或读取失败返回 None。"""
     if not (HAS_TORCH and torch.cuda.is_available()):
         return None
     try:
@@ -120,7 +149,11 @@ def _v676987b6() -> int | None:
         return None
 
 
-def _v352bfdca() -> tuple[int, int] | None:
+def get_system_memory_bytes() -> tuple[int, int] | None:
+    """读取系统物理内存（总量, 可用）字节数；仅支持 Windows，失败返回 None。
+
+    使用 ctypes 调用 Win32 API GlobalMemoryStatusEx，纯标准库实现。
+    """
     if not sys.platform.startswith("win"):
         return None
     try:
@@ -149,7 +182,8 @@ def _v352bfdca() -> tuple[int, int] | None:
     return None
 
 
-def _v1a5be7f8(path: Path) -> int:
+def get_disk_free_bytes(path: Path) -> int:
+    """返回路径所在磁盘的剩余字节数；路径尚不存在时向上回溯最近存在的祖先目录。"""
     probe = Path(path)
     while not probe.exists():
         parent = probe.parent
@@ -162,16 +196,29 @@ def _v1a5be7f8(path: Path) -> int:
         return 0
 
 
-def _v9919f9a3() -> bool:
+def amp_supported() -> bool:
+    """检查当前环境是否支持 CUDA 混合精度（autocast + GradScaler）。"""
     return bool(HAS_TORCH and torch.cuda.is_available()
                 and _amp_autocast is not None
                 and _amp_grad_scaler is not None)
 
 
-def _v9f3ed460(mode: str, architecture: str = "resnet50",
+def derive_auto_batch(mode: str, architecture: str = "resnet50",
                       amp: bool = True) -> tuple[int, list[str]]:
+    """按设备资源、网络架构与 AMP 状态自适应推导批大小。
+
+    推导规则（安全优先）：
+        - 显存预算：adaptive 用显存的 55%，high 用 80%；
+        - 每样本显存按架构区分：ResNet 系约 45MB，ViT 系约 70MB（224px 输入
+          实测校准值）；关闭 AMP 时按 2 倍估算（FP32 占用更高）；
+          估算仅作探测起点，最终由 probe_batch_size 实测兜底；
+        - 结果限制：adaptive 夹在 [8, 128]，high 夹在 [16, 256]；
+        - 内存约束：系统可用内存减 2GB 预留后，每样本再按 4MB 估算，取更小值；
+        - 无 GPU：CPU 安全回退（batch=8），调用方应同时把 workers 置 0。
+    返回 (批大小, 中文探测日志行列表)，由调用方逐行打印。
+    """
     lines: list[str] = []
-    gpu_mem = _v676987b6()
+    gpu_mem = get_gpu_memory_bytes()
     if gpu_mem is None:
         lines.append("未检测到 GPU，按 CPU 安全参数训练，速度较慢")
         lines.append("CPU 安全回退: batch=8, workers=0")
@@ -190,7 +237,7 @@ def _v9f3ed460(mode: str, architecture: str = "resnet50",
     lines.append(f"GPU 显存: {gpu_mem / 1024 ** 3:.2f} GB"
                  f"（架构 {arch_key}，混合精度={'开' if amp else '关'}，"
                  f"每样本按 {sample_mb}MB 估算）")
-    mem_info = _v352bfdca()
+    mem_info = get_system_memory_bytes()
     if mem_info is not None:
         total_mem, avail_mem = mem_info
         lines.append(f"系统内存: 总量 {total_mem / 1024 ** 3:.2f} GB，"
@@ -223,7 +270,18 @@ def _v9f3ed460(mode: str, architecture: str = "resnet50",
     return batch, lines
 
 
-def _v25be5372(mode: str | None) -> tuple[int, list[str]]:
+def derive_auto_workers(mode: str | None) -> tuple[int, list[str]]:
+    """按训练模式推导数据加载进程数（脚本有 __main__ 守护，Windows 多进程安全）。
+
+    规则：
+        - low（低速后台）：固定 2 个加载进程，尽量少占 CPU；
+        - adaptive：按 CPU 核数一半推导，夹在 [2, 8]；
+        - high（高速）：按 CPU 核数一半推导，夹在 [4, 12]；
+        - 无模式（旧路径）按 adaptive 处理；
+        - 命令行显式 --workers 正数优先于本推导（由调用方保证）；
+        - 内存约束：可用内存不足时按每进程估算占用下调，防止子进程 OOM 崩溃。
+    返回 (进程数, 中文探测日志行列表)。
+    """
     mode = mode or "adaptive"
     cpu = os.cpu_count() or 4
     if mode == "low":
@@ -240,13 +298,14 @@ def _v25be5372(mode: str | None) -> tuple[int, list[str]]:
     # 防止 Windows 下多进程同时加载 torch 触发 OpenBLAS/系统内存分配失败。
     # 进程总量按三个 DataLoader 常驻池计算：训练池 w 个 + 验证/检测池各 min(w, 2) 个
     # （评估加载器每轮仅迭代一次，worker 数上限 2，避免与训练池同规模常驻翻倍）
-    mem_info = _v352bfdca()
+    mem_info = get_system_memory_bytes()
     if mem_info is not None:
         _, avail_mem = mem_info
         per_worker_bytes = 800 * 1024 * 1024
         total_cap = max(1, int(avail_mem * 0.6 // per_worker_bytes))
 
         def _pool_total(w: int) -> int:
+            """三个加载器常驻进程总量：训练 w + 验证/检测各 min(w, 2)。"""
             return w + 2 * min(w, 2)
 
         if _pool_total(workers) > total_cap:
@@ -262,19 +321,27 @@ def _v25be5372(mode: str | None) -> tuple[int, list[str]]:
 
 # 批大小实测探测的显存预算比例：探测用启发式卷积算法（关闭 cudnn 自动寻优）
 # 测得的峰值，余量留给寻优工作区、WDDM 桌面占用、显存碎片与评估阶段
-_vb477c630 = 0.72
+PROBE_BUDGET_RATIO = 0.72
 
 
-def _vf7442ed9(model, device, batch_size: int, img_size: int,
+def probe_batch_size(model, device, batch_size: int, img_size: int,
                      num_classes: int, amp_enabled: bool, logger):
+    """训练开始前用虚拟数据实测批大小：OOM 或超显存预算则减半重试。
+
+    推导公式只能给出估算值，实际占用受 cudnn 工作区与优化器实现影响较大；
+    且 Windows WDDM 驱动显存不足时不报 OOM 而是静默换页到内存（训练极慢），
+    因此除捕获 OOM 外还检查峰值分配是否超出物理显存预算。探测只做一次
+    前向+反向（分配梯度，不更新参数），通过后再与最近失败值取中点精调一次，
+    避免二分减半过冲。返回实测可用的批大小。
+    """
     if device.type != "cuda":
         return batch_size
-    gpu_total = _v676987b6() or 0
+    gpu_total = get_gpu_memory_bytes() or 0
     if gpu_total <= 0:
         return batch_size
     # 优化器状态（Adam/AdamW 每参数 8 字节）探测时尚未分配，从预算中扣除
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    budget = int(gpu_total * _vb477c630) - param_bytes * 2
+    budget = int(gpu_total * PROBE_BUDGET_RATIO) - param_bytes * 2
     criterion = nn.CrossEntropyLoss()
     scaler = _amp_grad_scaler(enabled=amp_enabled)
     # 探测期关闭 cudnn 自动寻优：寻优会遍历多种算法工作区，污染峰值测量
@@ -282,6 +349,7 @@ def _vf7442ed9(model, device, batch_size: int, img_size: int,
     torch.backends.cudnn.benchmark = False
 
     def _try_once(batch: int) -> bool:
+        """单次探测：虚拟前向+反向，OOM 或峰值超预算均视为失败。"""
         imgs = labels = outputs = loss = None
         try:
             torch.cuda.reset_peak_memory_stats()
@@ -330,7 +398,12 @@ def _vf7442ed9(model, device, batch_size: int, img_size: int,
         torch.backends.cudnn.benchmark = prev_benchmark
 
 
-def _v626bf2dd(base_model: str) -> str:
+def _infer_architecture(base_model: str) -> str:
+    """在不实例化网络的前提下，按基础模型标识推断架构类型（供批大小估算）。
+
+    与 build_model 的分支判定保持一致：内置 resnet50 / vit_bird_525；
+    模型库条目读其 architecture 字段（旧记录缺省按 resnet50）。
+    """
     base = (base_model or "resnet50").strip()
     if base == "resnet50":
         return "resnet50"
@@ -346,10 +419,11 @@ def _v626bf2dd(base_model: str) -> str:
     return "resnet50"
 
 
-def _va92493b0(root: Path) -> Path:
+def resolve_effective_root(root: Path) -> Path:
+    """自动下钻定位真正的数据根目录（压缩包外壳多包一层时）。"""
     current = root
     for _ in range(4):
-        if any((current / s).is_dir() for s in _v4b2b067f):
+        if any((current / s).is_dir() for s in SPLIT_NAMES):
             return current
         children = [c for c in current.iterdir() if c.is_dir()]
         if len(children) != 1:
@@ -358,9 +432,10 @@ def _va92493b0(root: Path) -> Path:
     return current
 
 
-def _v415004a4(root: Path) -> dict[str, dict[str, list[Path]]]:
+def scan_dataset(root: Path) -> dict[str, dict[str, list[Path]]]:
+    """扫描数据根目录，返回 {类别名: {划分名: [图片路径]}}。"""
     grouped: dict[str, dict[str, list[Path]]] = {}
-    for split in _v4b2b067f:
+    for split in SPLIT_NAMES:
         split_dir = root / split
         if not split_dir.is_dir():
             continue
@@ -368,13 +443,18 @@ def _v415004a4(root: Path) -> dict[str, dict[str, list[Path]]]:
             if not class_dir.is_dir():
                 continue
             images = [p for p in class_dir.rglob("*")
-                      if p.is_file() and p.suffix.lower() in _vaa115322]
+                      if p.is_file() and p.suffix.lower() in IMG_SUFFIXES]
             if images:
                 grouped.setdefault(class_dir.name, {}).setdefault(split, []).extend(images)
     return grouped
 
 
-class _v24b56252(Dataset):
+class BirdDataset(Dataset):
+    """按固定划分类别文件夹读取图片的简单 Dataset（训练/验证/测试通用）。
+
+    对损坏/无法读取的图片做容错：返回全零占位图并计数，训练主循环据此告警，
+    避免因单张坏图导致整个训练崩溃。
+    """
 
     # 类别级计数器：键为类别序号，值为损坏图片数
     corrupt_count: dict = {}
@@ -393,16 +473,17 @@ class _v24b56252(Dataset):
             img.load()          # 强制解码，提前暴露截断/损坏文件
             img = img.convert("RGB")
         except Exception:
-            _v24b56252.corrupt_count[label] = \
-                _v24b56252.corrupt_count.get(label, 0) + 1
+            BirdDataset.corrupt_count[label] = \
+                BirdDataset.corrupt_count.get(label, 0) + 1
             img = Image.new("RGB", (224, 224), (0, 0, 0))
         if self.transform:
             img = self.transform(img)
         return img, label
 
 
-def _v31994b5a(grouped: dict[str, dict[str, list[Path]]], split: str,
+def build_samples(grouped: dict[str, dict[str, list[Path]]], split: str,
                   label_to_idx: dict[str, int]) -> list[tuple[Path, int]]:
+    """把某一类别的某划分图片展开为 (路径, 标签序号) 样本列表。"""
     samples: list[tuple[Path, int]] = []
     for class_name, splits in grouped.items():
         idx = label_to_idx[class_name]
@@ -413,13 +494,12 @@ def _v31994b5a(grouped: dict[str, dict[str, list[Path]]], split: str,
 
 # ============================================================
 # 分架构训练策略注册表（不同网络用不同优化策略）
-# 说明：训练模式（adaptive/low/high/custom）负责「资源推导与批大小」等设备适配，
-#       轮数/优化器/耐心值/学习率由用户自定义（GUI 提供推荐值）；
+# 说明：训练模式（adaptive/low/high/custom）负责「训练多久、多大批量、何时早停」；
 #       本注册表负责「怎么优化」——优化器、学习率分配、调度器、增强、标签平滑。
-#       两者正交叠加：模式定资源，策略定手法。
+#       两者正交叠加：模式定节奏，策略定手法。
 # ============================================================
 # ViT 系列（鸟类专域起点 / 通用 HuggingFace ViT）共用同一套迁移策略
-_v2a73f25b = {
+_VIT_TRANSFER_STRATEGY = {
     "label": "ViT 迁移策略",
     "optimizer": "adamw",
     "backbone_lr_mult": 0.1,   # 骨干学习率 = 基础学习率 × 0.1（ViT 对学习率敏感）
@@ -431,7 +511,7 @@ _v2a73f25b = {
     "description": "差异化学习率（骨干0.1×/分类头1×）+ 2轮升温 + 余弦退火 + 标签平滑0.1",
 }
 
-_v0e456636 = {
+ARCH_TRAINING_STRATEGY = {
     "resnet50": {
         "label": "ResNet50 标准策略",
         "optimizer": "adamw",
@@ -443,8 +523,8 @@ _v0e456636 = {
         "augment": "basic",
         "description": "等学习率 + 余弦退火 + 基础增强（与原训练行为一致）",
     },
-    "vit_bird_525": _v2a73f25b,
-    "vit_hf": _v2a73f25b,
+    "vit_bird_525": _VIT_TRANSFER_STRATEGY,
+    "vit_hf": _VIT_TRANSFER_STRATEGY,
     "resnest101": {
         "label": "ResNeSt101 策略",
         "optimizer": "sgd",
@@ -459,9 +539,10 @@ _v0e456636 = {
 }
 
 
-def _v8450d335(architecture) -> dict:
-    return _v0e456636.get(str(architecture or "resnet50"),
-                                      _v0e456636["resnet50"])
+def get_training_strategy(architecture) -> dict:
+    """按架构取训练策略；未登记架构按 ResNet50 标准策略兜底。"""
+    return ARCH_TRAINING_STRATEGY.get(str(architecture or "resnet50"),
+                                      ARCH_TRAINING_STRATEGY["resnet50"])
 
 
 # ============================================================
@@ -469,36 +550,37 @@ def _v8450d335(architecture) -> dict:
 # 说明：当前训练器实现图像分类，各分类架构主指标为 Top-1 准确率；
 #       分割(mIoU)/检测(mAP) 条目为结构预留，待相应训练管线接入。
 # ============================================================
-_veeec11af = {
+_CLS_METRIC_ENTRY = {
     "primary": "top1_acc",
     "options": ["top1_acc", "top5_acc", "macro_f1", "val_loss"],
 }
-_v19b8353d = {
-    "resnet50": _veeec11af,
-    "vit_bird_525": _veeec11af,
-    "vit_hf": _veeec11af,
-    "resnest101": _veeec11af,
+EVAL_METRIC_REGISTRY = {
+    "resnet50": _CLS_METRIC_ENTRY,
+    "vit_bird_525": _CLS_METRIC_ENTRY,
+    "vit_hf": _CLS_METRIC_ENTRY,
+    "resnest101": _CLS_METRIC_ENTRY,
     "segformer_seg": {"primary": "miou", "options": ["miou"]},   # 预留（当前不训练分割）
-    "generic": _veeec11af,
+    "generic": _CLS_METRIC_ENTRY,
 }
 
 # 判据方向：True = 越大越好，False = 越小越好
-_v19dfe9f4 = {
+METRIC_HIGHER_BETTER = {
     "top1_acc": True, "val_acc": True, "top5_acc": True,
     "macro_f1": True, "miou": True, "mAP": True, "val_loss": False,
 }
 
 # 指标中文名（日志与报告展示）
-_v9cfd5ca0 = {
+METRIC_CN_NAMES = {
     "top1_acc": "Top-1 准确率", "val_acc": "Top-1 准确率",
     "top5_acc": "Top-5 准确率", "macro_f1": "宏平均F1",
     "val_loss": "验证损失", "miou": "mIoU", "mAP": "mAP",
 }
 
 
-def _v18745dc3(architecture) -> dict:
-    return _v19b8353d.get(str(architecture or "resnet50"),
-                                    _veeec11af)
+def get_eval_metrics(architecture) -> dict:
+    """按架构取评估指标配置（主指标 + 可选判据）；未登记按分类兜底。"""
+    return EVAL_METRIC_REGISTRY.get(str(architecture or "resnet50"),
+                                    _CLS_METRIC_ENTRY)
 
 
 # ============================================================
@@ -515,7 +597,8 @@ SPLIT_PRESETS = {
 }
 
 
-def _v5c758620(text) -> tuple | None:
+def parse_split_ratio(text) -> tuple | None:
+    """解析 "训练,验证,检测" 比例字符串，返回三元组；非法时返回 None。"""
     if not text:
         return None
     parts = [p.strip() for p in str(text).replace("：", ":").split(",")]
@@ -532,10 +615,17 @@ def _v5c758620(text) -> tuple | None:
     return tuple(values)
 
 
-def _v8a5998b2(root: Path) -> dict[str, list[Path]]:
+def scan_flat_dataset(root: Path) -> dict[str, list[Path]]:
+    """扫描数据集为「类别 → 图片列表」的平铺结构（忽略既有划分）。
+
+    兼容两种目录形态：
+      ① 平铺结构：root/类别名/*.jpg；
+      ② 既有划分结构：root/{train,val,test}/类别名/*.jpg（三划分合并后按类别归并，
+         便于用户用同一份数据按新比例重新划分）。
+    """
     grouped: dict[str, list[Path]] = {}
-    if any((root / s).is_dir() for s in _v4b2b067f):
-        for split in _v4b2b067f:
+    if any((root / s).is_dir() for s in SPLIT_NAMES):
+        for split in SPLIT_NAMES:
             split_dir = root / split
             if not split_dir.is_dir():
                 continue
@@ -543,7 +633,7 @@ def _v8a5998b2(root: Path) -> dict[str, list[Path]]:
                 if not class_dir.is_dir():
                     continue
                 images = [p for p in class_dir.rglob("*")
-                          if p.is_file() and p.suffix.lower() in _vaa115322]
+                          if p.is_file() and p.suffix.lower() in IMG_SUFFIXES]
                 if images:
                     grouped.setdefault(class_dir.name, []).extend(images)
     else:
@@ -551,14 +641,23 @@ def _v8a5998b2(root: Path) -> dict[str, list[Path]]:
             if not class_dir.is_dir():
                 continue
             images = [p for p in class_dir.rglob("*")
-                      if p.is_file() and p.suffix.lower() in _vaa115322]
+                      if p.is_file() and p.suffix.lower() in IMG_SUFFIXES]
             if images:
                 grouped[class_dir.name] = images
     return grouped
 
 
-def _v237fd1e0(grouped_flat: dict[str, list[Path]],
+def per_class_adaptive_split(grouped_flat: dict[str, list[Path]],
                              ratio, seed: int) -> tuple:
+    """按比例做「类内自适应分层划分」，返回 ({类名: {划分: [路径]}}, 统计字典)。
+
+    小类保底规则（避免某些类别在验证/检测集中缺席，影响训练效果评估）：
+        - 类别图片数 < 3：全部进训练集；
+        - 类别图片数 < 6：不进检测集（只分训练/验证）；
+        - 类别图片数 < 12：验证集不足 1 张时补 1 张、检测集不足 1 张时补 1 张；
+        - 任何情况下训练集至少保留 1 张。
+    类内随机打乱使用固定种子（可复现），类别之间互不影响。
+    """
     ratios = [float(x) for x in ratio]
     total = sum(ratios) or 1.0
     norm = [r / total for r in ratios]
@@ -588,12 +687,18 @@ def _v237fd1e0(grouped_flat: dict[str, list[Path]],
                 "train": items[n_test + n_val:],
             }
         result[class_name] = assign
-        stats[class_name] = {s: len(assign[s]) for s in _v4b2b067f}
+        stats[class_name] = {s: len(assign[s]) for s in SPLIT_NAMES}
     return result, stats
 
 
-def _v1a383fe9(model, architecture: str, base_lr: float,
+def build_param_groups(model, architecture: str, base_lr: float,
                        weight_decay: float, backbone_lr_mult: float) -> tuple:
+    """按架构拆分骨干/分类头参数组，返回 (参数组列表, 说明文本)。
+
+    分类头模块识别：torchvision/timm 的 fc，HuggingFace ViT 的 classifier。
+    骨干组学习率 = base_lr × backbone_lr_mult，分类头组 = base_lr；
+    倍率为 1.0 或无法区分时合并为单组（等价原行为，保持向后兼容）。
+    """
     head_module, head_name = None, "分类头"
     if hasattr(model, "classifier"):
         head_module, head_name = model.classifier, "classifier"
@@ -621,7 +726,12 @@ def _v1a383fe9(model, architecture: str, base_lr: float,
     return groups, note
 
 
-def _v893552ef(optimizer, strategy: dict, epochs: int) -> tuple:
+def build_scheduler(optimizer, strategy: dict, epochs: int) -> tuple:
+    """按策略构建学习率调度器（线性升温 + 余弦退火），返回 (scheduler, 说明)。
+
+    不引入新依赖，用 LambdaLR 手写；warmup=0 且未指定 cosine 时返回 None
+    （保持原有的恒定学习率行为）。
+    """
     warmup = int(strategy.get("warmup_epochs") or 0)
     kind = strategy.get("scheduler")
     if kind != "cosine" and warmup <= 0:
@@ -629,6 +739,7 @@ def _v893552ef(optimizer, strategy: dict, epochs: int) -> tuple:
     import math as _math
 
     def lr_lambda(epoch_index: int) -> float:
+        """epoch_index 从 0 开始（PyTorch LambdaLR 约定）。"""
         if warmup > 0 and epoch_index < warmup:
             return float(epoch_index + 1) / float(warmup + 1)  # 线性升温
         if kind != "cosine":
@@ -646,7 +757,12 @@ def _v893552ef(optimizer, strategy: dict, epochs: int) -> tuple:
     return scheduler, " + ".join(parts)
 
 
-def _v1787aa9e(strategy: dict, img_size: int) -> tuple:
+def build_transforms(strategy: dict, img_size: int) -> tuple:
+    """按策略返回 (训练增强, 评估增强)。
+
+    basic：缩放 + 随机水平翻转（与既有训练完全一致）；
+    color：在 basic 基础上加入轻微色彩抖动（供 ResNeSt 等新架构使用）。
+    """
     normalize = transforms.Normalize([0.485, 0.456, 0.406],
                                      [0.229, 0.224, 0.225])
     eval_tf = transforms.Compose([
@@ -663,7 +779,8 @@ def _v1787aa9e(strategy: dict, img_size: int) -> tuple:
     return transforms.Compose(layers), eval_tf
 
 
-def _v33f56a82(labels: list, preds: list, num_classes: int) -> float:
+def _macro_f1(labels: list, preds: list, num_classes: int) -> float:
+    """手写宏平均 F1（避免引入 sklearn 依赖，保证任何环境结果一致）。"""
     if num_classes <= 0 or not labels:
         return 0.0
     tp = [0] * num_classes
@@ -684,7 +801,8 @@ def _v33f56a82(labels: list, preds: list, num_classes: int) -> float:
     return f1_sum / num_classes
 
 
-def _v7c500f91(labels: list, preds: list, class_names: list) -> list:
+def per_class_metrics(labels: list, preds: list, class_names: list) -> list:
+    """计算每个类别的 precision/recall/f1/support，供评估报告 CSV 使用。"""
     num_classes = len(class_names)
     tp = [0] * num_classes
     fp = [0] * num_classes
@@ -714,8 +832,13 @@ def _v7c500f91(labels: list, preds: list, class_names: list) -> list:
     return rows
 
 
-def _vb256abb6(model, loader, criterion, device, num_classes: int,
+def evaluate_model(model, loader, criterion, device, num_classes: int,
                    collect_predictions: bool = False) -> dict:
+    """在给定数据加载器上评估模型，返回指标字典。
+
+    计算项：验证损失、Top-1、Top-5、宏平均 F1；collect_predictions=True 时
+    额外返回逐样本的 (labels, preds) 便于生成每类明细报表。
+    """
     model.eval()
     loss_sum, total = 0.0, 0
     top1_correct, top5_correct = 0, 0
@@ -741,7 +864,7 @@ def _vb256abb6(model, loader, criterion, device, num_classes: int,
         "val_loss": round(loss_sum / max(1, total), 4),
         "top1_acc": round(top1_correct / max(1, total), 4),
         "top5_acc": round(top5_correct / max(1, total), 4),
-        "macro_f1": round(_v33f56a82(all_labels, all_preds, num_classes), 4),
+        "macro_f1": round(_macro_f1(all_labels, all_preds, num_classes), 4),
         "count": total,
     }
     if collect_predictions:
@@ -750,14 +873,15 @@ def _vb256abb6(model, loader, criterion, device, num_classes: int,
     return metrics
 
 
-def _v604d7147(out_dir: Path, payload: dict) -> None:
+def _save_resume_state(out_dir: Path, payload: dict) -> None:
+    """原子写入断点状态文件（先写 .tmp 再替换，避免写一半损坏）。"""
     target = out_dir / "resume_state.pth"
     tmp = out_dir / "resume_state.tmp"
     try:
         torch.save(payload, str(tmp))
         os.replace(str(tmp), str(target))
     except Exception as exc:  # 断点保存失败不影响训练主流程
-        _v7552da09(f"[警告] 断点状态保存失败（不影响本次训练）：{exc}")
+        log(f"[警告] 断点状态保存失败（不影响本次训练）：{exc}")
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -765,7 +889,17 @@ def _v604d7147(out_dir: Path, payload: dict) -> None:
             pass
 
 
-def _vd89f50d8(base_model: str, class_count: int, vit_dir=None):
+def build_model(base_model: str, class_count: int, vit_dir=None):
+    """按基础模型标识构建分类网络，返回 (model, architecture, 说明文本)。
+
+    三分支：
+      resnet50      —— torchvision ImageNet 预训练 ResNet50（默认）；
+      vit_bird_525  —— transformers 本地 525 类鸟类 ViT（鸟类专域起点）；
+      其他          —— 视为模型库中的模型名，读其权重继续微调
+                       （旧记录缺 architecture 字段时按 resnet50 处理）。
+    统一语义：先按目标类别数替换分类头，再载入基础权重（strict=False，
+    分类头形状不同自动跳过，骨干权重完成迁移）。
+    """
     base = (base_model or "resnet50").strip()
     if base == "resnet50":
         weights = models.ResNet50_Weights.DEFAULT
@@ -883,14 +1017,15 @@ def _vd89f50d8(base_model: str, class_count: int, vit_dir=None):
     return model, architecture, note
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """训练主流程：解析参数 → 扫描数据 → 构建模型 → 逐轮训练/验证。"""
     parser = argparse.ArgumentParser(
         description="鸟类图像分类模型训练（ResNet50 微调，GPU 优先）")
     parser.add_argument("--data-dir", required=True, help="数据根目录（含 train/val/test）")
     parser.add_argument("--epochs", type=int, default=None,
                         help="训练轮数（默认 15；--mode 时未传则用模式预设值）")
     parser.add_argument("--batch-size", type=int, default=None,
-                        help="批大小（默认 32；adaptive/high/custom 模式未传时按设备自适应推导）")
+                        help="批大小（默认 32；adaptive/high 模式未传时按设备自适应推导）")
     parser.add_argument("--lr", type=float, default=None,
                         help="学习率（默认 1e-3；--mode 时未传则用模式预设值）")
     parser.add_argument("--img-size", type=int, default=224, help="输入图片边长（默认 224）")
@@ -948,10 +1083,10 @@ def _v6f5fe057() -> int:
     if not HAS_TVM:
         missing.append("torchvision（pip install torchvision）")
     if missing:
-        _v7552da09("缺少训练依赖，请先安装：")
+        log("缺少训练依赖，请先安装：")
         for m in missing:
-            _v7552da09(f"  - {m}")
-        _v7552da09("CUDA(GPU)版安装示例：pip install torch torchvision --index-url "
+            log(f"  - {m}")
+        log("CUDA(GPU)版安装示例：pip install torch torchvision --index-url "
             "https://download.pytorch.org/whl/cu126")
         return 2
 
@@ -961,16 +1096,26 @@ def _v6f5fe057() -> int:
     preset = None
     if mode:
         if not HAS_MODEL_LIBRARY:
-            _v7552da09("训练模式依赖同目录的 model_library.py（共享模型库模块），未找到该文件。")
+            log("训练模式依赖同目录的 model_library.py（共享模型库模块），未找到该文件。")
             return 2
         preset = model_library.TRAINING_MODE_PRESETS.get(mode)
         if preset is None:
-            _v7552da09(f"未知的训练模式: {mode}（可选 adaptive/low/high/custom）")
+            log(f"未知的训练模式: {mode}（可选 adaptive/low/high/custom）")
             return 1
-        # 说明：所有模式的轮数/优化器/耐心值/学习率均不再预设固定值，
-        # 由用户显式传入；未传入时回退下方 pick 的内置默认值（各模式行为一致）
+        # 自定义模式的轮数/批大小/耐心值没有预设兜底，必须显式给出，避免误用空预设
+        if mode == "custom":
+            if args.epochs is None:
+                log("自定义模式必须显式指定 --epochs（训练轮数）。")
+                return 1
+            if args.batch_size is None:
+                log("自定义模式必须显式指定 --batch-size（批大小）。")
+                return 1
+            if args.patience is None:
+                log("自定义模式必须显式指定 --patience（早停耐心值，传 0 表示不早停）。")
+                return 1
 
     def pick(explicit, preset_value, legacy_value):
+        """单个参数取值：命令行显式值 > 模式预设值 > 旧默认值。"""
         if explicit is not None:
             return explicit
         if mode and preset_value is not None:
@@ -982,7 +1127,7 @@ def _v6f5fe057() -> int:
     optimizer_name = pick(args.optimizer, preset["optimizer"] if preset else None, "adamw")
     patience = pick(args.patience, preset["patience"] if preset else None, None)
     workers = args.workers  # None 表示未显式指定，待设备探测后再决定默认值
-    # 批大小单独归一化：adaptive/high/custom 预设的 batch=None 表示「按设备推导」，
+    # 批大小单独归一化：adaptive/high 预设的 batch=None 表示「按设备推导」，
     # 与「未传参数回退旧默认 32」含义不同，不能走 pick 的回退逻辑
     if args.batch_size is not None:
         batch_size = args.batch_size          # 命令行显式值最优先
@@ -995,27 +1140,27 @@ def _v6f5fe057() -> int:
 
     # 参数合法性校验（中文报错，非 0 退出）
     if epochs is None or epochs <= 0:
-        _v7552da09(f"参数错误：训练轮数必须为正整数，当前为 {epochs}。")
+        log(f"参数错误：训练轮数必须为正整数，当前为 {epochs}。")
         return 1
     if batch_size is not None and batch_size <= 0:
-        _v7552da09(f"参数错误：批大小必须为正整数，当前为 {batch_size}。")
+        log(f"参数错误：批大小必须为正整数，当前为 {batch_size}。")
         return 1
     if patience is not None and patience < 0:
-        _v7552da09(f"参数错误：早停耐心值不能为负数，当前为 {patience}。")
+        log(f"参数错误：早停耐心值不能为负数，当前为 {patience}。")
         return 1
     if workers is not None and workers < 0:
-        _v7552da09(f"参数错误：数据加载线程数不能为负数，当前为 {workers}。")
+        log(f"参数错误：数据加载线程数不能为负数，当前为 {workers}。")
         return 1
 
     # ---- 自动划分比例归一化 ----
-    split_ratio = _v5c758620(args.split_ratio) if args.split_ratio else None
+    split_ratio = parse_split_ratio(args.split_ratio) if args.split_ratio else None
     if args.auto_split:
         if split_ratio is None:
             split_ratio = (8.0, 1.0, 1.0)      # 未指定时用均衡标准级 8:1:1
-        _v7552da09(f"自动划分比例（训练:验证:检测）= "
+        log(f"自动划分比例（训练:验证:检测）= "
             f"{split_ratio[0]:g}:{split_ratio[1]:g}:{split_ratio[2]:g}")
     elif args.split_ratio:
-        _v7552da09("提示：--split-ratio 需与 --auto-split 同时使用，本次已忽略该参数。")
+        log("提示：--split-ratio 需与 --auto-split 同时使用，本次已忽略该参数。")
 
     # ---- 中断续训：读取断点状态，并用快照回填数据/模型参数 ----
     resume_dir = None
@@ -1028,10 +1173,10 @@ def _v6f5fe057() -> int:
                 resume_state = torch.load(str(resume_file), map_location="cpu",
                                           weights_only=False)
             except Exception as exc:
-                _v7552da09(f"[警告] 断点文件读取失败，将按全新训练执行：{exc}")
+                log(f"[警告] 断点文件读取失败，将按全新训练执行：{exc}")
                 resume_state = None
         else:
-            _v7552da09(f"[警告] 断点目录缺少 resume_state.pth（{resume_file}），将按全新训练执行。")
+            log(f"[警告] 断点目录缺少 resume_state.pth（{resume_file}），将按全新训练执行。")
         if isinstance(resume_state, dict):
             snapshot = resume_state.get("snapshot") or {}
             # 用快照回填训练条件，保证数据划分与网络结构与中断前完全一致
@@ -1045,26 +1190,26 @@ def _v6f5fe057() -> int:
                 args.seed = int(snapshot["seed"])
             if snapshot.get("auto_split"):
                 args.auto_split = True
-                restored = _v5c758620(snapshot.get("split_ratio"))
+                restored = parse_split_ratio(snapshot.get("split_ratio"))
                 if restored:
                     split_ratio = restored
-            _v7552da09(f"续训模式：读取断点（已完成 "
+            log(f"续训模式：读取断点（已完成 "
                 f"{resume_state.get('completed_epoch', 0)} 轮，"
-                f"最佳 {_v9cfd5ca0.get(resume_state.get('best_metric_name'), '指标')}"
+                f"最佳 {METRIC_CN_NAMES.get(resume_state.get('best_metric_name'), '指标')}"
                 f"={resume_state.get('best_metric')}）")
 
     # ---- 扫描数据集 ----
-    data_root = _va92493b0(Path(args.data_dir).resolve())
+    data_root = resolve_effective_root(Path(args.data_dir).resolve())
     if not data_root.exists() or not data_root.is_dir():
-        _v7552da09(f"数据目录不存在或不是文件夹: {data_root}")
+        log(f"数据目录不存在或不是文件夹: {data_root}")
         return 1
     split_report = None
     if args.auto_split and split_ratio:
-        flat = _v8a5998b2(data_root)
+        flat = scan_flat_dataset(data_root)
         if not flat:
-            _v7552da09(f"未在 {data_root} 下找到任何类别目录与图片。")
+            log(f"未在 {data_root} 下找到任何类别目录与图片。")
             return 1
-        grouped, split_stats = _v237fd1e0(flat, split_ratio, args.seed)
+        grouped, split_stats = per_class_adaptive_split(flat, split_ratio, args.seed)
         split_report = {
             "mode": "auto_split",
             "ratio": list(split_ratio),
@@ -1072,40 +1217,28 @@ def _v6f5fe057() -> int:
             "data_root": str(data_root),
             "per_class": split_stats,
         }
-        _v7552da09(f"已按 {split_ratio[0]:g}:{split_ratio[1]:g}:{split_ratio[2]:g} "
+        log(f"已按 {split_ratio[0]:g}:{split_ratio[1]:g}:{split_ratio[2]:g} "
             f"完成类内自适应分层划分（含小类保底）。")
     else:
-        grouped = _v415004a4(data_root)
+        grouped = scan_dataset(data_root)
         if not grouped:
-            _v7552da09(f"未在 {data_root} 下找到 train/val/test 划分目录或任何图片。")
+            log(f"未在 {data_root} 下找到 train/val/test 划分目录或任何图片。")
             return 1
 
     classes = sorted(grouped)
     label_to_idx = {name: i for i, name in enumerate(classes)}
     idx_to_label = {i: name for name, i in label_to_idx.items()}
-    counts = {s: sum(len(v.get(s, [])) for v in grouped.values()) for s in _v4b2b067f}
-    _v7552da09(f"数据根目录: {data_root}")
-    _v7552da09(f"类别数: {len(classes)}")
-    for s in _v4b2b067f:
-        _v7552da09(f"  {s}: {counts[s]} 张")
+    counts = {s: sum(len(v.get(s, [])) for v in grouped.values()) for s in SPLIT_NAMES}
+    log(f"数据根目录: {data_root}")
+    log(f"类别数: {len(classes)}")
+    for s in SPLIT_NAMES:
+        log(f"  {s}: {counts[s]} 张")
     if args.list_only:
-        _v7552da09("（list-only 模式：仅统计，不训练）")
+        log("（list-only 模式：仅统计，不训练）")
         return 0
     if counts["train"] == 0:
-        _v7552da09("训练集为 0 张，无法训练。")
+        log("训练集为 0 张，无法训练。")
         return 1
-    # 验证集为空会导致评估指标全为 0（损失/准确率分母被兜底为 1），
-    # 且无法驱动早停与最佳模型选择，属致命数据问题，必须明确报错并给出解决路径，
-    # 避免静默训练出无效产物、让用户误判为公式错误。
-    if counts["val"] == 0:
-        _v7552da09("[错误] 验证集为 0 张，无法计算评估指标（损失/Top-1/Top-5/宏F1 会显示为 0）。")
-        _v7552da09("       请二选一解决：")
-        _v7552da09("       1) 在数据目录下补充 val 子目录（结构：val/类别名/图片）；")
-        _v7552da09("       2) 改用自动划分（--auto-split，按比例从训练集切出验证/检测集）。")
-        return 1
-    # 检测集为空不影响训练主流程，仅结束评估无意义，给出警告即可。
-    if counts["test"] == 0:
-        _v7552da09("[警告] 检测集为 0 张，训练结束时的检测集评估指标将显示为 0。")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1118,7 +1251,7 @@ def _v6f5fe057() -> int:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    _v7552da09(f"计算设备: {device}" +
+    log(f"计算设备: {device}" +
         (f"（GPU: {torch.cuda.get_device_name(0)}）" if device.type == "cuda" else ""))
 
     # ---- Task 2：批大小自适应推导 / workers 归一化 / AMP 开关归一化 ----
@@ -1127,13 +1260,13 @@ def _v6f5fe057() -> int:
     has_gpu = device.type == "cuda"
     amp_enabled = False
     if args.amp:
-        amp_enabled = has_gpu and _v9919f9a3()
+        amp_enabled = has_gpu and amp_supported()
     elif mode and preset["amp"] in (True, "auto"):
-        amp_enabled = has_gpu and _v9919f9a3()
+        amp_enabled = has_gpu and amp_supported()
     if args.amp and not amp_enabled:
-        _v7552da09("提示：当前无可用 GPU 或环境不支持混合精度，已忽略 --amp（AMP 仅在 CUDA 上生效）。")
+        log("提示：当前无可用 GPU 或环境不支持混合精度，已忽略 --amp（AMP 仅在 CUDA 上生效）。")
     elif mode and not args.amp and preset["amp"] is True and not amp_enabled:
-        _v7552da09("提示：当前无可用 GPU，已忽略该模式的混合精度（AMP）预设。")
+        log("提示：当前无可用 GPU，已忽略该模式的混合精度（AMP）预设。")
 
     # 批大小：按模式 + 架构 + AMP 状态推导（命令行显式 --batch-size 最优先）
     # batch_auto_derived 标记本值是否为自动推导（显式指定/续训回填时为 False），
@@ -1141,11 +1274,11 @@ def _v6f5fe057() -> int:
     batch_auto_derived = False
     if batch_size is None:
         # 仅 adaptive/high 预设的 batch 为 None（表示按设备资源自适应推导）
-        arch_hint = _v626bf2dd(args.base_model)
-        batch_size, probe_lines = _v9f3ed460(mode, arch_hint, amp_enabled)
+        arch_hint = _infer_architecture(args.base_model)
+        batch_size, probe_lines = derive_auto_batch(mode, arch_hint, amp_enabled)
         batch_auto_derived = True
         for line in probe_lines:
-            _v7552da09(line)
+            log(line)
 
     # workers：命令行显式正数最优先；未指定或 <=0 时按模式自动推导
     # （脚本有 __main__ 守护，Windows 下多进程加载安全；纯 CPU 训练保持主进程加载）
@@ -1153,31 +1286,31 @@ def _v6f5fe057() -> int:
         if device.type != "cuda":
             workers = 0
         else:
-            workers, worker_lines = _v25be5372(mode)
+            workers, worker_lines = derive_auto_workers(mode)
             for line in worker_lines:
-                _v7552da09(line)
+                log(line)
 
     # ---- 模型：按基础模型选择构建（ImageNet ResNet50 / 鸟类ViT / 库内微调） ----
     try:
-        model, architecture, base_note = _vd89f50d8(
+        model, architecture, base_note = build_model(
             args.base_model, len(classes), vit_dir=args.vit_dir)
     except RuntimeError as exc:
-        _v7552da09(f"[错误] 基础模型加载失败：{exc}")
+        log(f"[错误] 基础模型加载失败：{exc}")
         return 1
     model.to(device)
-    _v7552da09(f"基础模型: {base_note}")
-    _v7552da09(f"网络架构: {architecture}，分类头类别数: {len(classes)}")
+    log(f"基础模型: {base_note}")
+    log(f"网络架构: {architecture}，分类头类别数: {len(classes)}")
 
     # ---- 分架构训练策略：优化器结构/学习率分配/调度器/增强/标签平滑 ----
-    strategy = _v8450d335(architecture)
-    metrics_cfg = _v18745dc3(architecture)
+    strategy = get_training_strategy(architecture)
+    metrics_cfg = get_eval_metrics(architecture)
     select_metric = args.select_metric or metrics_cfg.get("primary") or "top1_acc"
-    higher_better = _v19dfe9f4.get(select_metric, True)
+    higher_better = METRIC_HIGHER_BETTER.get(select_metric, True)
     # 策略里的优化器仅在用户/模式未显式指定优化器时生效（显式指定优先）
     if not args.optimizer and not (mode and preset and preset.get("optimizer")):
         optimizer_name = strategy.get("optimizer", optimizer_name)
-    _v7552da09(f"训练策略: {strategy.get('label')} —— {strategy.get('description')}")
-    _v7552da09(f"最佳模型判据: {_v9cfd5ca0.get(select_metric, select_metric)}"
+    log(f"训练策略: {strategy.get('label')} —— {strategy.get('description')}")
+    log(f"最佳模型判据: {METRIC_CN_NAMES.get(select_metric, select_metric)}"
         f"（{'越大越好' if higher_better else '越小越好'}）")
 
     # ---- 断点续训：回填训练超参（优化器/学习率/批大小/耐心值/AMP/workers）----
@@ -1206,26 +1339,26 @@ def _v6f5fe057() -> int:
             workers = int(snap["workers"])
             restored_params.append(f"workers={workers}")
         if restored_params:
-            _v7552da09(f"续训回填：{'，'.join(restored_params)}")
+            log(f"续训回填：{'，'.join(restored_params)}")
 
     # ---- 批大小实测探测：估算仅作起点，虚拟前向+反向实测显存后最终确定 ----
     # 仅 GPU + 自动推导 + 全新训练时探测；Windows WDDM 下显存不足不报 OOM
     # 而是静默换页到系统内存（GPU 利用率 100% 但速度骤降），故探测同时检查
     # OOM 异常与实际峰值显存两道防线（见 probe_batch_size）
     if batch_auto_derived and device.type == "cuda" and resume_state is None:
-        batch_size = _vf7442ed9(model, device, batch_size, args.img_size,
-                                      len(classes), amp_enabled, _v7552da09)
+        batch_size = probe_batch_size(model, device, batch_size, args.img_size,
+                                      len(classes), amp_enabled, log)
 
     # ---- 数据增强与加载（增强强度由策略决定） ----
     img_size = args.img_size
-    train_tf, eval_tf = _v1787aa9e(strategy, img_size)
+    train_tf, eval_tf = build_transforms(strategy, img_size)
 
-    train_set = _v24b56252(_v31994b5a(grouped, "train", label_to_idx), train_tf)
-    val_set = _v24b56252(_v31994b5a(grouped, "val", label_to_idx), eval_tf)
-    test_set = _v24b56252(_v31994b5a(grouped, "test", label_to_idx), eval_tf)
+    train_set = BirdDataset(build_samples(grouped, "train", label_to_idx), train_tf)
+    val_set = BirdDataset(build_samples(grouped, "val", label_to_idx), eval_tf)
+    test_set = BirdDataset(build_samples(grouped, "test", label_to_idx), eval_tf)
     # Windows 多进程 DataLoader 需 if __name__ == "__main__" 守护，故此处直接提示
     if workers > 0 and sys.platform.startswith("win"):
-        _v7552da09("提示：Windows 下多线程数据加载可能不稳定，如遇异常请将线程设为 0 重试。")
+        log("提示：Windows 下多线程数据加载可能不稳定，如遇异常请将线程设为 0 重试。")
     pin = (device.type == "cuda")
     # 训练加载器：多进程时常驻并预取下一批，避免每轮重建进程与 GPU 空等数据
     train_extra = {"persistent_workers": True, "prefetch_factor": 4} \
@@ -1247,10 +1380,10 @@ def _v6f5fe057() -> int:
     criterion = nn.CrossEntropyLoss(label_smoothing=smoothing)
 
     # 参数组：按策略拆分骨干/分类头（差异化学习率）
-    param_groups, groups_note = _v1a383fe9(
+    param_groups, groups_note = build_param_groups(
         model, architecture, lr, float(strategy.get("weight_decay") or 0.0),
         float(strategy.get("backbone_lr_mult") or 1.0))
-    _v7552da09(f"参数组: {groups_note}")
+    log(f"参数组: {groups_note}")
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(param_groups, lr=lr, momentum=0.9)
     elif optimizer_name == "adam":
@@ -1258,8 +1391,8 @@ def _v6f5fe057() -> int:
     else:
         optimizer = torch.optim.AdamW(param_groups, lr=lr)
     # 学习率调度器：线性升温 + 余弦退火（按策略）
-    scheduler, sched_note = _v893552ef(optimizer, strategy, epochs)
-    _v7552da09(f"学习率调度: {sched_note}")
+    scheduler, sched_note = build_scheduler(optimizer, strategy, epochs)
+    log(f"学习率调度: {sched_note}")
     # 混合精度梯度缩放器（enabled=False 时全部操作自动退化为普通前向/反向；
     # 经兼容层创建：新版 torch.amp.GradScaler("cuda")，旧版回退 torch.cuda.amp）
     scaler = _amp_grad_scaler(enabled=amp_enabled)
@@ -1279,30 +1412,30 @@ def _v6f5fe057() -> int:
         register_after_train = True
         generate_preview = True
     else:
-        out_dir = Path(args.out_dir).resolve() if args.out_dir else _vb4b585b9
+        out_dir = Path(args.out_dir).resolve() if args.out_dir else BASE_OUTPUT_DIR
         # 显式指定输出目录 + 模式化训练：仍注册入库（预览图不生成，保持旧产物结构）
         register_after_train = bool(mode)
 
     # 磁盘安全检查：模式化训练时输出磁盘剩余不足 5GB 拒绝训练（安全优先）
     if mode:
-        disk_free = _v1a5be7f8(out_dir)
-        _v7552da09(f"输出磁盘剩余空间: {disk_free / 1024 ** 3:.2f} GB")
+        disk_free = get_disk_free_bytes(out_dir)
+        log(f"输出磁盘剩余空间: {disk_free / 1024 ** 3:.2f} GB")
         if disk_free < 5 * 1024 ** 3:
-            _v7552da09("[错误] 输出磁盘剩余空间不足 5GB，为避免训练中断导致产物损坏，已拒绝训练。"
+            log("[错误] 输出磁盘剩余空间不足 5GB，为避免训练中断导致产物损坏，已拒绝训练。"
                 "请清理磁盘空间后重试。")
             return 1
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 启用训练日志文件（双写 stdout + 文件；续训时接续同一日志，新训练重置） ----
-    global _vb8844621
-    _vb8844621 = out_dir / "train_log.txt"
+    global _LOG_FILE_PATH
+    _LOG_FILE_PATH = out_dir / "train_log.txt"
     if not is_resume:
         try:
-            _vb8844621.write_text("", encoding="utf-8")
+            _LOG_FILE_PATH.write_text("", encoding="utf-8")
         except OSError as exc:
-            _v7552da09(f"[警告] 训练日志文件创建失败（不影响训练）：{exc}")
-            _vb8844621 = None
-    _v7552da09(f"训练日志文件: {_vb8844621 if _vb8844621 else '（未启用）'}")
+            log(f"[警告] 训练日志文件创建失败（不影响训练）：{exc}")
+            _LOG_FILE_PATH = None
+    log(f"训练日志文件: {_LOG_FILE_PATH if _LOG_FILE_PATH else '（未启用）'}")
 
     # 自动划分报告落盘（在内存中完成划分，不移动/复制用户原始文件）
     if split_report is not None:
@@ -1310,9 +1443,9 @@ def _v6f5fe057() -> int:
             (out_dir / "split_report.json").write_text(
                 json.dumps(split_report, ensure_ascii=False, indent=2),
                 encoding="utf-8")
-            _v7552da09(f"数据划分报告已保存: {out_dir / 'split_report.json'}")
+            log(f"数据划分报告已保存: {out_dir / 'split_report.json'}")
         except OSError as exc:
-            _v7552da09(f"[警告] 数据划分报告写入失败（不影响训练）：{exc}")
+            log(f"[警告] 数据划分报告写入失败（不影响训练）：{exc}")
 
     # ViT 架构：把基础模型的 config.json / preprocessor_config.json 复制到产物目录，
     # 使训练产物目录保持可被视觉分析系统按 HuggingFace 目录方式加载
@@ -1355,7 +1488,7 @@ def _v6f5fe057() -> int:
             best_metric = resume_state.get("best_metric")
             no_improve = int(resume_state.get("no_improve", 0))
             history = list(resume_state.get("history") or [])
-            _v7552da09(f"已恢复断点状态：从第 {start_epoch} 轮继续训练"
+            log(f"已恢复断点状态：从第 {start_epoch} 轮继续训练"
                 f"（历史记录 {len(history)} 轮）")
             # 续训已成功启动：清除「上次中断」提示文件，避免 GUI 重复引导续训
             if HAS_MODEL_LIBRARY:
@@ -1366,21 +1499,21 @@ def _v6f5fe057() -> int:
                 except OSError:
                     pass
         except Exception as exc:
-            _v7552da09(f"[警告] 断点状态恢复失败，将按全新训练执行：{exc}")
+            log(f"[警告] 断点状态恢复失败，将按全新训练执行：{exc}")
             is_resume = False
             start_epoch, best_metric, no_improve, history = 1, None, 0, []
     if start_epoch > epochs:
-        _v7552da09(f"已完成轮数（{start_epoch - 1}）已达到目标轮数 {epochs}，直接进入结束评估。")
+        log(f"已完成轮数（{start_epoch - 1}）已达到目标轮数 {epochs}，直接进入结束评估。")
 
     # 启动信息：模式、最终生效参数、输出目录（全中文，供 GUI 与用户确认）
     mode_label = model_library.TRAINING_MODE_PRESETS[mode]["label"] if mode \
         else "默认模式（经典参数，不入库）"
-    _v7552da09(f"训练模式: {mode_label}")
-    _v7552da09(f"生效参数: epochs={epochs}, optimizer={optimizer_name}, "
+    log(f"训练模式: {mode_label}")
+    log(f"生效参数: epochs={epochs}, optimizer={optimizer_name}, "
         f"patience={patience if patience else '无'}, batch={batch_size}, lr={lr}, "
         f"amp={'开启' if amp_enabled else '关闭'}, workers={workers}, seed={args.seed}")
-    _v7552da09(f"输出目录: {out_dir}")
-    _v7552da09(f"开始训练：目标轮数 {epochs}，共 {len(classes)} 类")
+    log(f"输出目录: {out_dir}")
+    log(f"开始训练：目标轮数 {epochs}，共 {len(classes)} 类")
 
     # 断点快照：记录重建训练条件所需的全部参数（续训时用于回填，保证数据一致）
     snapshot = {
@@ -1404,13 +1537,14 @@ def _v6f5fe057() -> int:
     }
 
     def report_corrupt(stage: str) -> None:
-        if not _v24b56252.corrupt_count:
+        """汇总并打印损坏图片告警（按类别统计，最多列 10 类）。"""
+        if not BirdDataset.corrupt_count:
             return
-        total_corrupt = sum(_v24b56252.corrupt_count.values())
-        _v7552da09(f"[告警] {stage} 共遇到 {total_corrupt} 张损坏/无法读取的图片，已用占位图跳过：")
+        total_corrupt = sum(BirdDataset.corrupt_count.values())
+        log(f"[告警] {stage} 共遇到 {total_corrupt} 张损坏/无法读取的图片，已用占位图跳过：")
         for label_idx, cnt in sorted(
-                _v24b56252.corrupt_count.items(), key=lambda x: -x[1])[:10]:
-            _v7552da09(f"    类别「{idx_to_label.get(label_idx, label_idx)}」: {cnt} 张")
+                BirdDataset.corrupt_count.items(), key=lambda x: -x[1])[:10]:
+            log(f"    类别「{idx_to_label.get(label_idx, label_idx)}」: {cnt} 张")
 
     trained_epochs = max(0, start_epoch - 1)  # 已完成的轮数（含续训前完成的轮数）
     interrupted = False
@@ -1444,7 +1578,7 @@ def _v6f5fe057() -> int:
                 correct_t += (outputs.argmax(1) == labels).sum()
                 total += labels.size(0)
                 if i % log_every == 0 or i == len(train_loader):
-                    _v7552da09(f"  [Epoch {epoch}/{epochs}] "
+                    log(f"  [Epoch {epoch}/{epochs}] "
                         f"batch {i}/{len(train_loader)} "
                         f"loss={running_loss_t.item() / max(1, total):.4f} "
                         f"acc={correct_t.item() / max(1, total):.4f}")
@@ -1453,11 +1587,11 @@ def _v6f5fe057() -> int:
             train_acc = correct_t.item() / max(1, total)
 
             # ---- 验证：一次性计算全部指标（损失 / Top-1 / Top-5 / 宏F1） ----
-            metrics = _vb256abb6(model, val_loader, criterion, device, len(classes))
+            metrics = evaluate_model(model, val_loader, criterion, device, len(classes))
             report_corrupt(f"Epoch {epoch} 验证")
             dt = time.time() - t0
             current_lr = optimizer.param_groups[0]["lr"]
-            _v7552da09(f"[Epoch {epoch}/{epochs}] 完成：train_loss={train_loss:.4f} "
+            log(f"[Epoch {epoch}/{epochs}] 完成：train_loss={train_loss:.4f} "
                 f"train_acc={train_acc:.4f} val_loss={metrics['val_loss']:.4f} "
                 f"top1={metrics['top1_acc']:.4f} top5={metrics['top5_acc']:.4f} "
                 f"macro_f1={metrics['macro_f1']:.4f} lr={current_lr:.2e} 耗时 {dt:.1f}s")
@@ -1476,7 +1610,7 @@ def _v6f5fe057() -> int:
             if is_best:
                 best_metric = metric_value
                 torch.save(model.state_dict(), out_dir / "best_model.pt")
-                _v7552da09(f"  已保存最佳模型（{_v9cfd5ca0.get(select_metric, select_metric)}"
+                log(f"  已保存最佳模型（{METRIC_CN_NAMES.get(select_metric, select_metric)}"
                     f"={metric_value:.4f}）")
             # 早停计数：首轮建立基线或严格提升时重置，其余累加
             strict_better = metric_value is not None and (
@@ -1497,7 +1631,7 @@ def _v6f5fe057() -> int:
                 "is_best": bool(is_best),
                 "seconds": round(dt, 1),
             })
-            _vccf31420({
+            log_metric({
                 "epoch": epoch,
                 "train_loss": round(train_loss, 4),
                 "val_loss": metrics["val_loss"],
@@ -1515,7 +1649,7 @@ def _v6f5fe057() -> int:
             except OSError:
                 pass
             # 断点状态原子落盘，供中断后继续训练
-            _v604d7147(out_dir, {
+            _save_resume_state(out_dir, {
                 "completed_epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -1535,14 +1669,14 @@ def _v6f5fe057() -> int:
             # 早停判断：连续 patience 轮无提升则提前结束（patience 为 0/None 时不启用）
             if patience and no_improve >= patience:
                 early_stopped = True
-                _v7552da09(f"早停触发：{_v9cfd5ca0.get(select_metric, select_metric)}"
+                log(f"早停触发：{METRIC_CN_NAMES.get(select_metric, select_metric)}"
                     f"连续 {patience} 轮未提升，提前结束训练。")
                 break
     except KeyboardInterrupt:
-        _v7552da09("收到中断信号（Ctrl+C / 停止训练），正在保存当前模型后退出…")
+        log("收到中断信号（Ctrl+C / 停止训练），正在保存当前模型后退出…")
         interrupted = True
     except Exception:
-        _v7552da09("训练过程发生异常，保存当前模型后退出：")
+        log("训练过程发生异常，保存当前模型后退出：")
         traceback.print_exc()
         interrupted = True
     finally:
@@ -1552,9 +1686,9 @@ def _v6f5fe057() -> int:
                 json.dumps(label_to_idx, ensure_ascii=False, indent=2),
                 encoding="utf-8")
             torch.save(model.state_dict(), out_dir / "last_model.pt")
-            _v7552da09(f"模型与标签已保存至: {out_dir}")
+            log(f"模型与标签已保存至: {out_dir}")
         except Exception as save_exc:
-            _v7552da09(f"保存模型时出错: {save_exc}")
+            log(f"保存模型时出错: {save_exc}")
         # 释放 GPU 显存，避免残留占用影响下次训练
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1574,15 +1708,15 @@ def _v6f5fe057() -> int:
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
             except OSError:
                 pass
-        _v7552da09(f"训练提前结束。已完成 {trained_epochs} 轮，"
-            f"最佳 {_v9cfd5ca0.get(select_metric, select_metric)}={best_metric}")
-        _v7552da09(f"断点已保存，可续训：--resume \"{out_dir}\"")
+        log(f"训练提前结束。已完成 {trained_epochs} 轮，"
+            f"最佳 {METRIC_CN_NAMES.get(select_metric, select_metric)}={best_metric}")
+        log(f"断点已保存，可续训：--resume \"{out_dir}\"")
         return 130  # 128+SIGINT，标识为中断退出（中断/异常时不注册入库）
 
     # ---- 正常结束（含早停）：用最佳模型做完整评估，再写元信息并注册入库 ----
     end_note = "（早停）" if early_stopped else ""
-    _v7552da09(f"训练正常结束{end_note}。实际训练 {trained_epochs} 轮，"
-        f"最佳 {_v9cfd5ca0.get(select_metric, select_metric)}={best_metric}")
+    log(f"训练正常结束{end_note}。实际训练 {trained_epochs} 轮，"
+        f"最佳 {METRIC_CN_NAMES.get(select_metric, select_metric)}={best_metric}")
 
     # 载入最佳模型，用于验证集与检测集的完整评估（生成评估报告）
     best_path = out_dir / "best_model.pt"
@@ -1590,9 +1724,9 @@ def _v6f5fe057() -> int:
         try:
             model.load_state_dict(torch.load(str(best_path), map_location="cpu",
                                              weights_only=True))
-            _v7552da09("已载入最佳模型用于结束评估。")
+            log("已载入最佳模型用于结束评估。")
         except Exception as exc:
-            _v7552da09(f"[警告] 最佳模型载入失败，改用当前模型评估：{exc}")
+            log(f"[警告] 最佳模型载入失败，改用当前模型评估：{exc}")
 
     evaluation_report = {
         "metric_name": select_metric,
@@ -1604,38 +1738,38 @@ def _v6f5fe057() -> int:
     }
     val_full = None
     try:
-        val_full = _vb256abb6(model, val_loader, criterion, device,
+        val_full = evaluate_model(model, val_loader, criterion, device,
                                   len(classes), collect_predictions=True)
         evaluation_report["val"] = {k: v for k, v in val_full.items()
                                     if k not in ("labels", "preds")}
-        _v7552da09(f"验证集评估：top1={val_full['top1_acc']:.4f} "
+        log(f"验证集评估：top1={val_full['top1_acc']:.4f} "
             f"top5={val_full['top5_acc']:.4f} macro_f1={val_full['macro_f1']:.4f} "
             f"val_loss={val_full['val_loss']:.4f}")
     except Exception as exc:
-        _v7552da09(f"[警告] 验证集评估失败：{exc}")
+        log(f"[警告] 验证集评估失败：{exc}")
         val_full = None
     test_full = None
     if counts.get("test", 0) > 0:
         try:
-            test_full = _vb256abb6(model, test_loader, criterion, device,
+            test_full = evaluate_model(model, test_loader, criterion, device,
                                        len(classes), collect_predictions=True)
             evaluation_report["test"] = {k: v for k, v in test_full.items()
                                          if k not in ("labels", "preds")}
-            _v7552da09(f"检测集评估：top1={test_full['top1_acc']:.4f} "
+            log(f"检测集评估：top1={test_full['top1_acc']:.4f} "
                 f"top5={test_full['top5_acc']:.4f} macro_f1={test_full['macro_f1']:.4f} "
                 f"val_loss={test_full['val_loss']:.4f}")
         except Exception as exc:
-            _v7552da09(f"[警告] 检测集评估失败：{exc}")
+            log(f"[警告] 检测集评估失败：{exc}")
             test_full = None
     else:
-        _v7552da09("检测集为空，跳过检测集评估（如需该指标，请为数据划分 test 集）。")
+        log("检测集为空，跳过检测集评估（如需该指标，请为数据划分 test 集）。")
 
     # 每类明细报表：检测集优先，无检测集时用验证集
     detail_metrics = test_full or val_full
     detail_source = "test" if test_full else ("val" if val_full else None)
     if detail_metrics and detail_source:
         try:
-            rows = _v7c500f91(detail_metrics["labels"],
+            rows = per_class_metrics(detail_metrics["labels"],
                                      detail_metrics["preds"], classes)
             csv_lines = ["class,index,precision,recall,f1,support"]
             for row in rows:
@@ -1645,20 +1779,21 @@ def _v6f5fe057() -> int:
             (out_dir / "per_class_metrics.csv").write_text(
                 "\n".join(csv_lines), encoding="utf-8-sig")
             evaluation_report["per_class_source"] = detail_source
-            _v7552da09(f"每类指标明细已保存: {out_dir / '_v7c500f91.csv'}"
+            log(f"每类指标明细已保存: {out_dir / 'per_class_metrics.csv'}"
                 f"（基于 {detail_source} 集）")
         except Exception as exc:
-            _v7552da09(f"[警告] 每类指标写入失败：{exc}")
+            log(f"[警告] 每类指标写入失败：{exc}")
 
     try:
         (out_dir / "evaluation_report.json").write_text(
             json.dumps(evaluation_report, ensure_ascii=False, indent=2),
             encoding="utf-8")
-        _v7552da09(f"评估报告已保存: {out_dir / 'evaluation_report.json'}")
+        log(f"评估报告已保存: {out_dir / 'evaluation_report.json'}")
     except Exception as exc:
-        _v7552da09(f"[警告] 评估报告写入失败：{exc}")
+        log(f"[警告] 评估报告写入失败：{exc}")
 
     def _metric_set(src) -> dict | None:
+        """把评估结果裁剪为入库用的指标集合（Top-1/Top-5/宏F1/损失）。"""
         if not src:
             return None
         return {"top1_acc": src["top1_acc"], "top5_acc": src["top5_acc"],
@@ -1697,7 +1832,7 @@ def _v6f5fe057() -> int:
                 (out_dir / "meta.json").write_text(
                     json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as meta_exc:
-                _v7552da09(f"[警告] meta.json 写入失败: {meta_exc}")
+                log(f"[警告] meta.json 写入失败: {meta_exc}")
         # 注册入库：正常结束才注册；失败只警告不中断，训练产物已保存不受影响
         try:
             preview_path = None
@@ -1711,10 +1846,10 @@ def _v6f5fe057() -> int:
                 mode=mode, source="本机训练", preview_path=preview_path,
                 architecture=architecture, metric_name=select_metric,
                 metrics=_metric_set(val_full))
-            _v7552da09(f"模型已注册入库: {record.get('name')}"
+            log(f"模型已注册入库: {record.get('name')}"
                 f"（模型库目录: {model_library.MODEL_LIBRARY_DIR}）")
         except Exception as reg_exc:
-            _v7552da09(f"[警告] 模型注册入库失败（训练产物不受影响）: {reg_exc}")
+            log(f"[警告] 模型注册入库失败（训练产物不受影响）: {reg_exc}")
     return 0
 
 
@@ -1724,4 +1859,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

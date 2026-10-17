@@ -5,6 +5,14 @@
 # ============================================================
 
 # 天咏 2026-09-07
+"""iNaturalist 鸟类下载项目数据库初始化模块。
+
+负责创建并维护两个 SQLite 数据库：
+- raw_data.db：原始数据层，中文字段，保留 API 原始 JSON
+- bird_observations.db：规范化主数据层，英文字段，支持查询与去重
+
+提供目录自动创建、损坏库备份重建等容错能力。
+"""
 
 from __future__ import annotations
 
@@ -17,7 +25,7 @@ from typing import Any
 
 
 # 原始库建表语句
-_v0ea5fdb5: list[tuple[str, str]] = [
+RAW_DB_SCHEMA: list[tuple[str, str]] = [
     (
         "raw_observations",
         """
@@ -89,7 +97,7 @@ _v0ea5fdb5: list[tuple[str, str]] = [
     ),
 ]
 
-_ve63d5931: list[str] = [
+RAW_DB_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_raw_obs_观察记录ID ON raw_observations(观察记录ID)",
     "CREATE INDEX IF NOT EXISTS idx_raw_obs_类群ID ON raw_observations(类群ID)",
     "CREATE INDEX IF NOT EXISTS idx_raw_obs_采集时间 ON raw_observations(采集时间)",
@@ -100,7 +108,7 @@ _ve63d5931: list[str] = [
 ]
 
 # 主库建表语句
-_v132f772a: list[tuple[str, str]] = [
+MAIN_DB_SCHEMA: list[tuple[str, str]] = [
     (
         "taxa",
         """
@@ -251,7 +259,7 @@ _v132f772a: list[tuple[str, str]] = [
     ),
 ]
 
-_v2e8c4020: list[str] = [
+MAIN_DB_INDEXES: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_obs_observation_id ON observations(observation_id)",
     "CREATE INDEX IF NOT EXISTS idx_obs_taxon_id ON observations(taxon_id)",
     "CREATE INDEX IF NOT EXISTS idx_obs_scientific_name ON observations(scientific_name)",
@@ -272,7 +280,8 @@ _v2e8c4020: list[str] = [
 ]
 
 
-def _v510cb11f(db_path: Path) -> None:
+def _backup_corrupted_db(db_path: Path) -> None:
+    """如果数据库文件已存在但疑似损坏，则备份后删除。"""
     if not db_path.exists() or db_path.stat().st_size == 0:
         return
     backup_path = db_path.with_suffix(f".db.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
@@ -283,7 +292,8 @@ def _v510cb11f(db_path: Path) -> None:
         pass
 
 
-def _vf4cc69e1(db_path: Path, schema: list[tuple[str, str]], indexes: list[str]) -> None:
+def _init_single_db(db_path: Path, schema: list[tuple[str, str]], indexes: list[str]) -> None:
+    """初始化单个数据库：建表、建索引、做完整性检查。"""
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 先尝试连接，若损坏则备份重建
@@ -292,7 +302,7 @@ def _vf4cc69e1(db_path: Path, schema: list[tuple[str, str]], indexes: list[str])
         conn.execute("PRAGMA integrity_check").fetchone()
         conn.close()
     except sqlite3.DatabaseError:
-        _v510cb11f(db_path)
+        _backup_corrupted_db(db_path)
 
     conn = sqlite3.connect(db_path)
     try:
@@ -310,29 +320,33 @@ def _vf4cc69e1(db_path: Path, schema: list[tuple[str, str]], indexes: list[str])
         conn.close()
 
 
-def _vf04ed2c7(raw_db_path: Path | str) -> Path:
+def init_raw_db(raw_db_path: Path | str) -> Path:
+    """初始化原始数据层数据库。"""
     path = Path(raw_db_path)
-    _vf4cc69e1(path, _v0ea5fdb5, _ve63d5931)
+    _init_single_db(path, RAW_DB_SCHEMA, RAW_DB_INDEXES)
     return path
 
 
-def _v4f692264(main_db_path: Path | str) -> Path:
+def init_main_db(main_db_path: Path | str) -> Path:
+    """初始化规范化主数据层数据库。"""
     path = Path(main_db_path)
-    _vf4cc69e1(path, _v132f772a, _v2e8c4020)
+    _init_single_db(path, MAIN_DB_SCHEMA, MAIN_DB_INDEXES)
     return path
 
 
-def _ve49f7201(
+def init_all_databases(
     raw_db_path: Path | str,
     main_db_path: Path | str,
 ) -> dict[str, Path]:
+    """同时初始化两个数据库，返回路径字典。"""
     return {
-        "raw_db": _vf04ed2c7(raw_db_path),
-        "main_db": _v4f692264(main_db_path),
+        "raw_db": init_raw_db(raw_db_path),
+        "main_db": init_main_db(main_db_path),
     }
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """命令行入口：可传入原始库与主库路径。"""
     import sys
 
     base_dir = Path(__file__).resolve().parent
@@ -340,11 +354,11 @@ def _v6f5fe057() -> int:
     raw_db = sys.argv[1] if len(sys.argv) > 1 else default_db_dir / "raw_data.db"
     main_db = sys.argv[2] if len(sys.argv) > 2 else default_db_dir / "bird_observations.db"
 
-    paths = _ve49f7201(raw_db, main_db)
+    paths = init_all_databases(raw_db, main_db)
     print(f"原始数据库初始化完成: {paths['raw_db']}")
     print(f"主数据库初始化完成: {paths['main_db']}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(_v6f5fe057())
+    raise SystemExit(main())

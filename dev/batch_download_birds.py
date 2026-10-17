@@ -5,6 +5,22 @@
 # ============================================================
 
 # 天咏 2026-09-05
+"""批量下载多个鸟类类群的 iNaturalist 观察数据与图片。
+
+基于官方 API（https://api.inaturalist.org/v1），合规采集。
+每个类群（科）的图片自动存放于独立文件夹：
+    data/taxon_{id}_{学名}_{俗名}/photos/
+并生成各自的 observations.csv、photos.csv、summary.json 元数据。
+
+默认内置 15 个常见鸟类科；默认仅下载研究级（research grade）观察，
+并限制每个类群的最大观察数，防止大类群（如鸭科 486 万条）拖垮内存。
+
+用法示例：
+    python batch_download_birds.py
+    python batch_download_birds.py --max-per-taxon 100
+    python batch_download_birds.py --taxon-ids 574 19728
+    python batch_download_birds.py --taxon-ids 574 19728 --max-per-taxon 50 --workers 4
+"""
 
 from __future__ import annotations
 
@@ -15,12 +31,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from download_inaturalist import _v4ec0b3e2
-from inaturalist_db_manager import _vc1f32a11
+from download_inaturalist import download_taxon_data
+from inaturalist_db_manager import INaturalistDatabaseManager
 
 # 默认鸟类类群列表（科级别，附中文名便于识别）
 # 数据量为 2026-09 查询值，仅供参考
-_vc9275948: list[dict[str, Any]] = [
+DEFAULT_TAXA: list[dict[str, Any]] = [
     {"taxon_id": 574, "label_cn": "雉科"},      # Phasianidae（鸡形目，含竹鸡、鹧鸪等）
     {"taxon_id": 6912, "label_cn": "鸭科"},     # Anatidae（雁形目，雁、鸭、天鹅）
     {"taxon_id": 5067, "label_cn": "鹰科"},     # Accipitridae（鹰形目，鹰、雕、鸢）
@@ -119,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
     args = parse_args()
     try:
         sys.stdout.reconfigure(line_buffering=True)
@@ -130,7 +146,7 @@ def _v6f5fe057() -> int:
     if args.taxon_ids:
         taxa = [{"taxon_id": tid, "label_cn": ""} for tid in args.taxon_ids]
     else:
-        taxa = _vc9275948
+        taxa = DEFAULT_TAXA
 
     # 质量等级 "any" 表示不过滤
     quality = None if args.quality_grade == "any" else args.quality_grade
@@ -145,7 +161,7 @@ def _v6f5fe057() -> int:
     print("=" * 70)
 
     # 初始化数据库管理器并创建批次记录
-    db_manager: _vc1f32a11 | None = None
+    db_manager: INaturalistDatabaseManager | None = None
     batch_id: int | None = None
     db_dir = args.db_dir or (args.out_dir / "db")
     raw_db = args.raw_db or (db_dir / "raw_data.db")
@@ -153,7 +169,7 @@ def _v6f5fe057() -> int:
 
     if not args.no_db:
         try:
-            db_manager = _vc1f32a11(raw_db, main_db)
+            db_manager = INaturalistDatabaseManager(raw_db, main_db)
             batch_id = db_manager.create_batch_run(
                 batch_time=datetime.now().isoformat(timespec="seconds"),
                 taxa_requested=len(taxa),
@@ -181,7 +197,7 @@ def _v6f5fe057() -> int:
             # 单类群下载失败不影响其他类群（失败隔离）
             # 0 在命令行中表示不限制，转换为 None
             max_obs = None if args.max_per_taxon == 0 else args.max_per_taxon
-            summary = _v4ec0b3e2(
+            summary = download_taxon_data(
                 taxon_id=taxon_id,
                 out_dir=args.out_dir,
                 photo_size=args.photo_size,
@@ -266,4 +282,4 @@ def _v6f5fe057() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

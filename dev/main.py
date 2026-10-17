@@ -5,6 +5,24 @@
 # ============================================================
 
 # 天咏 2026-09-08
+"""iNaturalist 鸟类下载项目统一入口。
+
+提供子命令：
+    batch      批量下载多个鸟类类群
+    download   单个类群下载
+    migrate    将已有 CSV/JSON 历史数据迁移到数据库
+    init-db    初始化 SQLite 数据库
+    stats      查看数据库统计
+
+用法示例：
+    python main.py batch --max-per-taxon 200
+    python main.py download --taxon-id 20967 --max-observations 10
+    python main.py migrate
+    python main.py init-db
+    python main.py stats
+    python main.py panel
+    python main.py gui
+"""
 
 from __future__ import annotations
 
@@ -13,50 +31,53 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from download_inaturalist import _v4ec0b3e2
-from inaturalist_db_initializer import _ve49f7201
-from inaturalist_db_manager import _vc1f32a11
+from download_inaturalist import download_taxon_data
+from inaturalist_db_initializer import init_all_databases
+from inaturalist_db_manager import INaturalistDatabaseManager
 
 # ============================================================
 # 数字水印与版权信息（程序权属标识，受保护内容，请勿移除）
 # ============================================================
-_v3698f533 = "1.5.1"
-_va54a0eaa = "天咏"
-_vc78006c9 = "明月照今日，风摇过两川。"
+APP_VERSION = "1.5.1"
+APP_AUTHOR = "天咏"
+APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
 # 控制台输出的版权行不含 © 字符（Windows 控制台默认 GBK 代码页无法
 # 编码该字符）；PE 版本资源中的版权行由版本信息文件独立定义（含 ©）。
-_vc08e4dd5 = "2026 天咏 版权所有（明月照今日，风摇过两川。）"
+APP_COPYRIGHT = "2026 天咏 版权所有（明月照今日，风摇过两川。）"
 # 以下两项为打包占位符：打包准备脚本构建时自动替换为源码指纹与构建时间；
 # 源码直接运行时保留占位说明文本，不影响任何功能。
-_vfd80eb11 = "f370869eed682eac"
-_v234b6456 = "2026-10-16 11:06:49"
+APP_BUILD_FINGERPRINT = "@@BUILD_FINGERPRINT@@"
+APP_BUILD_TIME = "@@BUILD_TIME@@"
 # 数字水印标识：TYWM（天咏水印）+ 产品代号 + 版本 + 源码指纹
-_vd0d9683b = f"TYWM-BIRD-v{_v3698f533}-{_vfd80eb11}"
+APP_WATERMARK_ID = f"TYWM-BIRD-v{APP_VERSION}-{APP_BUILD_FINGERPRINT}"
 
 
-def _v40fcadd3() -> str:
+def watermark_banner() -> str:
+    """组装程序权属水印文本（copyright 子命令与版本输出共用）。"""
     lines = [
         "程序名称：鸟类（iNaturalist 鸟类数据采集与图像下载系统）",
-        f"程序版本：v{_v3698f533}",
-        f"作者署名：{_va54a0eaa}（{_vc78006c9}）",
-        f"版权声明：{_vc08e4dd5}",
-        f"数字水印：{_vd0d9683b}",
-        f"构建指纹：{_vfd80eb11}",
-        f"构建时间：{_v234b6456}",
+        f"程序版本：v{APP_VERSION}",
+        f"作者署名：{APP_AUTHOR}（{APP_AUTHOR_SIGNATURE}）",
+        f"版权声明：{APP_COPYRIGHT}",
+        f"数字水印：{APP_WATERMARK_ID}",
+        f"构建指纹：{APP_BUILD_FINGERPRINT}",
+        f"构建时间：{APP_BUILD_TIME}",
         "权属说明：本程序及其安装包内嵌数字水印与源码构建指纹，",
         "        用以标识著作权归属；未经授权不得去除或篡改。",
     ]
     return "\n".join(lines)
 
 
-def _vbbc13256(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]:
+def _resolve_db_paths(args: argparse.Namespace, out_dir: Path) -> tuple[Path, Path]:
+    """根据命令行参数解析数据库路径。"""
     db_dir = args.db_dir or (out_dir / "db")
     raw_db = args.raw_db or (db_dir / "raw_data.db")
     main_db = args.main_db or (db_dir / "bird_observations.db")
     return Path(raw_db), Path(main_db)
 
 
-def _vdee07610(parser: argparse.ArgumentParser) -> None:
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    """添加通用参数：输出目录与数据库路径。"""
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -89,8 +110,9 @@ def _vdee07610(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _vc7b4cd0f(args: argparse.Namespace) -> int:
-    from batch_download_birds import _v6f5fe057 as batch_main
+def cmd_batch(args: argparse.Namespace) -> int:
+    """批量下载子命令。"""
+    from batch_download_birds import main as batch_main
 
     # 构造 sys.argv 以复用 batch_download_birds 的 argparse
     sys.argv = ["batch_download_birds.py"]
@@ -119,8 +141,9 @@ def _vc7b4cd0f(args: argparse.Namespace) -> int:
     return batch_main()
 
 
-def _vf97c83f4(args: argparse.Namespace) -> int:
-    summary = _v4ec0b3e2(
+def cmd_download(args: argparse.Namespace) -> int:
+    """单类群下载子命令。"""
+    summary = download_taxon_data(
         taxon_id=args.taxon_id,
         out_dir=args.out_dir,
         photo_size=args.photo_size,
@@ -131,14 +154,15 @@ def _vf97c83f4(args: argparse.Namespace) -> int:
         save_raw_json=args.save_raw_json,
         skip_places=not args.no_skip_places,
         db_enabled=not args.no_db,
-        raw_db_path=_vbbc13256(args, args.out_dir)[0],
-        main_db_path=_vbbc13256(args, args.out_dir)[1],
+        raw_db_path=_resolve_db_paths(args, args.out_dir)[0],
+        main_db_path=_resolve_db_paths(args, args.out_dir)[1],
     )
     return 0 if summary["photos_failed"] == 0 else 1
 
 
-def _vcdd72447(args: argparse.Namespace) -> int:
-    from inaturalist_db_migrator import _v6f5fe057 as migrator_main
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """历史数据迁移子命令。"""
+    from inaturalist_db_migrator import main as migrator_main
 
     sys.argv = ["inaturalist_db_migrator.py"]
     sys.argv.extend(["--out-dir", str(args.out_dir)])
@@ -153,21 +177,23 @@ def _vcdd72447(args: argparse.Namespace) -> int:
     return migrator_main()
 
 
-def _v9150cd3a(args: argparse.Namespace) -> int:
-    raw_db, main_db = _vbbc13256(args, args.out_dir)
-    _ve49f7201(raw_db, main_db)
+def cmd_init_db(args: argparse.Namespace) -> int:
+    """初始化数据库子命令。"""
+    raw_db, main_db = _resolve_db_paths(args, args.out_dir)
+    init_all_databases(raw_db, main_db)
     print(f"数据库初始化完成：")
     print(f"  原始库: {raw_db}")
     print(f"  主库: {main_db}")
     return 0
 
 
-def _v9099e1af(args: argparse.Namespace) -> int:
-    raw_db, main_db = _vbbc13256(args, args.out_dir)
+def cmd_stats(args: argparse.Namespace) -> int:
+    """查看数据库统计子命令。"""
+    raw_db, main_db = _resolve_db_paths(args, args.out_dir)
     if not main_db.exists():
         print(f"主数据库不存在: {main_db}")
         return 1
-    manager = _vc1f32a11(raw_db, main_db)
+    manager = INaturalistDatabaseManager(raw_db, main_db)
     print("=== 数据库统计 ===")
     print(f"观察记录总数: {manager.get_observation_count()}")
     print(f"照片总数: {manager.get_photo_count()}")
@@ -189,34 +215,38 @@ def _v9099e1af(args: argparse.Namespace) -> int:
     return 0
 
 
-def _v39d8b066(args: argparse.Namespace) -> int:
+def cmd_panel(args: argparse.Namespace) -> int:
+    """启动数据库交互面板子命令（浏览器访问）。"""
     # 面板仅依赖主数据库，路径延迟导入以加快其他子命令的启动速度
-    from bird_db_panel import _v52e537e0
+    from bird_db_panel import serve
 
-    _, main_db = _vbbc13256(args, args.out_dir)
-    _v52e537e0(main_db=main_db, port=args.port, open_browser=not args.no_browser)
+    _, main_db = _resolve_db_paths(args, args.out_dir)
+    serve(main_db=main_db, port=args.port, open_browser=not args.no_browser)
     return 0
 
 
-def _v4269340b(args: argparse.Namespace) -> int:
+def cmd_gui(args: argparse.Namespace) -> int:
+    """启动 Windows 桌面控制台子命令（Tkinter 弹窗界面）。"""
     from bird_crawler_gui import run as gui_run
 
     return gui_run()
 
 
-def _v73707c7f(args: argparse.Namespace) -> int:
-    from drop_crawl_interface import _va0fedbb1
+def cmd_drop(args: argparse.Namespace) -> int:
+    """拖入自动处理子命令（txt/csv 清单爬取；图片/文件夹按种类指纹编码入库）。"""
+    from drop_crawl_interface import run_cli
 
     # db-dir 未指定时按 out-dir/db 兜底解析，避免空值传给接口
     if getattr(args, "db_dir", None) is None:
         args.db_dir = Path(args.out_dir) / "db"
-    return _va0fedbb1(args)
+    return run_cli(args)
 
 
-def _v108cad6d(args: argparse.Namespace) -> int:
+def cmd_dataset(args: argparse.Namespace) -> int:
+    """训练数据集导出子命令（按观察划分防泄漏，硬链接零拷贝）。"""
     from dataset_exporter import run as dataset_run
 
-    _, main_db = _vbbc13256(args, args.out_dir)
+    _, main_db = _resolve_db_paths(args, args.out_dir)
     # 映射为导出模块的参数命名空间
     export_args = argparse.Namespace(
         out=args.out,
@@ -237,15 +267,20 @@ def _v108cad6d(args: argparse.Namespace) -> int:
     return dataset_run(export_args)
 
 
-def _v59966678(args: argparse.Namespace) -> int:
-    print(_v40fcadd3())
+def cmd_copyright(args: argparse.Namespace) -> int:
+    """版权与数字水印查询子命令：输出程序权属标识信息。"""
+    print(watermark_banner())
     return 0
 
 
-def _veca4458f(args: argparse.Namespace) -> int:
-    from db_health_check import _v6f5fe057 as health_main
+def cmd_health(args: argparse.Namespace) -> int:
+    """数据库健康检查子命令（复用 db_health_check 模块）。
 
-    raw_db, main_db = _vbbc13256(args, args.out_dir)
+    默认只读检查；--apply 时执行安全修复（修复前自动整库备份）。
+    """
+    from db_health_check import main as health_main
+
+    raw_db, main_db = _resolve_db_paths(args, args.out_dir)
     argv: list[str] = ["--data-dir", str(args.out_dir),
                        "--db", str(main_db),
                        "--raw-db", str(raw_db)]
@@ -254,7 +289,8 @@ def _veca4458f(args: argparse.Namespace) -> int:
     return health_main(argv)
 
 
-def _v536f243a() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行解析器。"""
     parser = argparse.ArgumentParser(
         description="iNaturalist 鸟类下载项目统一入口",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -263,14 +299,14 @@ def _v536f243a() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"鸟类 v{_v3698f533}（2026 {_va54a0eaa} 版权所有） 数字水印 {_vd0d9683b}",
+        version=f"鸟类 v{APP_VERSION}（2026 {APP_AUTHOR} 版权所有） 数字水印 {APP_WATERMARK_ID}",
         help="输出版本、版权与数字水印信息",
     )
     subparsers = parser.add_subparsers(dest="command", required=True, help="子命令")
 
     # batch 子命令
     batch_parser = subparsers.add_parser("batch", help="批量下载多个鸟类类群")
-    _vdee07610(batch_parser)
+    _add_common_args(batch_parser)
     batch_parser.add_argument(
         "--taxon-ids",
         type=int,
@@ -323,7 +359,7 @@ def _v536f243a() -> argparse.ArgumentParser:
 
     # download 子命令
     download_parser = subparsers.add_parser("download", help="单个类群下载")
-    _vdee07610(download_parser)
+    _add_common_args(download_parser)
     download_parser.add_argument(
         "--taxon-id",
         type=int,
@@ -375,7 +411,7 @@ def _v536f243a() -> argparse.ArgumentParser:
 
     # migrate 子命令
     migrate_parser = subparsers.add_parser("migrate", help="迁移已有 CSV/JSON 到数据库")
-    _vdee07610(migrate_parser)
+    _add_common_args(migrate_parser)
     migrate_parser.add_argument(
         "--batch-uuid",
         type=str,
@@ -385,15 +421,15 @@ def _v536f243a() -> argparse.ArgumentParser:
 
     # init-db 子命令
     init_parser = subparsers.add_parser("init-db", help="初始化数据库")
-    _vdee07610(init_parser)
+    _add_common_args(init_parser)
 
     # stats 子命令
     stats_parser = subparsers.add_parser("stats", help="查看数据库统计")
-    _vdee07610(stats_parser)
+    _add_common_args(stats_parser)
 
     # panel 子命令
     panel_parser = subparsers.add_parser("panel", help="启动数据库交互面板（浏览器访问）")
-    _vdee07610(panel_parser)
+    _add_common_args(panel_parser)
     panel_parser.add_argument("--port", type=int, default=8765, help="面板服务端口（默认 8765）")
     panel_parser.add_argument("--no-browser", action="store_true", help="启动后不自动打开浏览器")
 
@@ -428,7 +464,7 @@ def _v536f243a() -> argparse.ArgumentParser:
     dataset_parser = subparsers.add_parser(
         "dataset",
         help="导出标准训练数据集（按观察划分防泄漏、manifest 清单、硬链接零拷贝）")
-    _vdee07610(dataset_parser)
+    _add_common_args(dataset_parser)
     dataset_parser.add_argument(
         "--out", type=Path, required=True,
         help="数据集导出目标目录")
@@ -473,7 +509,7 @@ def _v536f243a() -> argparse.ArgumentParser:
     # health 子命令（数据库健康检查：残留/孤儿/空批次/重复/歧义/两库一致性）
     health_parser = subparsers.add_parser(
         "health", help="数据库健康检查（残留/孤儿记录/空批次/重复/同名歧义/两库一致性）")
-    _vdee07610(health_parser)
+    _add_common_args(health_parser)
     health_parser.add_argument(
         "--apply", action="store_true",
         help="执行安全修复（默认只检查；修复前自动整库备份）")
@@ -482,10 +518,12 @@ def _v536f243a() -> argparse.ArgumentParser:
 
 
 def parse_args() -> argparse.Namespace:
-    return _v536f243a().parse_args()
+    """解析命令行参数。"""
+    return build_parser().parse_args()
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """项目统一入口主函数。"""
     try:
         # 行缓冲即时输出；errors=replace 保证极端代码页下不可编码字符不致崩溃
         sys.stdout.reconfigure(line_buffering=True, errors="replace")
@@ -498,27 +536,27 @@ def _v6f5fe057() -> int:
             # 冻结环境（双击 exe）：默认打开桌面控制台界面
             sys.argv.append("gui")
         else:
-            parser = _v536f243a()
+            parser = build_parser()
             parser.print_help()
             return 0
 
     args = parse_args()
     command_map: dict[str, Any] = {
-        "batch": _vc7b4cd0f,
-        "download": _vf97c83f4,
-        "migrate": _vcdd72447,
-        "init-db": _v9150cd3a,
-        "stats": _v9099e1af,
-        "panel": _v39d8b066,
-        "gui": _v4269340b,
-        "drop": _v73707c7f,
-        "dataset": _v108cad6d,
-        "copyright": _v59966678,
-        "health": _veca4458f,
+        "batch": cmd_batch,
+        "download": cmd_download,
+        "migrate": cmd_migrate,
+        "init-db": cmd_init_db,
+        "stats": cmd_stats,
+        "panel": cmd_panel,
+        "gui": cmd_gui,
+        "drop": cmd_drop,
+        "dataset": cmd_dataset,
+        "copyright": cmd_copyright,
+        "health": cmd_health,
     }
     handler = command_map[args.command]
     return handler(args)
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

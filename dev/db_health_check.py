@@ -3,6 +3,42 @@
 # 项目：iNaturalist 鸟类数据采集与图像下载系统
 # 作者签名：天咏（明月照今日，风摇过两川。）
 # ============================================================
+"""数据库健康检查与自愈模块。
+
+背景（2026-10-16 全量核查结论）：
+    数据库本身无虚假记录，但存在若干"多余存储"与残留问题：
+    1. 下载中断产生的 .part 残留文件；
+    2. taxon 目录中存在但未入库的散图（磁盘有文件、库无记录）；
+    3. 个别无照片的观察记录（库有记录、无照片支撑）；
+    4. 空批次历史记录（total_photos=0 等无意义批次）；
+    5. 跨类群同名照片文件导致的文件名索引歧义；
+    6. 需要持续监控的重复指纹 / 两库不一致风险。
+
+本模块提供 8 项检查与对应的安全修复（自愈）能力：
+    检查（只读，不改动任何数据）：
+        C1 .part 残留文件
+        C2 taxon 目录未入库散图
+        C3 无照片的观察记录 / 无观察的照片 / 无观察的类群
+        C4 空批次记录
+        C5 重复照片指纹
+        C6 照片路径可解析性（库内路径能否对应实际文件）
+        C7 跨类群同名文件歧义
+        C8 主库与原始库照片记录一致性
+    修复（apply，执行前自动整库备份）：
+        R1 删除 .part 残留文件
+        R2 散图移动至 data/orphan_pending/<时间戳>/ 待人工处理
+           （不自动入库，避免历史上"回退层级名误导入"同类风险）
+        R3 删除无照片的观察记录（主库 + 原始库同步删除）
+        R4 删除空批次记录及其关联行
+        C5/C7 仅报告不自动处理，C6 缺失文件仅报告。
+
+用法：
+    只检查（默认）：python db_health_check.py
+    检查+修复：python db_health_check.py --apply
+    自定义路径：
+        python db_health_check.py --data-dir D:\\...\\data \\
+            --db 主库.db --raw-db 原始库.db
+"""
 
 from __future__ import annotations
 
@@ -16,25 +52,30 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # 图片扩展名集合（与 bird_crawler_gui 的照片索引保持一致）
-_vea981ec7 = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 
 @dataclass
-class _v3dd173eb:
+class HealthReport:
+    """健康检查结果报告（检查项 -> 明细列表）。"""
     issues: dict[str, list[str]] = field(default_factory=dict)
     stats: list[str] = field(default_factory=list)
 
     def add(self, key: str, line: str) -> None:
+        """追加一条问题明细。"""
         self.issues.setdefault(key, []).append(line)
 
     def add_stat(self, line: str) -> None:
+        """追加一条统计信息（非问题）。"""
         self.stats.append(line)
 
     @property
     def total_issues(self) -> int:
+        """问题明细总条数。"""
         return sum(len(v) for v in self.issues.values())
 
     def render(self) -> str:
+        """渲染为可读文本报告。"""
         names = {
             "C1_part_residue": "C1 下载残留 .part 文件",
             "C2_orphan_images": "C2 taxon 目录未入库散图",
@@ -65,29 +106,32 @@ class _v3dd173eb:
         return "\n".join(lines)
 
 
-def _v646c75ef(db: Path) -> sqlite3.Connection:
+def _connect_ro(db: Path) -> sqlite3.Connection:
+    """只读方式连接数据库（检查阶段绝不写库）。"""
     conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _vda41a341(data_dir: Path):
+def _iter_taxon_image_files(data_dir: Path):
+    """遍历所有 taxon_* 目录下的图片文件（yield 路径）。"""
     for taxon in data_dir.glob("taxon_*"):
         if not taxon.is_dir():
             continue
         for item in taxon.rglob("*"):
-            if item.is_file() and item.suffix.lower() in _vea981ec7:
+            if item.is_file() and item.suffix.lower() in IMAGE_EXTS:
                 yield item
 
 
-def _v3ec64384(data_dir: Path, main_db: Path, raw_db: Path) -> _v3dd173eb:
-    rep = _v3dd173eb()
+def run_checks(data_dir: Path, main_db: Path, raw_db: Path) -> HealthReport:
+    """执行全部 8 项检查（只读，无任何写入）。"""
+    rep = HealthReport()
     t0 = time.time()
     rep.add_stat(f"数据目录: {data_dir}")
     rep.add_stat(f"主库: {main_db}")
     rep.add_stat(f"原始库: {raw_db}")
 
-    con = _v646c75ef(main_db)
+    con = _connect_ro(main_db)
     con.execute("ATTACH DATABASE ? AS rawdb", (str(raw_db),))
 
     # ---- C1: .part 残留文件 ----
@@ -102,11 +146,11 @@ def _v3ec64384(data_dir: Path, main_db: Path, raw_db: Path) -> _v3dd173eb:
 
     # ---- 一次性构建 磁盘文件名 -> 类群目录集合 映射（供 C2/C6/C7 复用）----
     name_to_taxons: dict[str, set[str]] = defaultdict(set)
-    for f in _vda41a341(data_dir):
+    for f in _iter_taxon_image_files(data_dir):
         name_to_taxons[f.name].add(f.parent.parent.name)
 
     # ---- C2: taxon 目录未入库散图 ----
-    for f in _vda41a341(data_dir):
+    for f in _iter_taxon_image_files(data_dir):
         if f.name not in ref_names:
             rep.add("C2_orphan_images", str(f.relative_to(data_dir)))
 
@@ -190,7 +234,8 @@ def _v3ec64384(data_dir: Path, main_db: Path, raw_db: Path) -> _v3dd173eb:
     return rep
 
 
-def _vc936bcdf(db: Path) -> Path:
+def _backup(db: Path) -> Path:
+    """修复前整库备份（同目录 backup 子目录，带时间戳）。"""
     bdir = db.parent / "backup"
     bdir.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -199,12 +244,17 @@ def _vc936bcdf(db: Path) -> Path:
     return dest
 
 
-def _vf141c0fd(data_dir: Path, main_db: Path, raw_db: Path,
-                rep: _v3dd173eb) -> list[str]:
+def apply_fixes(data_dir: Path, main_db: Path, raw_db: Path,
+                rep: HealthReport) -> list[str]:
+    """按检查报告执行安全修复（返回修复动作日志）。
+
+    修复范围：R1 删 .part / R2 散图移入待处理区 / R3 删无照片观察 /
+    R4 删空批次。C5/C6/C7 仅报告项不自动处理。
+    """
     logs: list[str] = []
     # ---- 修复前整库备份 ----
     for db in (main_db, raw_db):
-        dest = _vc936bcdf(db)
+        dest = _backup(db)
         logs.append(f"备份 {db.name} -> {dest.name}")
 
     # ---- R1: 删除 .part 残留 ----
@@ -221,7 +271,7 @@ def _vf141c0fd(data_dir: Path, main_db: Path, raw_db: Path,
         ref_names.add(Path(lp).name)
     pending = data_dir / "orphan_pending" / time.strftime("%Y%m%d_%H%M%S")
     # 先收集再移动，避免遍历过程中移动文件导致目录遍历异常
-    orphans = [f for f in _vda41a341(data_dir)
+    orphans = [f for f in _iter_taxon_image_files(data_dir)
                if f.name not in ref_names]
     n_moved = 0
     for f in orphans:
@@ -280,14 +330,16 @@ def _vf141c0fd(data_dir: Path, main_db: Path, raw_db: Path,
     return logs
 
 
-def _v9d550d57() -> tuple[Path, Path, Path]:
+def _default_paths() -> tuple[Path, Path, Path]:
+    """从脚本位置推导默认路径（不硬编码绝对路径）。"""
     base = Path(__file__).resolve().parent
     data_dir = base / "data"
     db_dir = data_dir / "db"
     return data_dir, db_dir / "bird_observations.db", db_dir / "raw_data.db"
 
 
-def _v6f5fe057(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
+    """命令行入口：--check 只检查，--apply 检查并修复。"""
     parser = argparse.ArgumentParser(description="数据库健康检查与自愈")
     parser.add_argument("--apply", action="store_true", help="执行安全修复（默认只检查）")
     parser.add_argument("--data-dir", help="数据目录（默认：脚本所在目录/data）")
@@ -295,7 +347,7 @@ def _v6f5fe057(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-db", help="原始库路径（默认：data/db/raw_data.db）")
     args = parser.parse_args(argv)
 
-    d_data, d_main, d_raw = _v9d550d57()
+    d_data, d_main, d_raw = _default_paths()
     data_dir = Path(args.data_dir) if args.data_dir else d_data
     main_db = Path(args.db) if args.db else d_main
     raw_db = Path(args.raw_db) if args.raw_db else d_raw
@@ -304,18 +356,18 @@ def _v6f5fe057(argv: list[str] | None = None) -> int:
         print(f"数据库不存在: {main_db} / {raw_db}", file=sys.stderr)
         return 2
 
-    rep = _v3ec64384(data_dir, main_db, raw_db)
+    rep = run_checks(data_dir, main_db, raw_db)
     print(rep.render())
 
     if args.apply and rep.issues:
         print("\n=== 执行修复 ===")
-        for line in _vf141c0fd(data_dir, main_db, raw_db, rep):
+        for line in apply_fixes(data_dir, main_db, raw_db, rep):
             print(f"  {line}")
         print("修复完成，复查结果：")
-        rep2 = _v3ec64384(data_dir, main_db, raw_db)
+        rep2 = run_checks(data_dir, main_db, raw_db)
         print(rep2.render())
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(_v6f5fe057())
+    raise SystemExit(main())

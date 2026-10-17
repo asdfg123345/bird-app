@@ -5,6 +5,17 @@
 # ============================================================
 
 # 天咏 2026-09-15
+"""训练数据集导出模块。
+
+把数据库中已下载的照片一键导出为 PyTorch 可直接加载的标准数据集：
+- 按"观察"为单位划分 train/val/test（防止同一观察的照片跨集合造成数据泄漏）
+- 生成 manifest.csv / manifest.jsonl 清单（含纲-目-科层级与许可证信息）
+- 默认硬链接导出（同盘零拷贝，100GB 级数据不产生磁盘翻倍）
+- 支持最小尺寸、许可证白名单、每类样本上下限过滤
+- 输出数据质量报告与 PyTorch 加载示例代码
+
+纯标准库实现；PIL（Pillow）仅在存在时用于图片完整性校验，缺失则自动跳过。
+"""
 
 from __future__ import annotations
 
@@ -22,20 +33,21 @@ from pathlib import Path
 from typing import Any
 
 # 路径相对脚本目录解析，避免硬编码
-_vfca465fc = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 
 # 三个标准数据划分集合
-_v4b2b067f = ("train", "val", "test")
+SPLIT_NAMES = ("train", "val", "test")
 
 # manifest.jsonl 的固定字段顺序
-_v074b6b20 = [
+MANIFEST_FIELDS = [
     "file", "split", "taxon_id", "label", "scientific_name", "common_name",
     "class", "order", "family", "observation_id", "photo_id",
     "license_code", "attribution", "width", "height", "sha256_16", "mode",
 ]
 
 
-def _v536f243a() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
+    """构建 dataset 子命令的参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="dataset",
         description="把数据库照片导出为标准训练数据集（按观察划分、防泄漏、硬链接零拷贝）",
@@ -45,9 +57,9 @@ def _v536f243a() -> argparse.ArgumentParser:
     parser.add_argument("--taxon-ids", type=str, default="",
                         help="仅导出指定类群（逗号分隔的类群 ID，空=全部；"
                              "GUI「训练数据集」页签按勾选类群导出时使用）")
-    parser.add_argument("--data-dir", type=Path, default=_vfca465fc / "data",
+    parser.add_argument("--data-dir", type=Path, default=BASE_DIR / "data",
                         help="照片数据根目录（含 taxon_* 目录，默认脚本目录下的 data）")
-    parser.add_argument("--main-db", type=Path, default=_vfca465fc / "data" / "db" / "bird_observations.db",
+    parser.add_argument("--main-db", type=Path, default=BASE_DIR / "data" / "db" / "bird_observations.db",
                         help="主数据库路径（默认 data/db/bird_observations.db）")
     parser.add_argument("--splits", type=str, default="8:1:1",
                         help="train:val:test 比例（默认 8:1:1）")
@@ -72,13 +84,15 @@ def _v536f243a() -> argparse.ArgumentParser:
     return parser
 
 
-def _va74f259f(text: str, fallback: str) -> str:
+def _clean_label(text: str, fallback: str) -> str:
+    """把类名清洗为文件系统安全的目录名，空结果回退到 fallback。"""
     cleaned = re.sub(r"[^\w\s()-]", "", text or "", flags=re.UNICODE).strip()
     cleaned = re.sub(r"[-\s]+", "_", cleaned)
     return cleaned or fallback
 
 
-def _vdcefa3ed(manager) -> dict[int, dict[str, str]]:
+def _load_taxa_meta(manager) -> dict[int, dict[str, str]]:
+    """读取 taxa 表的类群基础信息作为 taxon_tree 缺失时的兜底。"""
     conn = manager._get_main_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -94,9 +108,14 @@ def _vdcefa3ed(manager) -> dict[int, dict[str, str]]:
     return meta
 
 
-def _vc94148c4(tree: dict[int, dict[str, Any]],
+def _ancestor_ranks(tree: dict[int, dict[str, Any]],
                     taxa_meta: dict[int, dict[str, str]],
                     taxon_id: int) -> dict[str, str]:
+    """沿层级链向上取纲/目/科名称（tree 优先，taxa 表兜底）。
+
+    返回 {"class": 纲名, "order": 目名, "family": 科名}，取不到的层级
+    用 taxon_{ID} 占位，保证 manifest 字段始终可用。
+    """
     want = {"class", "order", "family"}
     result = {"class": "", "order": "", "family": ""}
     seen: set[int] = set()
@@ -124,11 +143,12 @@ def _vc94148c4(tree: dict[int, dict[str, Any]],
     return {r: result[r] or f"taxon_{taxon_id}" for r in want}
 
 
-def _v65d0fd17(data_dir: Path, taxon_id: int,
+def _resolve_taxon_dir(data_dir: Path, taxon_id: int,
                        sci: str, cn: str) -> Path | None:
-    from download_inaturalist import _vca17059a
+    """定位照片所在的 taxon_* 目录：先按命名规则精确匹配，再按前缀兜底。"""
+    from download_inaturalist import slugify
 
-    exact = data_dir / f"taxon_{taxon_id}_{_vca17059a(sci)}_{_vca17059a(cn)}"
+    exact = data_dir / f"taxon_{taxon_id}_{slugify(sci)}_{slugify(cn)}"
     if exact.is_dir():
         return exact
     for cand in sorted(data_dir.glob(f"taxon_{taxon_id}_*")):
@@ -137,7 +157,8 @@ def _v65d0fd17(data_dir: Path, taxon_id: int,
     return None
 
 
-def _v27da1612(manager) -> list[dict[str, Any]]:
+def _fetch_candidates(manager) -> list[dict[str, Any]]:
+    """从主库拉取全部有本地文件的照片记录（JOIN 观察表取类群信息）。"""
     conn = manager._get_main_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -169,7 +190,11 @@ def _v27da1612(manager) -> list[dict[str, Any]]:
     return rows
 
 
-def _v2bd3af86(path: Path) -> tuple[bool, int, int, str]:
+def _verify_image(path: Path) -> tuple[bool, int, int, str]:
+    """用 PIL 校验图片完整性，返回 (是否有效, 宽, 高, 色彩模式)。
+
+    PIL 未安装时视为有效但信息未知，调用方据此前进。
+    """
     try:
         from PIL import Image
     except ImportError:
@@ -182,7 +207,11 @@ def _v2bd3af86(path: Path) -> tuple[bool, int, int, str]:
         return False, 0, 0, ""
 
 
-def _veedde773(src: Path, dst: Path, mode: str) -> str:
+def _link_or_copy(src: Path, dst: Path, mode: str) -> str:
+    """按指定方式落盘：hard=硬链接（跨盘/不支持时回退复制），copy=复制。
+
+    返回实际使用的方式（"hard" 或 "copy"），供报告统计。
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
     if mode == "hard":
         try:
@@ -194,8 +223,9 @@ def _veedde773(src: Path, dst: Path, mode: str) -> str:
     return "copy"
 
 
-def _v4c874ce5(args: argparse.Namespace) -> int:
-    from inaturalist_db_manager import _vc1f32a11
+def export_dataset(args: argparse.Namespace) -> int:
+    """导出主流程：查询 → 过滤 → 观察级划分 → 落盘 → 清单与报告。"""
+    from inaturalist_db_manager import INaturalistDatabaseManager
 
     out_dir: Path = args.out
     data_dir: Path = args.data_dir
@@ -229,12 +259,12 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
             taxon_allow.add(int(part))
     rng = random.Random(args.seed)
 
-    manager = _vc1f32a11(
+    manager = INaturalistDatabaseManager(
         main_db.parent / "raw_data.db", main_db)
     try:
         tree = manager.load_taxon_tree()
-        taxa_meta = _vdcefa3ed(manager)
-        candidates = _v27da1612(manager)
+        taxa_meta = _load_taxa_meta(manager)
+        candidates = _fetch_candidates(manager)
     finally:
         manager.close()
 
@@ -268,7 +298,7 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
             continue
         # 定位源文件
         if taxon_id not in meta_by_taxon:
-            src_dir = _v65d0fd17(
+            src_dir = _resolve_taxon_dir(
                 data_dir, taxon_id,
                 row["scientific_name"], row["common_name"])
             meta_by_taxon[taxon_id] = {"src_dir": str(src_dir) if src_dir else ""}
@@ -307,11 +337,11 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
         sample_row = next(iter(obs_map.values()))[0]
         sci = sample_row["scientific_name"]
         cn = sample_row["common_name"]
-        ranks = _vc94148c4(tree, taxa_meta, taxon_id)
+        ranks = _ancestor_ranks(tree, taxa_meta, taxon_id)
 
         # 类别目录名
         if args.label_scheme == "sci":
-            label = _va74f259f(sci, f"taxon_{taxon_id}")
+            label = _clean_label(sci, f"taxon_{taxon_id}")
         elif args.label_scheme == "cn":
             # 优先取真正含中文的俗名（iNaturalist 优先俗名默认随 locale
             # 常为英文），全无中文时回退学名，避免"cn 目录却是英文名"
@@ -321,8 +351,8 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
                 if re.search(r"[\u4e00-\u9fff]", cand or ""):
                     cn_pick = cand
                     break
-            label = (_va74f259f(cn_pick, "")
-                     or _va74f259f(sci, f"taxon_{taxon_id}"))
+            label = (_clean_label(cn_pick, "")
+                     or _clean_label(sci, f"taxon_{taxon_id}"))
         else:
             label = str(taxon_id)
         # 同名类别去重（不同类群可能同名）
@@ -378,7 +408,7 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
                 mode = ""
                 width, height = row["width"], row["height"]
                 if verify:
-                    ok, vw, vh, vmode = _v2bd3af86(src)
+                    ok, vw, vh, vmode = _verify_image(src)
                     if not ok:
                         stats["corrupted"] += 1
                         corrupt_list.append(str(src))
@@ -393,7 +423,7 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
                             args.min_height and height and height < args.min_height):
                         skip_size += 1
                         continue
-                used = _veedde773(src, dst, args.link)
+                used = _link_or_copy(src, dst, args.link)
                 if used == "hard":
                     stats["hardlinks"] += 1
                 else:
@@ -427,7 +457,7 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_csv = out_dir / "manifest.csv"
     with manifest_csv.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=_v074b6b20,
+        writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS,
                                 extrasaction="ignore")
         writer.writeheader()
         writer.writerows(manifest_rows)
@@ -437,10 +467,10 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # 写出 PyTorch 加载示例
-    _vb6c5bc43(out_dir)
+    write_train_example(out_dir)
 
     # 生成质量报告
-    report = _v9d51188f(out_dir, args, manifest_rows, stats,
+    report = build_report(out_dir, args, manifest_rows, stats,
                           skip_no_file, skip_license, skip_size,
                           dropped_small, corrupt_list, ratios)
     (out_dir / "report.md").write_text(report, encoding="utf-8")
@@ -462,7 +492,8 @@ def _v4c874ce5(args: argparse.Namespace) -> int:
     return 0
 
 
-def _vb6c5bc43(out_dir: Path) -> None:
+def write_train_example(out_dir: Path) -> None:
+    """生成 PyTorch 加载示例脚本（随数据集输出，供训练端直接参考）。"""
     example = '''# -*- coding: utf-8 -*-
 # PyTorch 数据集加载示例（由 dataset 导出命令自动生成）
 # 作者签名：天咏（明月照今日，风摇过两川。）
@@ -510,11 +541,12 @@ class BirdManifestDataset(Dataset):
     (out_dir / "train_example.py").write_text(example, encoding="utf-8")
 
 
-def _v9d51188f(out_dir: Path, args: argparse.Namespace,
+def build_report(out_dir: Path, args: argparse.Namespace,
                  rows: list[dict[str, Any]], stats: dict[str, int],
                  skip_no_file: int, skip_license: int, skip_size: int,
                  dropped_small: list[int], corrupt_list: list[str],
                  ratios: list[float]) -> str:
+    """生成数据质量报告（markdown）。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     per_class: dict[str, int] = {}
     per_split: Counter = Counter()
@@ -585,16 +617,18 @@ def _v9d51188f(out_dir: Path, args: argparse.Namespace,
 
 
 def run(args: argparse.Namespace) -> int:
-    return _v4c874ce5(args)
+    """dataset 子命令入口。"""
+    return export_dataset(args)
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """独立运行入口：python dataset_exporter.py --out 某目录。"""
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    return run(_v536f243a().parse_args())
+    return run(build_parser().parse_args())
 
 
 if __name__ == "__main__":
-    raise SystemExit(_v6f5fe057())
+    raise SystemExit(main())

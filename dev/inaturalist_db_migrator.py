@@ -5,6 +5,15 @@
 # ============================================================
 
 # 天咏 2026-09-07
+"""iNaturalist 鸟类下载项目历史数据迁移脚本。
+
+将已有的 taxon_* 目录下的 observations.csv、photos.csv、summary.json
+以及根目录的 batch_summary.json 导入到 SQLite 两层数据库中。
+
+用法示例：
+    python inaturalist_db_migrator.py
+    python inaturalist_db_migrator.py --out-dir d:/鸟类/iNaturalist/iNaturalist/data
+"""
 
 from __future__ import annotations
 
@@ -16,11 +25,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from inaturalist_db_manager import _vc1f32a11
+from inaturalist_db_manager import INaturalistDatabaseManager
 
 
 # 英文 CSV 字段到中文字段的映射（用于原始库）
-_v688080c6: dict[str, str] = {
+OBS_FIELD_MAP: dict[str, str] = {
     "observation_id": "观察记录ID",
     "uuid": "UUID",
     "uri": "链接",
@@ -55,7 +64,7 @@ _v688080c6: dict[str, str] = {
     "local_photo_files": "本地照片文件",
 }
 
-_v601c3a59: dict[str, str] = {
+PHOTO_FIELD_MAP: dict[str, str] = {
     "observation_id": "观察记录ID",
     "photo_id": "照片ID",
     "position": "位置",
@@ -72,6 +81,7 @@ _v601c3a59: dict[str, str] = {
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
         description="将已有 CSV/JSON 数据迁移到 SQLite 数据库。"
     )
@@ -108,14 +118,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _vbbc13256(args: argparse.Namespace) -> tuple[Path, Path]:
+def _resolve_db_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """根据参数解析出两个数据库的绝对路径。"""
     db_dir = args.db_dir or (args.out_dir / "db")
     raw_db = args.raw_db or (db_dir / "raw_data.db")
     main_db = args.main_db or (db_dir / "bird_observations.db")
     return Path(raw_db), Path(main_db)
 
 
-def _vcef03458(path: Path) -> list[dict[str, Any]]:
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    """读取 CSV 文件为字典列表。"""
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -123,7 +135,8 @@ def _vcef03458(path: Path) -> list[dict[str, Any]]:
         return [row for row in reader]
 
 
-def _vf8eb9384(path: Path) -> dict[str, Any] | None:
+def _read_json(path: Path) -> dict[str, Any] | None:
+    """读取 JSON 文件。"""
     if not path.exists():
         return None
     try:
@@ -132,20 +145,23 @@ def _vf8eb9384(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _v92821f03(obs: dict[str, Any]) -> dict[str, Any]:
-    return {cn: obs.get(en) for en, cn in _v688080c6.items()}
+def _to_chinese_obs(obs: dict[str, Any]) -> dict[str, Any]:
+    """将英文观察记录字段映射为中文字段，用于原始库写入。"""
+    return {cn: obs.get(en) for en, cn in OBS_FIELD_MAP.items()}
 
 
-def _vb2bafc5e(photo: dict[str, Any]) -> dict[str, Any]:
-    return {cn: photo.get(en) for en, cn in _v601c3a59.items()}
+def _to_chinese_photo(photo: dict[str, Any]) -> dict[str, Any]:
+    """将英文照片字段映射为中文字段，用于原始库写入。"""
+    return {cn: photo.get(en) for en, cn in PHOTO_FIELD_MAP.items()}
 
 
-def _v1a0e0328(
-    manager: _vc1f32a11,
+def migrate_taxon_directory(
+    manager: INaturalistDatabaseManager,
     taxon_dir: Path,
     batch_id: int | None,
 ) -> dict[str, Any]:
-    summary = _vf8eb9384(taxon_dir / "summary.json") or {}
+    """迁移单个类群目录的数据到数据库。"""
+    summary = _read_json(taxon_dir / "summary.json") or {}
     taxon_id = summary.get("taxon_id")
     scientific_name = summary.get("scientific_name", "")
     common_name = summary.get("common_name", "")
@@ -169,8 +185,8 @@ def _v1a0e0328(
         label_cn="",
     )
 
-    observations = _vcef03458(taxon_dir / "observations.csv")
-    photos = _vcef03458(taxon_dir / "photos.csv")
+    observations = _read_csv_rows(taxon_dir / "observations.csv")
+    photos = _read_csv_rows(taxon_dir / "photos.csv")
 
     crawl_time = summary.get("batch_time") or datetime.now().isoformat(timespec="seconds")
 
@@ -217,11 +233,12 @@ def _v1a0e0328(
     }
 
 
-def _vdeca8d41(
-    manager: _vc1f32a11,
+def migrate_batch_summary(
+    manager: INaturalistDatabaseManager,
     batch_summary_path: Path,
 ) -> int:
-    data = _vf8eb9384(batch_summary_path)
+    """根据 batch_summary.json 创建一条合成批次记录，返回 batch_id。"""
+    data = _read_json(batch_summary_path)
     if data is None:
         return manager.create_batch_run(
             batch_time=datetime.now().isoformat(timespec="seconds")
@@ -241,9 +258,10 @@ def _vdeca8d41(
     )
 
 
-def _v6f5fe057() -> int:
+def main() -> int:
+    """迁移入口。"""
     args = parse_args()
-    raw_db, main_db = _vbbc13256(args)
+    raw_db, main_db = _resolve_db_paths(args)
 
     print(f"输出目录: {args.out_dir}")
     print(f"原始数据库: {raw_db}")
@@ -253,7 +271,7 @@ def _v6f5fe057() -> int:
         print(f"错误：输出目录不存在 {args.out_dir}")
         return 1
 
-    manager = _vc1f32a11(raw_db, main_db, batch_uuid=args.batch_uuid)
+    manager = INaturalistDatabaseManager(raw_db, main_db, batch_uuid=args.batch_uuid)
 
     # 查找所有 taxon_* 目录
     taxon_dirs = sorted([d for d in args.out_dir.iterdir() if d.is_dir() and d.name.startswith("taxon_")])
@@ -264,7 +282,7 @@ def _v6f5fe057() -> int:
     batch_id: int | None = None
     if batch_summary_path.exists():
         print("检测到 batch_summary.json，创建合成批次记录...")
-        batch_id = _vdeca8d41(manager, batch_summary_path)
+        batch_id = migrate_batch_summary(manager, batch_summary_path)
         print(f"合成批次 ID: {batch_id}")
     else:
         print("未检测到 batch_summary.json，跳过批次关联")
@@ -275,7 +293,7 @@ def _v6f5fe057() -> int:
     for index, taxon_dir in enumerate(taxon_dirs, start=1):
         print(f"[{index}/{len(taxon_dirs)}] 迁移 {taxon_dir.name} ...")
         try:
-            result = _v1a0e0328(manager, taxon_dir, batch_id)
+            result = migrate_taxon_directory(manager, taxon_dir, batch_id)
             results.append(result)
             if "error" in result:
                 errors.append(f"{taxon_dir.name}: {result['error']}")
@@ -308,4 +326,4 @@ def _v6f5fe057() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_v6f5fe057())
+    sys.exit(main())

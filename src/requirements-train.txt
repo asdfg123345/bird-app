@@ -1,0 +1,31 @@
+# 鸟类 v1.7.0 · 模型训练 / 视觉分析环境依赖
+# ============================================================
+# 适用场景：模型训练、模型库、视觉分析（ViT / OWL-ViT / SegFormer / Faster R-CNN）
+# 基础爬虫运行只需：requests + Pillow
+#
+# 安装顺序：
+#   1. 先按显卡驱动安装匹配的 torch / torchvision（见下方示例）
+#   2. 再执行：pip install -r requirements-train.txt
+#
+# CUDA 12.6（与 model_trainer.py 内置提示一致）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# 仅 CPU：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# ============================================================
+
+# 深度学习框架（>=2.3 使用 torch.amp 新接口；旧版由代码自动回退）
+torch>=2.3
+torchvision>=0.18
+
+# 预训练模型与骨干网络
+transformers>=4.40,<5
+timm>=0.9.16
+safetensors>=0.4.0
+
+# 图像处理与视觉分析
+Pillow>=10.0
+opencv-python>=4.8
+numpy>=1.24,<3
+
+# 数据采集与数据集导出
+requests>=2.31

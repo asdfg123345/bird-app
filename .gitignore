@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/
+安装输出/
+发布程序/
+build_tmp/
+程序_混合加密/
+*.exe
+*.db
+*.pth
+*.zip
+本地环境路径.local.json

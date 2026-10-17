@@ -63,6 +63,20 @@ python main.py copyright     # 版权与数字水印信息
 训练前需在页签中选择含 torch 的 Python 解释器；数据集可由 `dataset` 命令导出，
 或从本地层级文件夹导入（train/val/test 自动 8:1:1 划分，验证集为空时自动防护）。
 
+### 模型训练环境配置
+
+训练与视觉分析需要独立的 PyTorch 环境（爬虫主程序只需 `requests` + `Pillow`）。
+完整步骤见 [模型训练环境配置](docs/模型训练环境配置_20261018_001.md)，
+依赖清单见 `src/requirements-train.txt`。速览：
+
+```powershell
+python -m venv .venv-train
+.\.venv-train\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+.\.venv-train\Scripts\python.exe -m pip install -r src\requirements-train.txt
+```
+
+安装后在「模型训练」页把训练解释器指向 `.venv-train\Scripts\python.exe` 即可。
+
 ### 打包发布（可选）
 
 `packaging/` 目录提供完整打包链路：`准备打包源码*.py`（源码指纹水印注入）→

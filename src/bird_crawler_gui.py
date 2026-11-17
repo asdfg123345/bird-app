@@ -52,6 +52,48 @@ DB_DIR = DATA_DIR / "db"
 DEFAULT_RAW_DB = DB_DIR / "raw_data.db"
 DEFAULT_MAIN_DB = DB_DIR / "bird_observations.db"
 
+# ============================================================
+# 界面主题常量（2026-11-17 抽取）
+# ============================================================
+# 背景：界面原先散落 25 种硬编码色值、65 处引用，改配色要动几十处，
+# 也无从做深色模式。此处集中为语义化常量，界面代码只引用常量名。
+# 说明：常量留在本文件而非独立 ui/theme.py，是因为打包链
+# （build_scrambled_release.SOURCE_FILES / build_hybrid_encrypted_release）
+# 按显式模块清单构建发布版，新增顶层模块需同步改打包脚本才有意义；
+# 那属于结构治理阶段，届时把本段整体平移到 ui/theme.py 即可。
+UI_FONT_UI = ("Microsoft YaHei UI", 9)          # 界面默认字体
+UI_FONT_TITLE = ("Microsoft YaHei UI", 14, "bold")
+UI_FONT_LABEL_BOLD = ("Microsoft YaHei UI", 9, "bold")
+UI_FONT_ITALIC = ("Microsoft YaHei UI", 9, "italic")
+UI_FONT_SMALL = ("Microsoft YaHei", 8)          # 缩略图说明
+UI_FONT_MONO = ("Consolas", 9)                  # 日志/终端
+
+CLR_BANNER_BG = "#22384e"        # 顶部横幅底色
+CLR_BANNER_FG = "#ffffff"        # 横幅主标题
+CLR_BANNER_SUB = "#c4d5e5"       # 横幅副标题
+CLR_BANNER_SIGN = "#8fb0cc"      # 横幅签名
+CLR_FG_MUTED = "#8a95a1"         # 次要说明文字（原最高频：25 处）
+CLR_FG_STATUS = "#6b7683"        # 状态栏文字
+CLR_BG_PANEL = "#f4f6f9"         # 浅色面板底
+CLR_BG_PREVIEW = "#eef1f5"       # 模型预览框底
+CLR_FG_SUCCESS = "#1d7a34"       # 成功/进行中
+CLR_FG_SUCCESS_DARK = "#1d6b3a"  # 成功（表格内）
+CLR_FG_ERROR = "#b03030"         # 错误
+CLR_FG_ERROR_DARK = "#a02020"    # 错误（强调）
+CLR_FG_ERROR_ALT = "#b3261e"     # 错误（备用强调）
+CLR_BG_ERROR_SOFT = "#fdecec"    # 错误浅底
+CLR_FG_WARN = "#b06a00"          # 警告
+CLR_FG_WARN_ALT = "#b06818"      # 警告（备用）
+CLR_FG_HIGHLIGHT = "#b04818"     # 高亮强调
+CLR_FG_HINT_DARK = "#8a5a2a"     # 深色底上的提示
+CLR_BG_HINT_SOFT = "#fdf6ec"     # 提示浅底
+CLR_BG_ACTIVE_ROW = "#eaf2fc"    # 激活行底色
+CLR_FG_ACTIVE_ROW = "#185a9d"    # 激活行文字
+CLR_BG_BEST_ROW = "#eaf7ee"      # 最佳轮次行底色
+CLR_FG_STRATEGY = "#2f6f4f"      # 训练策略说明
+CLR_BG_TERMINAL = "#101418"      # 终端日志底（深色）
+CLR_FG_TERMINAL = "#d4e2d4"      # 终端日志字
+
 # 本地环境覆盖文件（与 vision_system/config.py 共用同一份；开发机专用，
 # 安装包打包时排除不随包分发）：本机特有的解释器与外部资源路径写在这里，
 # 代码中不再出现任何硬编码绝对路径
@@ -192,6 +234,85 @@ def _find_vision_system_dir() -> Path | None:
     return latest
 
 
+# ============================================================
+# 版本号单一来源解析（界面上显示的版本必须与 main.py 的 APP_VERSION 一致）
+# ============================================================
+def _app_version() -> str:
+    """取程序版本号，单一来源为 main.py 的 APP_VERSION。
+
+    解析顺序：
+      1. 已在 sys.modules 中的 main / __main__ 模块（正常经 `python main.py gui`
+         启动时，__main__ 就是 main.py，直接读常量，零开销、零副作用）；
+      2. 尚未加载时导入 main 模块（如直接 `python bird_crawler_gui.py` 启动）；
+      3. 都拿不到（极端裁剪环境）返回空串，由调用方降级为不带版本号的标题。
+    绝不硬编码版本号字面量，避免与打包脚本/README 出现版本漂移。
+    """
+    for mod_name in ("main", "__main__"):
+        mod = sys.modules.get(mod_name)
+        value = getattr(mod, "APP_VERSION", "") if mod is not None else ""
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    try:
+        import main as _main_module
+        value = getattr(_main_module, "APP_VERSION", "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+    return ""
+
+
+# ============================================================
+# DPI 感知与像素缩放（2026-11-17 新增）
+# ============================================================
+# 背景：未声明 DPI 感知时，Windows 会把整个窗口当位图拉伸，125%/150% 缩放下
+# 界面发虚。但只声明感知而不缩放固定像素尺寸会更糟——文字按真实 DPI 放大、
+# 窗口与图片框仍是原像素，结果是文字被裁、留白错位。因此这里成对处理：
+#   1) 在创建任何窗口之前声明进程 DPI 感知（Win8.1+ shcore，Win7 回退 user32）；
+#   2) 读出系统 DPI，得到缩放系数；
+#   3) 界面上少量「真像素」尺寸（窗口、横幅高度、预览框、缩略图）统一走 px()；
+#      以字符/行数为单位的控件尺寸（Entry width、Text height 等）由 Tk 随字体
+#      自动缩放，无需处理。
+_UI_SCALE: float | None = None
+
+
+def _detect_dpi_scale() -> float:
+    """声明进程 DPI 感知并返回缩放系数（非 Windows 或失败时返回 1.0）。"""
+    if sys.platform != "win32":
+        return 1.0
+    scale = 1.0
+    try:
+        import ctypes
+        try:
+            # 1 = PROCESS_SYSTEM_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()      # Win7 回退
+        hdc = ctypes.windll.user32.GetDC(0)
+        try:
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)   # LOGPIXELSX
+        finally:
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        if dpi and dpi > 0:
+            scale = max(1.0, float(dpi) / 96.0)
+    except Exception:
+        scale = 1.0                                         # 任何异常都退回 1.0
+    return scale
+
+
+def ui_scale() -> float:
+    """取 DPI 缩放系数（首次调用时完成 DPI 感知声明，结果缓存）。"""
+    global _UI_SCALE
+    if _UI_SCALE is None:
+        _UI_SCALE = _detect_dpi_scale()
+    return _UI_SCALE
+
+
+def px(value: int) -> int:
+    """把设计稿像素值换算成当前 DPI 下的实际像素。"""
+    return int(round(value * ui_scale()))
+
+
 class BirdCrawlerGUI:
     """桌面控制台主窗口。"""
 
@@ -216,10 +337,20 @@ class BirdCrawlerGUI:
         self._ph_offset = 0                              # 照片分页偏移
 
         # 标题栏嵌入版本号与版权标识（程序数字水印的界面层）
-        root.title("鸟类爬虫控制台 v1.5.1 - iNaturalist 数据采集与浏览 | © 2026 天咏")
-        root.geometry("1080x760")
-        root.minsize(960, 660)
-        root.option_add("*Font", ("Microsoft YaHei UI", 9))
+        # 版本号不再硬编码：统一取 main.py 的 APP_VERSION 单一来源，
+        # 避免出现「README 写 v1.7.0、窗口标题写 v1.5.1」的不一致。
+        _ver = _app_version()
+        root.title(f"鸟类爬虫控制台 v{_ver} - iNaturalist 数据采集与浏览 | © 2026 天咏"
+                   if _ver else
+                   "鸟类爬虫控制台 - iNaturalist 数据采集与浏览 | © 2026 天咏")
+        # 窗口尺寸按 DPI 缩放系数换算；同时受屏幕可用区域约束，
+        # 避免 150% 缩放下默认窗口超出屏幕
+        _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        _w = min(px(1080), int(_sw * 0.92))
+        _h = min(px(760), int(_sh * 0.90))
+        root.geometry(f"{_w}x{_h}")
+        root.minsize(min(px(960), _w), min(px(660), _h))
+        root.option_add("*Font", UI_FONT_UI)
         # 窗口图标：星云封面（资源缺失时静默回退系统默认图标）
         try:
             self._icon_img = tk.PhotoImage(
@@ -236,31 +367,125 @@ class BirdCrawlerGUI:
         self._poll_drop_queue()
         self._poll_train_queue()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._bind_shortcuts()
         # 启动早期检测 Pillow：缺失时弹窗提供一键安装（可跳过，不影响其余功能）
         if not HAS_PIL:
             root.after(300, self._prompt_pillow_install)
 
     # ================= 界面构建 =================
+    def _bind_shortcuts(self) -> None:
+        """绑定常用键盘快捷键（2026-11-17 新增）。
+
+        - F5            刷新当前页签依赖的数据（原先每个页都要先切过去再点按钮）
+        - Ctrl+Enter    当前页签的主操作（下载/拖入/生成数据集/开始训练）
+        绑定在顶层窗口而非 bind_all，避免与 Text/Treeview 的内部按键冲突。
+        """
+        self.root.bind("<F5>", lambda _e: self._refresh_current_view())
+        self.root.bind("<Control-Return>", self._shortcut_primary_action)
+
+    def _current_tab_label(self) -> str:
+        """当前选中页签的文案（去空白）；取不到时返回空串。"""
+        try:
+            return self.notebook.tab(self.notebook.select(), "text").strip()
+        except Exception:
+            return ""
+
+    def _refresh_current_view(self) -> None:
+        """F5：按当前页签刷新对应数据，不切换页签。"""
+        label = self._current_tab_label()
+        try:
+            self._refresh_taxon_filters()
+        except Exception:
+            pass
+        try:
+            if label in ("模型库", "模型训练"):
+                self.refresh_models()
+            elif label == "训练数据集":
+                self._load_dataset_taxa()
+                self._refresh_dataset_list()
+            elif label == "数据浏览":
+                self._load_observations()
+            elif label == "照片浏览":
+                self._load_photos()
+            elif label == "统计与说明":
+                self._load_stats()
+        except Exception as exc:            # 刷新失败只在状态栏提示，不弹窗打断
+            self.status_var.set(f"刷新失败：{exc}")
+            self.status_label.config(foreground=CLR_FG_ERROR)
+            return
+        self.status_var.set("就绪" if not self._active_tasks
+                            else " / ".join(self._active_tasks.values()))
+
+    def _shortcut_primary_action(self, _event=None) -> str:
+        """Ctrl+Enter：触发当前页签的主操作。返回 "break" 阻止默认行为。"""
+        label = self._current_tab_label()
+        handler = {
+            "下载控制": self._start_download,
+            "拖入文件爬取": self._start_drop_file,
+            "训练数据集": self._start_dataset_export,
+            "模型训练": self._start_train,
+        }.get(label)
+        if handler is not None:
+            handler()
+        return "break"
+
     def _build_banner(self) -> None:
         """顶部签名横幅（深色底，展示项目名与作者签名）。"""
-        banner = tk.Frame(self.root, bg="#22384e", height=58)
+        banner = tk.Frame(self.root, bg=CLR_BANNER_BG, height=px(58))
         banner.pack(fill=tk.X)
         banner.pack_propagate(False)
-        tk.Label(banner, text="鸟类爬虫控制台", bg="#22384e", fg="#ffffff",
+        tk.Label(banner, text="鸟类爬虫控制台", bg=CLR_BANNER_BG, fg=CLR_BANNER_FG,
                  font=("Microsoft YaHei UI", 14, "bold")).pack(side=tk.LEFT, padx=(16, 8))
-        tk.Label(banner, text="iNaturalist 数据采集与图像下载系统", bg="#22384e",
-                 fg="#c4d5e5").pack(side=tk.LEFT, pady=(8, 0))
-        tk.Label(banner, text="签名：天咏（明月照今日，风摇过两川。）", bg="#22384e",
-                 fg="#8fb0cc", font=("Microsoft YaHei UI", 9, "italic")).pack(
+        tk.Label(banner, text="iNaturalist 数据采集与图像下载系统", bg=CLR_BANNER_BG,
+                 fg=CLR_BANNER_SUB).pack(side=tk.LEFT, pady=(8, 0))
+        tk.Label(banner, text="签名：天咏（明月照今日，风摇过两川。）", bg=CLR_BANNER_BG,
+                 fg=CLR_BANNER_SIGN, font=("Microsoft YaHei UI", 9, "italic")).pack(
             side=tk.RIGHT, padx=16)
 
     def _build_status_bar(self) -> None:
-        """底部状态栏（数据库路径 + 就绪标识）。"""
+        """底部状态栏（数据库路径 + 全局任务状态）。
+
+        状态文字不再恒为「就绪」：四个后台任务（下载/拖入/数据集/训练）
+        启动与结束时通过 _set_status() 更新，用户在任意页签都能看到后台是否在跑。
+        """
         bar = ttk.Frame(self.root, padding=(10, 3))
         bar.pack(fill=tk.X, side=tk.BOTTOM)
         ttk.Label(bar, text=f"数据库：{DEFAULT_MAIN_DB}",
-                  foreground="#6b7683").pack(side=tk.LEFT)
-        ttk.Label(bar, text="就绪", foreground="#6b7683").pack(side=tk.RIGHT)
+                  foreground=CLR_FG_STATUS).pack(side=tk.LEFT)
+        self.status_var = tk.StringVar(value="就绪")
+        self.status_label = ttk.Label(bar, textvariable=self.status_var,
+                                      foreground=CLR_FG_STATUS)
+        self.status_label.pack(side=tk.RIGHT)
+        # 记录当前正在跑的后台任务集合，任一任务结束只移除自己那一项，
+        # 避免「训练结束时把仍在跑的下载状态也清成就绪」
+        self._active_tasks: dict[str, str] = {}
+
+    def _set_status(self, task: str | None, label: str = "",
+                    color: str | None = None) -> None:
+        """更新全局任务状态。
+
+        task 为 None 表示清空全部任务（回到就绪）；否则登记/更新该任务的状态文字。
+        """
+        if task is None:
+            self._active_tasks.clear()
+        else:
+            self._active_tasks[task] = label or task
+        if self._active_tasks:
+            self.status_var.set(" / ".join(self._active_tasks.values()))
+            self.status_label.config(foreground=color or CLR_FG_SUCCESS)
+        else:
+            self.status_var.set("就绪")
+            self.status_label.config(foreground=color or CLR_FG_STATUS)
+
+    def _clear_task_status(self, task: str) -> None:
+        """移除某个任务的进行中状态（该任务结束时调用）。"""
+        self._active_tasks.pop(task, None)
+        if self._active_tasks:
+            self.status_var.set(" / ".join(self._active_tasks.values()))
+            self.status_label.config(foreground=CLR_FG_SUCCESS)
+        else:
+            self.status_var.set("就绪")
+            self.status_label.config(foreground=CLR_FG_STATUS)
 
     def _build_notebook(self) -> None:
         """构建各功能标签页（模型库页插在模型训练页之后）并应用统一样式。"""
@@ -270,50 +495,92 @@ class BirdCrawlerGUI:
             if theme in style.theme_names():
                 style.theme_use(theme)
                 break
-        style.configure("TNotebook.Tab", padding=(18, 7),
-                        font=("Microsoft YaHei UI", 9))
-        style.configure("TLabelframe.Label", font=("Microsoft YaHei UI", 9, "bold"))
-        style.configure("Accent.TButton", font=("Microsoft YaHei UI", 9, "bold"))
+        style.configure("TNotebook.Tab", padding=(10, 7),
+                        font=UI_FONT_UI)
+        style.configure("TLabelframe.Label", font=UI_FONT_LABEL_BOLD)
+        style.configure("Accent.TButton", font=UI_FONT_LABEL_BOLD)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self._build_download_tab()
-        self._build_drop_tab()
-        self._build_dataset_tab()
-        self._build_train_tab()
-        self._build_models_tab()
-        self._build_vision_tab()
-        self._build_browse_tab()
-        self._build_photos_tab()
-        self._build_stats_tab()
+        # 页签按业务流程分组排序：采集 → 数据 → 模型 → 分析 → 系统。
+        # 原顺序把「模型训练/模型库/视觉分析」夹在「训练数据集」与「浏览类」
+        # 之间，用户要来回跳；按流程重排后同组页签相邻。
+        # 注意：页签切换一律用控件引用（如 self._train_tab_frame、self._vision_tab），
+        # 不依赖页签序号，因此重排不会影响任何跳转逻辑。
+        self._build_download_tab()      # 采集：批量下载
+        self._build_drop_tab()          # 采集：拖入清单/图片
+        self._build_dataset_tab()       # 数据：导出训练集
+        self._build_browse_tab()        # 数据：观察记录浏览
+        self._build_photos_tab()        # 数据：照片浏览
+        self._build_train_tab()         # 模型：训练
+        self._build_models_tab()        # 模型：模型库
+        self._build_vision_tab()        # 分析：视觉问答
+        self._build_stats_tab()         # 系统：统计与说明
+        self._apply_tab_group_spacing()
+
+    # 每个分组第一个页签的额外左内边距（视觉上把分组隔开）
+    _TAB_GROUP_STARTS = ("训练数据集", "模型训练", "视觉分析", "统计与说明")
+    _TAB_GROUP_PAD_LEFT = 26
+
+    def _apply_tab_group_spacing(self) -> None:
+        """给每个分组的首个页签加左内边距，形成视觉分组间隔。
+
+        ttk.Notebook 没有原生分组概念，用「组首页签更大的左内边距」
+        作为轻量替代，不改变任何页签的点击与切换行为。
+        """
+        for tab_id in self.notebook.tabs():
+            text = self.notebook.tab(tab_id, "text").strip()
+            try:
+                if text in self._TAB_GROUP_STARTS:
+                    self.notebook.tab(tab_id,
+                                      padding=(self._TAB_GROUP_PAD_LEFT, 7))
+                else:
+                    self.notebook.tab(tab_id, padding=(10, 7))
+            except tk.TclError:
+                pass                    # 主题不支持逐页签 padding 时保持默认
 
     # ---------- 标签页 1：下载控制 ----------
     def _build_download_tab(self) -> None:
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 下载控制 ")
+        self.notebook.add(page, text="下载控制")
 
         # 左侧：参数区
         left = ttk.Frame(page, padding=8)
         left.pack(side=tk.LEFT, fill=tk.Y)
 
-        # 类群选择列表
-        # 类群选择：默认不做任何选择即代表全部 15 科尽量爬取（无需先选数据再爬取）
-        group = ttk.LabelFrame(left, text=" 选择要下载的类群（可 Ctrl 多选；不选=全部 15 科尽量爬取） ", padding=6)
-        group.pack(fill=tk.BOTH, expand=True)
-        self.taxon_listbox = tk.Listbox(group, selectmode=tk.EXTENDED,
-                                        height=14, exportselection=False)
-        for tid, name in DEFAULT_TAXA:
-            self.taxon_listbox.insert(tk.END, f"{tid}   {name}")
-        self.taxon_listbox.pack(fill=tk.BOTH, expand=True)
+        # ---------- 垂直空间分配策略（2026-11-17 修复「开始下载」按钮不可见） ----------
+        # Tk 的 pack 按调用顺序切分空腔：空间不足时，后打包的控件会被压成 0 高。
+        # 原实现把按钮行放在最后打包，实测默认窗口 1080x760 下按钮帧高被挤成 1px，
+        # 主功能入口完全不可见（详见界面分析 UI-P0-A）。
+        # 现改为「自底向上占位」：先给按钮行，再给参数区、自定义 ID 区，最后才给
+        # 类群列表——列表自带滚动条，窗口变矮时由它承担压缩，关键按钮始终可见。
+        btns = ttk.Frame(left)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+
+        params = ttk.LabelFrame(left, text=" 下载参数 ", padding=6)
+        params.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
 
         custom = ttk.LabelFrame(left, text=" 或输入自定义类群 ID（逗号分隔，优先于上方选择） ", padding=6)
-        custom.pack(fill=tk.X, pady=(6, 0))
+        custom.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 6))
+
+        # 类群选择：最后打包，占据剩余高度（不选=全部 15 科尽量爬取，
+        # 无需先选数据再爬取）；列表与滚动条同处一个 wrapper，压缩时不丢失滚动能力
+        group = ttk.LabelFrame(left, text=" 选择要下载的类群（可 Ctrl 多选；不选=全部 15 科尽量爬取） ", padding=6)
+        group.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        list_wrap = ttk.Frame(group)
+        list_wrap.pack(fill=tk.BOTH, expand=True)
+        self.taxon_listbox = tk.Listbox(list_wrap, selectmode=tk.EXTENDED,
+                                        height=8, exportselection=False)
+        for tid, name in DEFAULT_TAXA:
+            self.taxon_listbox.insert(tk.END, f"{tid}   {name}")
+        taxon_list_bar = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL,
+                                       command=self.taxon_listbox.yview)
+        self.taxon_listbox.configure(yscrollcommand=taxon_list_bar.set)
+        self.taxon_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        taxon_list_bar.pack(side=tk.RIGHT, fill=tk.Y)
+
         self.custom_taxon_var = tk.StringVar()
         ttk.Entry(custom, textvariable=self.custom_taxon_var).pack(fill=tk.X)
-
-        # 下载参数
-        params = ttk.LabelFrame(left, text=" 下载参数 ", padding=6)
-        params.pack(fill=tk.X, pady=6)
 
         row1 = ttk.Frame(params); row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="每类群观察上限:").pack(side=tk.LEFT)
@@ -339,8 +606,8 @@ class BirdCrawlerGUI:
         ttk.Spinbox(row3, from_=1, to=16, textvariable=self.workers_var,
                     width=8).pack(side=tk.LEFT, padx=4)
 
-        # 操作按钮
-        btns = ttk.Frame(left); btns.pack(fill=tk.X, pady=4)
+        # 操作按钮（btns 已在本方法开头创建并以 side=BOTTOM 占住底部空间，
+        # 保证任何窗口高度下都可见可点）
         self.start_btn = ttk.Button(btns, text="开始下载", command=self._start_download)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(btns, text="停止下载", command=self._stop_download,
@@ -361,7 +628,7 @@ class BirdCrawlerGUI:
     def _build_drop_tab(self) -> None:
         """构建拖入文件爬取标签页（对接 drop_crawl_interface.py 接口）。"""
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 拖入文件爬取 ")
+        self.notebook.add(page, text="拖入文件爬取")
 
         # 文件选择行（文本清单与图片均支持，可多选）
         top = ttk.Frame(page, padding=8)
@@ -413,13 +680,13 @@ class BirdCrawlerGUI:
         self.drop_watch_btn = ttk.Button(watch, text="启动监视 data/drop_inbox",
                                          command=self._toggle_drop_watch)
         self.drop_watch_btn.pack(side=tk.LEFT)
-        self.drop_watch_state = ttk.Label(watch, text="未启动", foreground="#8a95a1")
+        self.drop_watch_state = ttk.Label(watch, text="未启动", foreground=CLR_FG_MUTED)
         self.drop_watch_state.pack(side=tk.LEFT, padx=10)
         ttk.Button(watch, text="打开投放目录",
                    command=self._open_drop_inbox).pack(side=tk.LEFT, padx=6)
         ttk.Label(watch, text="监视模式下将 txt/csv 放入投放目录即自动爬取；"
                               "也可直接把文件拖到「拖入文件自动爬取.bat」图标上。",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=8)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=8)
 
         # 导入进度条：由子进程输出的 [进度] 行驱动，用户可直观看到当前导入进展
         prog = ttk.Frame(page, padding=(8, 2, 8, 0))
@@ -429,7 +696,7 @@ class BirdCrawlerGUI:
             prog, variable=self.drop_progress_var, maximum=100)
         self.drop_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.drop_progress_label = ttk.Label(prog, text="空闲",
-                                             foreground="#8a95a1")
+                                             foreground=CLR_FG_MUTED)
         self.drop_progress_label.pack(side=tk.LEFT, padx=8)
 
         # 处理报告
@@ -488,10 +755,11 @@ class BirdCrawlerGUI:
         self.drop_proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
+        self._set_status("drop", "拖入处理中…")
         self._append_drop_report(f"\n===== 启动拖入处理：{' '.join(cmd[1:])} =====\n")
         # 复位进度条与标签：每轮启动重新从 0 开始
         self.drop_progress_var.set(0.0)
-        self.drop_progress_label.config(text="准备导入…", foreground="#8a95a1")
+        self.drop_progress_label.config(text="准备导入…", foreground=CLR_FG_MUTED)
         self._drop_progress_photo_mode = False
         self.drop_stop_btn.config(state=tk.NORMAL)
         threading.Thread(target=self._read_drop_output, daemon=True).start()
@@ -510,7 +778,7 @@ class BirdCrawlerGUI:
             self._stop_drop()
             return
         self._spawn_drop_proc(["--watch"])
-        self.drop_watch_state.config(text="监视中：等待放入文件…", foreground="#1d7a34")
+        self.drop_watch_state.config(text="监视中：等待放入文件…", foreground=CLR_FG_SUCCESS)
         self.drop_watch_btn.config(text="停止监视")
 
     def _stop_drop(self) -> None:
@@ -550,7 +818,7 @@ class BirdCrawlerGUI:
                             cur / total * 100 if total else 0.0)
                     self.drop_progress_label.config(
                         text=f"种类 {cur}/{total}「{m.group(3)}」",
-                        foreground="#1d7a34")
+                        foreground=CLR_FG_SUCCESS)
                     continue
                 m = _DROP_PROGRESS_PHOTO_RE.match(line)
                 if m:
@@ -562,9 +830,10 @@ class BirdCrawlerGUI:
                     continue
                 self._append_drop_report(line)
                 if "[拖入处理进程已结束" in line:
+                    self._clear_task_status("drop")
                     self.drop_stop_btn.config(state=tk.DISABLED)
                     self.drop_watch_btn.config(text="启动监视 data/drop_inbox")
-                    self.drop_watch_state.config(text="未启动", foreground="#8a95a1")
+                    self.drop_watch_state.config(text="未启动", foreground=CLR_FG_MUTED)
                     # 按返回码分支提示：0=正常入库；非 0=出错或被用户终止
                     try:
                         rc = int(line.rsplit("rc=", 1)[-1].strip("]\n "))
@@ -574,10 +843,10 @@ class BirdCrawlerGUI:
                     if rc == 0:
                         self.drop_progress_var.set(100.0)
                         self.drop_progress_label.config(
-                            text="导入完成", foreground="#1d7a34")
+                            text="导入完成", foreground=CLR_FG_SUCCESS)
                     else:
                         self.drop_progress_label.config(
-                            text="处理已结束（未完整）", foreground="#b3261e")
+                            text="处理已结束（未完整）", foreground=CLR_FG_ERROR_ALT)
                     if rc == 0:
                         # 导入完成引导：提示到「训练数据集」页签勾选类群生成训练数据集
                         self._append_drop_report(
@@ -611,16 +880,23 @@ class BirdCrawlerGUI:
         登记进 data/train_datasets/registry.json，训练页下拉即可选用。
         """
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 训练数据集 ")
+        self.notebook.add(page, text="训练数据集")
 
         # 主体左右分栏：左侧类群勾选，右侧参数与数据集列表
+        # 用 grid 而非 pack：两栏都 pack(expand=True) 时 Tk 按各自请求宽度均分，
+        # 窗口变窄会直接裁掉右栏（实测 960 宽下右栏溢出 126px，「每类最多」
+        # 「标签方式」「删除」「刷新列表」完全不可达）。grid 下把右栏权重设为 0，
+        # 空间不足时只压缩左栏（其 Treeview 自带滚动条），右栏始终保足。
         body = ttk.Frame(page)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        body.columnconfigure(0, weight=1)   # 左栏：可压缩
+        body.columnconfigure(1, weight=0)   # 右栏：保持请求宽度
+        body.rowconfigure(0, weight=1)
 
         # ---------- 左侧：库内类群勾选列表 ----------
         left = ttk.LabelFrame(body, text=" 库内类群（勾选参与训练的类群） ",
                               padding=6)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left.grid(row=0, column=0, sticky="nsew")
 
         bar = ttk.Frame(left); bar.pack(fill=tk.X)
         ttk.Label(bar, text="搜索:").pack(side=tk.LEFT)
@@ -661,7 +937,7 @@ class BirdCrawlerGUI:
 
         # ---------- 右侧：生成参数 + 已生成数据集列表 ----------
         right = ttk.Frame(body)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         gen = ttk.LabelFrame(right, text=" 生成参数 ", padding=6)
         gen.pack(fill=tk.X)
@@ -701,7 +977,7 @@ class BirdCrawlerGUI:
         self.ds_generate_btn.pack(side=tk.LEFT)
         ttk.Label(row3, text="（硬链接零拷贝导出到 data/train_datasets/，"
                              "按观察级划分防泄漏）",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=8)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=8)
 
         lst = ttk.LabelFrame(right, text=" 已生成数据集（双击用于训练） ",
                              padding=6)
@@ -877,6 +1153,7 @@ class BirdCrawlerGUI:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
         self.ds_generate_btn.config(state=tk.DISABLED)
+        self._set_status("dataset", "数据集导出中…")
         self._append_ds_log(
             f"\n===== 开始生成数据集「{name}」：勾选 {len(taxon_ids)} 个类群 =====\n")
         self.ds_export_proc = subprocess.Popen(  # noqa: S603
@@ -911,6 +1188,7 @@ class BirdCrawlerGUI:
 
     def _on_ds_export_done(self, rc: int) -> None:
         """生成子进程结束：成功登记注册表并刷新联动，失败清理半成品目录。"""
+        self._clear_task_status("dataset")
         self.ds_generate_btn.config(state=tk.NORMAL)
         out_dir = self._ds_export_out_dir
         name = dataset_registry.clean_name(self.ds_name_var.get())
@@ -1027,7 +1305,7 @@ class BirdCrawlerGUI:
         容器：窗口不够高时可拖动滚动条查看全部区域，避免底部区域被裁掉。
         """
         outer = ttk.Frame(self.notebook)
-        self.notebook.add(outer, text=" 模型训练 ")
+        self.notebook.add(outer, text="模型训练")
         # 记录训练页容器引用，供「训练数据集」页签「用于训练」按钮切换页签
         self._train_tab_frame = outer
         canvas = tk.Canvas(outer, highlightthickness=0)
@@ -1051,8 +1329,20 @@ class BirdCrawlerGUI:
         canvas.bind("<Configure>", _stretch_width)
 
         def _on_wheel(event) -> None:
-            """鼠标滚轮滚动训练页（仅在本页范围内生效）。"""
-            canvas.yview_scroll(int(-event.delta / 120), "units")
+            """鼠标滚轮滚动训练页（仅在本页范围内生效）。
+
+            绑在 bind_all 上是为了让页面任意位置都能滚，但页面内部还有自带滚动的
+            控件（训练日志 ScrolledText、指标表 Treeview、下拉框列表）。这些控件
+            的类绑定会先把事件消费掉，bind_all 仍会再触发一次，导致「滚日志时整页
+            跟着滚」的双重滚动。因此先判断事件源，落在这些控件上就交还给它们自己。
+            """
+            w = event.widget
+            if isinstance(w, (tk.Text, tk.Listbox, ttk.Treeview, ttk.Combobox)):
+                return
+            # Tk 在 Windows 上 delta 为 ±120 的整数倍
+            delta = int(-event.delta / 120) if event.delta else 0
+            if delta:
+                canvas.yview_scroll(delta, "units")
 
         outer.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
         outer.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
@@ -1071,7 +1361,7 @@ class BirdCrawlerGUI:
         self.train_task_combo.pack(side=tk.LEFT, padx=4)
         self.train_task_combo.bind(
             "<<ComboboxSelected>>", self._on_train_task_changed)
-        self.train_task_hint = ttk.Label(row_task, text="", foreground="#8a95a1")
+        self.train_task_hint = ttk.Label(row_task, text="", foreground=CLR_FG_MUTED)
         self.train_task_hint.pack(side=tk.LEFT, padx=8)
 
         row_env = ttk.Frame(env); row_env.pack(fill=tk.X, pady=2)
@@ -1083,7 +1373,7 @@ class BirdCrawlerGUI:
                    command=self._browse_train_python).pack(side=tk.LEFT)
         ttk.Button(row_env, text="检测依赖",
                    command=self._check_train_deps).pack(side=tk.LEFT, padx=6)
-        self.train_dep_label = ttk.Label(row_env, text="", foreground="#8a95a1")
+        self.train_dep_label = ttk.Label(row_env, text="", foreground=CLR_FG_MUTED)
         self.train_dep_label.pack(side=tk.LEFT, padx=8)
 
         row_data = ttk.Frame(env); row_data.pack(fill=tk.X, pady=2)
@@ -1113,7 +1403,7 @@ class BirdCrawlerGUI:
             command=self._on_resume_toggled)
         self.train_resume_check.pack(side=tk.LEFT)
         self.train_resume_label = ttk.Label(row_resume, text="",
-                                            foreground="#8a95a1")
+                                            foreground=CLR_FG_MUTED)
         self.train_resume_label.pack(side=tk.LEFT, padx=8)
         self._refresh_resume_state()
 
@@ -1148,14 +1438,14 @@ class BirdCrawlerGUI:
         self._base_model_hint_label = ttk.Label(
             row_foundation,
             text="（训练起点；选模型库模型即以其权重继续微调）",
-            foreground="#8a95a1")
+            foreground=CLR_FG_MUTED)
         self._base_model_hint_label.pack(side=tk.LEFT)
         self._base_model_id = "resnet50"     # 当前选中的基础模型 id
         self._refresh_base_model_options()
 
         # 训练策略说明：随所选基础模型的架构联动刷新（只读提示）
         self.train_strategy_label = ttk.Label(
-            mode, text="", foreground="#2f6f4f", wraplength=780, justify=tk.LEFT)
+            mode, text="", foreground=CLR_FG_STRATEGY, wraplength=780, justify=tk.LEFT)
         self.train_strategy_label.pack(anchor=tk.W, pady=(2, 0))
         self._update_train_strategy_label()
 
@@ -1166,15 +1456,15 @@ class BirdCrawlerGUI:
         ttk.Entry(row_base, textvariable=self.train_model_base_var,
                   width=18).pack(side=tk.LEFT, padx=4)
         ttk.Label(row_base, text="（用于训练产物命名：基名_月日_版本）",
-                  foreground="#8a95a1").pack(side=tk.LEFT)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT)
 
         # 模式说明区：只读文本，随单选切换即时刷新
         self.train_mode_desc = tk.Text(
             mode, height=9, wrap="word", relief="flat", bd=0,
-            bg="#f4f6f9", font=("Microsoft YaHei UI", 9), state=tk.DISABLED)
+            bg=CLR_BG_PANEL, font=("Microsoft YaHei UI", 9), state=tk.DISABLED)
         self.train_mode_desc.pack(fill=tk.X, pady=(4, 0))
         self.train_mode_desc.tag_configure(
-            "mode_hl", foreground="#b04818",
+            "mode_hl", foreground=CLR_FG_HIGHLIGHT,
             font=("Microsoft YaHei UI", 9, "bold"))
 
         # 训练参数：轮数/优化器/耐心值/学习率各模式均可自定义（自动填入推荐值）
@@ -1234,11 +1524,11 @@ class BirdCrawlerGUI:
         ttk.Spinbox(row_workers, from_=0, to=16, textvariable=self.train_workers_var,
                     width=5).pack(side=tk.LEFT, padx=2)
         ttk.Label(row_workers, text="0=自动(按模式推导)；1-16=固定加载进程数",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=10)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=10)
 
         # 保存位置提示：训练产物统一走模型库入库流程，不再自选输出目录
         ttk.Label(params, text=f"模型将保存至模型库：{ml.MODEL_LIBRARY_DIR}",
-                  foreground="#8a95a1").pack(anchor=tk.W, pady=(2, 0))
+                  foreground=CLR_FG_MUTED).pack(anchor=tk.W, pady=(2, 0))
 
         # 数据划分与评估：4 级划分预设（含自定义）+ 最佳模型判据
         divide = ttk.LabelFrame(page, text=" 数据划分与评估 ", padding=6)
@@ -1255,13 +1545,13 @@ class BirdCrawlerGUI:
             values=list(ml.SPLIT_PRESET_LABELS.values()))
         self.train_split_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(row_split, text="训练:验证:检测 =",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=(6, 2))
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=(6, 2))
         self.train_split_ratio_var = tk.StringVar(value="8,1,1")
         self.train_split_ratio_entry = ttk.Entry(
             row_split, textvariable=self.train_split_ratio_var, width=12)
         self.train_split_ratio_entry.pack(side=tk.LEFT)
         ttk.Label(row_split, text="（选「使用目录既有划分」时忽略比例）",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=6)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=6)
         # 类别极少的场合自动保底（小类全进训练集/不进检测集），无需手工调整
 
         row_metric = ttk.Frame(divide); row_metric.pack(fill=tk.X, pady=2)
@@ -1276,7 +1566,7 @@ class BirdCrawlerGUI:
             values=list(ml.SELECT_METRIC_OPTIONS.values()))
         self.train_metric_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(row_metric, text="（按该指标保存最佳模型并驱动早停）",
-                  foreground="#8a95a1").pack(side=tk.LEFT, padx=6)
+                  foreground=CLR_FG_MUTED).pack(side=tk.LEFT, padx=6)
 
         # 初始化说明文字与自定义参数可用状态
         self._on_train_mode_changed()
@@ -1322,15 +1612,15 @@ class BirdCrawlerGUI:
         self.train_metric_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         metric_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         # 最佳轮次行高亮
-        self.train_metric_tree.tag_configure("best_row", background="#eaf7ee",
-                                             foreground="#1d6b3a")
+        self.train_metric_tree.tag_configure("best_row", background=CLR_BG_BEST_ROW,
+                                             foreground=CLR_FG_SUCCESS_DARK)
 
         # 训练进程输出（终端日志实时显示）；在滚动容器内用固定行高保证可见
         ttk.Label(page, text="训练进程输出（实时显示终端日志）",
                   padding=(10, 6, 0, 0)).pack(anchor=tk.W)
         self.train_log = scrolledtext.ScrolledText(page, state=tk.DISABLED,
                                                    font=("Consolas", 9),
-                                                   bg="#101418", fg="#d4e2d4",
+                                                   bg=CLR_BG_TERMINAL, fg=CLR_FG_TERMINAL,
                                                    height=14)
         self.train_log.pack(fill=tk.X, padx=8, pady=(2, 10))
 
@@ -1455,12 +1745,12 @@ class BirdCrawlerGUI:
                 text=f"检测到断点：{info.get('model_name') or '—'}"
                      f"（已完成 {info.get('completed_epoch')} 轮，"
                      f"{info.get('timestamp') or '—'}）",
-                foreground="#b06a00")
+                foreground=CLR_FG_WARN)
         else:
             check.config(state=tk.DISABLED)
             if self.train_resume_var.get():
                 self.train_resume_var.set(False)
-            label.config(text="暂无中断记录", foreground="#8a95a1")
+            label.config(text="暂无中断记录", foreground=CLR_FG_MUTED)
 
     def _on_resume_toggled(self) -> None:
         """续训勾选回调：展示断点信息并确认续训语义。"""
@@ -1791,7 +2081,7 @@ class BirdCrawlerGUI:
         if not py:
             # 冻结形态下无可用外部解释器：明确提示而非执行报错
             self.train_dep_label.config(
-                text="未配置可用的训练解释器", foreground="#b03030")
+                text="未配置可用的训练解释器", foreground=CLR_FG_ERROR)
             return
         code = (
             "import importlib.util as u\n"
@@ -1808,17 +2098,17 @@ class BirdCrawlerGUI:
                     deps[parts[1]] = parts[2]
             if deps and all(v == "True" for v in deps.values()):
                 self.train_dep_label.config(
-                    text="依赖就绪（torch/torchvision/PIL）", foreground="#1d7a34")
+                    text="依赖就绪（torch/torchvision/PIL）", foreground=CLR_FG_SUCCESS)
             else:
                 miss = [k for k, v in deps.items() if v != "True"]
                 if not miss and out.returncode != 0:
                     self.train_dep_label.config(
-                        text="解释器不可用或无输出", foreground="#b03030")
+                        text="解释器不可用或无输出", foreground=CLR_FG_ERROR)
                 else:
                     self.train_dep_label.config(
-                        text="缺少: " + ",".join(miss), foreground="#b03030")
+                        text="缺少: " + ",".join(miss), foreground=CLR_FG_ERROR)
         except Exception as exc:
-            self.train_dep_label.config(text=f"检测失败: {exc}", foreground="#b03030")
+            self.train_dep_label.config(text=f"检测失败: {exc}", foreground=CLR_FG_ERROR)
 
     def _scan_train_data(self) -> None:
         """扫描数据目录并打印类别/张数统计到训练日志。"""
@@ -1938,18 +2228,18 @@ class BirdCrawlerGUI:
                 label.config(
                     text="检测到上次训练权重（last_segpart.pth），"
                          "勾选后热启动追加训练（轮数=追加轮数）",
-                    foreground="#b06a00")
+                    foreground=CLR_FG_WARN)
             else:
                 check.config(state=tk.DISABLED)
                 if self.train_resume_var.get():
                     self.train_resume_var.set(False)
                 label.config(text="暂无部位分割训练权重（先完成一次训练）",
-                             foreground="#8a95a1")
+                             foreground=CLR_FG_MUTED)
         else:
             check.config(state=tk.DISABLED)
             if self.train_resume_var.get():
                 self.train_resume_var.set(False)
-            label.config(text="该训练路径不支持续训", foreground="#8a95a1")
+            label.config(text="该训练路径不支持续训", foreground=CLR_FG_MUTED)
         # 模式说明区替换为部位训练说明（避免残留分类模式的推荐参数说明）
         self.train_mode_desc.config(state=tk.NORMAL)
         self.train_mode_desc.delete("1.0", tk.END)
@@ -2207,6 +2497,8 @@ class BirdCrawlerGUI:
             self.train_start_btn.config(state=tk.DISABLED)
             self.train_stop_btn.config(state=tk.NORMAL)
             self.train_open_out_btn.config(state=tk.DISABLED)
+            # 全局状态栏：训练/扫描期间在任何页签都可见
+            self._set_status("train", f"{label}中…")
             # 训练运行期间禁用模型库删除按钮，防止删除与训练并发冲突
             if getattr(self, "model_del_btn", None) is not None:
                 self.model_del_btn.config(state=tk.DISABLED)
@@ -2238,6 +2530,7 @@ class BirdCrawlerGUI:
                     continue
                 self._append_train_log(line)
                 if "[训练进程已结束" in line:
+                    self._clear_task_status("train")
                     self.train_start_btn.config(state=tk.NORMAL)
                     self.train_stop_btn.config(state=tk.DISABLED)
                     self.train_open_out_btn.config(state=tk.NORMAL)
@@ -2311,7 +2604,7 @@ class BirdCrawlerGUI:
     def _build_models_tab(self) -> None:
         """构建模型库标签页（列表/预览/激活/删除/导入，数据来自 model_library）。"""
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 模型库 ")
+        self.notebook.add(page, text="模型库")
 
         # 工具栏：刷新 / 激活 / 删除 / 打开目录 / 导入
         bar = ttk.Frame(page, padding=6)
@@ -2327,7 +2620,7 @@ class BirdCrawlerGUI:
         ttk.Button(bar, text="导入外部模型",
                    command=self._import_external_model).pack(side=tk.LEFT, padx=6)
         ttk.Label(bar, text=f"模型库位置：{ml.MODEL_LIBRARY_DIR}",
-                  foreground="#8a95a1").pack(side=tk.RIGHT)
+                  foreground=CLR_FG_MUTED).pack(side=tk.RIGHT)
 
         # 主体：左侧列表 + 右侧预览
         main = ttk.Frame(page)
@@ -2350,16 +2643,19 @@ class BirdCrawlerGUI:
         self.model_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         # 激活模型行高亮（标签色 + ★ 标记）
-        self.model_tree.tag_configure("active_row", background="#eaf2fc",
-                                      foreground="#185a9d")
+        self.model_tree.tag_configure("active_row", background=CLR_BG_ACTIVE_ROW,
+                                      foreground=CLR_FG_ACTIVE_ROW)
         # 选中行事件：刷新预览与详情
-        self.model_tree.bind("<<TreeviewSelected>>", self._on_model_selected)
+        # 注意：ttk.Treeview 的选中虚拟事件名为 <<TreeviewSelect>>（无尾部 ed）。
+        # 早期误写为 <<TreeviewSelected>> 时该事件永不触发，导致预览与详情面板
+        # 在用户点击模型行后始终不刷新（处理函数本身正常）。
+        self.model_tree.bind("<<TreeviewSelect>>", self._on_model_selected)
 
         # 预览区：固定 248×248 容器 + 详情标签
         right = ttk.LabelFrame(main, text=" 预览 ", padding=8)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=6, pady=(0, 6))
-        preview_box = tk.Frame(right, width=248, height=248,
-                               bg="#eef1f5", relief="groove", bd=1)
+        preview_box = tk.Frame(right, width=px(248), height=px(248),
+                               bg=CLR_BG_PREVIEW, relief="groove", bd=1)
         preview_box.pack()
         preview_box.pack_propagate(False)
         if HAS_PIL:
@@ -2368,7 +2664,7 @@ class BirdCrawlerGUI:
             # 未安装 Pillow：预览区整体降级为文字提示，列表功能不受影响
             preview_text = "（未安装 Pillow，\n无法显示缩略图）"
         self.model_preview_label = tk.Label(
-            preview_box, text=preview_text, bg="#eef1f5", fg="#8a95a1",
+            preview_box, text=preview_text, bg=CLR_BG_PREVIEW, fg=CLR_FG_MUTED,
             font=("Microsoft YaHei UI", 9), justify=tk.CENTER)
         self.model_preview_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
         self.model_info_label = ttk.Label(right, text="", justify=tk.LEFT,
@@ -2521,7 +2817,7 @@ class BirdCrawlerGUI:
         if image is None:
             self.model_preview_label.config(image="", text="（暂无预览图）")
             return
-        image.thumbnail((240, 240))
+        image.thumbnail((px(240), px(240)))
         photo = ImageTk.PhotoImage(image)
         self._model_preview_ref = photo  # 持有引用防止被垃圾回收
         self.model_preview_label.config(image=photo, text="")
@@ -2778,7 +3074,7 @@ class BirdCrawlerGUI:
         ttk.Label(dialog, text=f"模型目录：{model_dir.name}",
                   padding=(16, 12), justify=tk.LEFT).pack(anchor=tk.W)
         ttk.Label(dialog, text=f"识别说明：{arch_note}",
-                  padding=(16, 0), foreground="#8a95a1").pack(anchor=tk.W)
+                  padding=(16, 0), foreground=CLR_FG_MUTED).pack(anchor=tk.W)
 
         # 架构下拉
         row1 = ttk.Frame(dialog)
@@ -2791,7 +3087,7 @@ class BirdCrawlerGUI:
         # 任务类型 / 可推理性提示（随下拉联动刷新）
         tip_var = tk.StringVar()
         ttk.Label(dialog, textvariable=tip_var, padding=(16, 6),
-                  foreground="#b06a00", wraplength=360,
+                  foreground=CLR_FG_WARN, wraplength=360,
                   justify=tk.LEFT).pack(anchor=tk.W)
 
         def _update_tip(*_args) -> None:
@@ -2871,7 +3167,7 @@ class BirdCrawlerGUI:
         # 禁用按钮防止重复点击
         self._set_pillow_dialog_buttons(dialog, tk.DISABLED)
         ttk.Label(dialog, text="正在后台安装 Pillow，请稍候…",
-                  foreground="#1d7a34").pack()
+                  foreground=CLR_FG_SUCCESS).pack()
 
         def _worker() -> None:
             """后台线程：执行 pip 安装并把结果回投到主线程。"""
@@ -2925,7 +3221,7 @@ class BirdCrawlerGUI:
         拖慢控制台启动速度；页签顺序位于「模型库」之后。
         """
         self._vision_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self._vision_tab, text=" 视觉分析 ")
+        self.notebook.add(self._vision_tab, text="视觉分析")
         self._vision_built = False      # 是否已完成惰性构建（仅构建一次）
         self._vision_panel = None       # 嵌入的视觉问答面板（BirdVqaPanel）引用
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
@@ -2959,7 +3255,7 @@ class BirdCrawlerGUI:
                 " vision_system_dir，值为视觉系统目录的完整路径，然后重启控制台。"
             )
             tk.Label(page, text=hint, justify=tk.LEFT, anchor="nw",
-                     fg="#8a5a2a", bg="#fdf6ec",
+                     fg=CLR_FG_HINT_DARK, bg=CLR_BG_HINT_SOFT,
                      font=("Microsoft YaHei UI", 10),
                      padx=24, pady=24).pack(fill=tk.BOTH, expand=True)
             return
@@ -3029,14 +3325,14 @@ class BirdCrawlerGUI:
                     "是否已安装，处理后重启控制台重试。"
                 )
             tk.Label(page, text=err, justify=tk.LEFT, anchor="nw",
-                     fg="#a02020", bg="#fdecec",
+                     fg=CLR_FG_ERROR_DARK, bg=CLR_BG_ERROR_SOFT,
                      font=("Microsoft YaHei UI", 10),
                      padx=24, pady=24).pack(fill=tk.BOTH, expand=True)
 
     # ---------- 标签页 6：数据浏览 ----------
     def _build_browse_tab(self) -> None:
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 数据浏览 ")
+        self.notebook.add(page, text="数据浏览")
 
         bar = ttk.Frame(page, padding=6); bar.pack(fill=tk.X)
         ttk.Label(bar, text="关键词:").pack(side=tk.LEFT)
@@ -3071,12 +3367,12 @@ class BirdCrawlerGUI:
         self.obs_page_label = ttk.Label(pager, text="")
         self.obs_page_label.pack(side=tk.LEFT, padx=10)
         ttk.Label(pager, text="双击行可打开 iNaturalist 页面",
-                  foreground="#8a95a1").pack(side=tk.RIGHT)
+                  foreground=CLR_FG_MUTED).pack(side=tk.RIGHT)
 
     # ---------- 标签页 7：照片浏览 ----------
     def _build_photos_tab(self) -> None:
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 照片浏览 ")
+        self.notebook.add(page, text="照片浏览")
 
         bar = ttk.Frame(page, padding=6); bar.pack(fill=tk.X)
         ttk.Label(bar, text="类群:").pack(side=tk.LEFT)
@@ -3088,32 +3384,47 @@ class BirdCrawlerGUI:
         ttk.Button(bar, text="刷新", command=self._load_photos).pack(side=tk.LEFT, padx=4)
         if not HAS_PIL:
             ttk.Label(bar, text="（未安装 Pillow，仅显示文件名；pip install pillow 可显示缩略图）",
-                      foreground="#b06818").pack(side=tk.LEFT, padx=8)
+                      foreground=CLR_FG_WARN_ALT).pack(side=tk.LEFT, padx=8)
 
         # 缩略图画布区（可滚动）
         canvas_frame = ttk.Frame(page)
         canvas_frame.pack(fill=tk.BOTH, expand=True, padx=6)
-        self.ph_canvas = tk.Canvas(canvas_frame, highlightthickness=0, bg="#f4f6f9")
+        self.ph_canvas = tk.Canvas(canvas_frame, highlightthickness=0, bg=CLR_BG_PANEL)
         scroll = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.ph_canvas.yview)
-        self.ph_inner = ttk.Frame(self.ph_canvas)
+        # 用 tk.Frame 而非 ttk.Frame：需要把底色设为与画布一致（CLR_BG_PANEL），
+        # ttk.Frame 取主题默认灰，会在空状态/缩略图之间露出一条色带
+        self.ph_inner = tk.Frame(self.ph_canvas, bg=CLR_BG_PANEL)
         self.ph_inner.bind("<Configure>",
                            lambda e: self.ph_canvas.configure(scrollregion=self.ph_canvas.bbox("all")))
-        self.ph_canvas.create_window((0, 0), window=self.ph_inner, anchor=tk.NW, width=1000)
+        # 内容框宽度跟随画布实际宽度：原先硬编码 width=1000，窗口拉宽后画廊
+        # 右侧留白、缩窄到 1000 以下则被裁且无横向滚动条
+        self._ph_window_id = self.ph_canvas.create_window((0, 0), window=self.ph_inner,
+                                                          anchor=tk.NW)
+        self.ph_canvas.bind(
+            "<Configure>",
+            lambda e: self.ph_canvas.itemconfigure(self._ph_window_id, width=e.width))
         self.ph_canvas.configure(yscrollcommand=scroll.set)
         self.ph_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
+        # 空状态占位：首次进入该页时画布是空白，用户分不清「没数据」还是
+        # 「没加载」。_load_photos 会清空 ph_inner 子控件，占位自动消失。
+        tk.Label(self.ph_inner,
+                 text="尚未加载照片\n\n"
+                      "点击「刷新」或选择上方类群开始浏览；\n"
+                      "照片来自「下载控制」爬取与「拖入文件爬取」本地导入。",
+                 justify=tk.CENTER, fg=CLR_FG_MUTED, bg=CLR_BG_PANEL,
+                 font=UI_FONT_UI, padx=0, pady=px(40)).pack(expand=True)
         pager = ttk.Frame(page, padding=(6, 4, 6, 6)); pager.pack(fill=tk.X)
         ttk.Button(pager, text="上一页", command=lambda: self._page_photos(-1)).pack(side=tk.LEFT)
         ttk.Button(pager, text="下一页", command=lambda: self._page_photos(1)).pack(side=tk.LEFT, padx=6)
         self.ph_page_label = ttk.Label(pager, text="")
         self.ph_page_label.pack(side=tk.LEFT, padx=10)
-        ttk.Label(pager, text="双击图片用系统看图工具打开原图", foreground="#8a95a1").pack(side=tk.RIGHT)
+        ttk.Label(pager, text="双击图片用系统看图工具打开原图", foreground=CLR_FG_MUTED).pack(side=tk.RIGHT)
 
     # ---------- 标签页 8：统计与说明 ----------
     def _build_stats_tab(self) -> None:
         page = ttk.Frame(self.notebook)
-        self.notebook.add(page, text=" 统计与说明 ")
+        self.notebook.add(page, text="统计与说明")
 
         bar = ttk.Frame(page, padding=6); bar.pack(fill=tk.X)
         ttk.Button(bar, text="刷新统计", command=self._load_stats).pack(side=tk.LEFT)
@@ -3235,6 +3546,7 @@ class BirdCrawlerGUI:
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding=_SUBPROC_OUTPUT_ENCODING, errors="replace", env=env, cwd=str(BASE_DIR))
 
+        self._set_status("download", "下载中…")
         self._append_log(f"\n===== 启动下载：{' '.join(cmd[1:])} =====\n")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -3260,6 +3572,7 @@ class BirdCrawlerGUI:
                 line = self.log_queue.get_nowait()
                 self._append_log(line)
                 if "[下载进程已结束]" in line:
+                    self._clear_task_status("download")
                     self.start_btn.config(state=tk.NORMAL)
                     self.stop_btn.config(state=tk.DISABLED)
                     self._refresh_taxon_filters()   # 下载结束后自动刷新类群列表
@@ -3378,7 +3691,7 @@ class BirdCrawlerGUI:
 
         if not rows:
             ttk.Label(self.ph_inner, text="该筛选条件下暂无照片",
-                      padding=40, foreground="#8a95a1").grid(row=0, column=0)
+                      padding=40, foreground=CLR_FG_MUTED).grid(row=0, column=0)
             return
 
         for i, r in enumerate(rows):
@@ -3395,13 +3708,13 @@ class BirdCrawlerGUI:
                              path: Path | None, row: sqlite3.Row) -> None:
         """创建单个缩略图控件（有 Pillow 用图片，无则用按钮）。"""
         if path is None:
-            ttk.Label(parent, text="文件缺失", foreground="#b06818",
+            ttk.Label(parent, text="文件缺失", foreground=CLR_FG_WARN_ALT,
                       padding=10).pack()
             return
         if HAS_PIL:
             try:
                 img = Image.open(path)
-                img.thumbnail((220, 165))
+                img.thumbnail((px(220), px(165)))
                 thumb = ImageTk.PhotoImage(img)
                 self._thumb_refs.append(thumb)
                 label = ttk.Label(parent, image=thumb, cursor="hand2")
@@ -3554,7 +3867,14 @@ class BirdCrawlerGUI:
 
 def run() -> int:
     """启动桌面界面（供 main.py 调用）。"""
+    # DPI 感知必须在创建任何窗口之前声明，否则对已存在的窗口无效
+    scale = ui_scale()
     root = tk.Tk()
+    # 同步 Tk 的「每磅像素数」使以 pt 指定的字体与真实 DPI 一致（96dpi → 4/3）
+    try:
+        root.tk.call("tk", "scaling", scale * 4.0 / 3.0)
+    except Exception:
+        pass                                # 老版本 Tk 不支持时退回默认缩放
     BirdCrawlerGUI(root)
     root.mainloop()
     return 0

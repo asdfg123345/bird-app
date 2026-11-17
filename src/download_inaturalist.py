@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import socket
 import sys
@@ -35,8 +36,20 @@ import requests
 
 from inaturalist_db_manager import INaturalistDatabaseManager
 
-# Prefer IPv4 to avoid long IPv6 hangs on some networks.
+# ------------------------------------------------------------
+# IPv4 优先解析（按需启用，不在 import 期改全局）
+# ------------------------------------------------------------
+# 某些网络下 IPv6 连接会长时间挂起，优先使用 IPv4 可显著改善下载稳定性。
+# 但这属于「改变整个进程 DNS 行为」的全局副作用：原实现在模块导入时就直接
+# 替换 socket.getaddrinfo，任何 import 本模块的进程（含 GUI、测试、其他工具）
+# 的解析行为都会被悄悄改掉，将来若某个依赖需要 IPv6 会得到极难排查的故障。
+# 现改为显式、幂等、可关闭：只在真正开始下载前调用 prefer_ipv4_resolution()。
 _orig_getaddrinfo = socket.getaddrinfo
+_ipv4_preference_applied = False
+_ipv4_preference_lock = threading.Lock()
+
+# 环境变量：置 1 时完全关闭该偏好（回到系统默认解析顺序）
+IPV4_PREF_ENV_VAR = "BIRD_DISABLE_IPV4_PREFERENCE"
 
 
 def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
@@ -45,7 +58,19 @@ def _getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
     return ipv4 or records
 
 
-socket.getaddrinfo = _getaddrinfo_ipv4
+def prefer_ipv4_resolution() -> bool:
+    """启用「IPv4 优先解析」；幂等，返回当前是否处于启用状态。
+
+    只在网络下载入口调用，模块导入本身不再产生任何副作用。
+    """
+    global _ipv4_preference_applied
+    if os.environ.get(IPV4_PREF_ENV_VAR) == "1":
+        return False
+    with _ipv4_preference_lock:
+        if not _ipv4_preference_applied:
+            socket.getaddrinfo = _getaddrinfo_ipv4
+            _ipv4_preference_applied = True
+    return True
 
 API_BASE = "https://api.inaturalist.org/v1"
 DEFAULT_TAXON_ID = 781
@@ -545,8 +570,10 @@ def sync_taxon_tree(
             zh_taxon = (zh.get("results") or [{}])[0]
             if isinstance(zh_taxon, dict) and zh_taxon.get("id"):
                 payloads.insert(0, zh_taxon)
-        except Exception:
-            pass  # 中文名补全失败不影响层级登记
+        except Exception as exc:
+            # 中文名补全失败不中断流程，但要留痕：其余逻辑（如 --label-scheme cn）
+            # 依赖 taxon_tree 里的中文名，静默失败会让用户以为「这鸟本来就没中文名」
+            log(f"  中文俗名补全失败（不影响层级登记）: {exc}")
     nodes = tree_nodes_from_payloads(payloads)
     return db_manager.upsert_taxon_tree_bulk(nodes)
 
@@ -646,13 +673,21 @@ def download_taxon_data(
     适合大规模（数万条）鸟类数据下载。
     每个类群的图片自动存放于独立文件夹：out_dir/taxon_{id}_{学名}_{俗名}/photos/
     """
-    # 解析数据库路径并初始化管理器
+    # 解析数据库路径（无条件解析，与是否启用数据库无关）
+    # 原实现把这两个变量定义在 `if db_enabled:` 分支内，却在函数末尾分支外的
+    # summary 组装处使用；目前仅靠「db_enabled=False 时 db_manager 也是 None」
+    # 这一巧合挡住，任何一次重构都会变成 NameError。此处先无条件算好。
+    db_dir = (out_dir / "db") if raw_db_path is None or main_db_path is None else None
+    resolved_raw_db = raw_db_path or (db_dir / "raw_data.db")
+    resolved_main_db = main_db_path or (db_dir / "bird_observations.db")
+
+    # 真正的下载入口才启用 IPv4 优先解析（幂等；导入本模块不再有副作用）
+    prefer_ipv4_resolution()
+
+    # 初始化数据库管理器
     db_manager: INaturalistDatabaseManager | None = None
     db_batch_id: int | None = batch_id
     if db_enabled:
-        db_dir = (out_dir / "db") if raw_db_path is None or main_db_path is None else None
-        resolved_raw_db = raw_db_path or (db_dir / "raw_data.db")
-        resolved_main_db = main_db_path or (db_dir / "bird_observations.db")
         try:
             db_manager = INaturalistDatabaseManager(resolved_raw_db, resolved_main_db)
             log(f"Database enabled: raw={resolved_raw_db}, main={resolved_main_db}")

@@ -398,10 +398,16 @@ def export_dataset(args: argparse.Namespace) -> int:
             for oid in obs_ids[n_train + n_val:]:
                 obs_split[oid] = "test"
 
-        # 图片级兜底：观察数太少导致验证集为空时，退化为图片级划分，
-        # 保证该类在 train/val/test 三集合均有样本，从源头避免训练时出现空验证集
+        # 图片级兜底：观察数太少导致验证集为空时，退化为图片级划分。
+        # 保证的边界（按图片数 n）：
+        #   n >= 3  → 训练集与验证集均非空（验证集非空是硬要求：空验证集会让
+        #             Top-1 恒为 0、早停与最佳模型选择全部失效）
+        #   n >= 6  → 额外切出检测集，三集合均非空
+        #   n <  3  → 不兜底（图片太少，任何划分都无意义），沿用观察级结果
         # （观察级防泄漏优先；观察不足无法防泄漏时，以「保证可评估」为更高优先级）
-        img_split_override: dict[int, str] = {}
+        # 键使用稳定的 (观察ID, 照片ID) 组合，而不是 id(row)：
+        # id() 是 CPython 对象地址，对象被回收后地址可能被复用，作为字典键不安全。
+        img_split_override: dict[tuple[Any, Any], str] = {}
         val_imgs = sum(len(obs_map[o]) for o, s in obs_split.items() if s == "val")
         if val_imgs == 0:
             flat_rows = [r for oid in sorted(obs_map) for r in obs_map[oid]]
@@ -413,18 +419,23 @@ def export_dataset(args: argparse.Namespace) -> int:
                 # 保证训练集至少保留 1 张
                 n_img_test = min(n_img_test, n_img - n_img_val - 1)
                 for idx, r in enumerate(flat_rows):
+                    key = (r["observation_id"], r["photo_id"])
                     if idx < n_img_val:
-                        img_split_override[id(r)] = "val"
+                        img_split_override[key] = "val"
                     elif idx < n_img_val + n_img_test:
-                        img_split_override[id(r)] = "test"
+                        img_split_override[key] = "test"
                     else:
-                        img_split_override[id(r)] = "train"
+                        img_split_override[key] = "train"
 
         # 逐照片落盘
-        for oid, split in obs_split.items():
+        for oid, obs_split_name in obs_split.items():
             for row in obs_map[oid]:
-                if img_split_override:
-                    split = img_split_override.get(id(row), split)
+                # 默认沿用观察级划分；图片级兜底启用时以 override 为准。
+                # 注意：必须用独立变量承接，不能复用外层循环变量——原实现写成
+                # `split = img_split_override.get(id(row), split)`，一旦某张照片
+                # 未命中 override，回退值就是「上一张照片的划分」而非本观察的划分。
+                split = img_split_override.get(
+                    (row["observation_id"], row["photo_id"]), obs_split_name)
                 src: Path = row["src"]
                 ext = src.suffix.lower()
                 filename = f"obs_{oid}_p{row['photo_id']}{ext}"

@@ -488,25 +488,36 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
         note_parts.append(texts)
 
     # 登记 iNaturalist 官方纲-目-科-种层级链（供训练导出使用，失败不中断导入）
+    # 注意：这里失败是「静默降级」的高危点——taxon_tree 是 dataset 导出
+    # manifest 中纲/目/科三个字段的唯一来源，缺了不会报错，只会让下游导出
+    # 悄悄退化成 taxon_<ID> 占位符。因此失败必须在处理报告里显式留痕。
     try:
         tree_nodes = fetch_taxon_tree_nodes(taxon_id)
         if tree_nodes:
             manager.upsert_taxon_tree_bulk(tree_nodes)
-    except Exception:
-        pass  # 层级登记失败不影响图片入库
+        else:
+            report_lines.append(
+                "  !! 未取得纲-目-科层级链（接口无返回），"
+                "该类的层级字段在数据集导出时将退化为占位符")
+    except Exception as exc:
+        report_lines.append(
+            f"  !! 纲-目-科层级链登记失败（不影响图片入库）: {exc}；"
+            "该类的层级字段在数据集导出时将退化为占位符")
 
     obs_id = manager.upsert_local_observation(
         taxon_id=taxon_id, scientific_name=sci, common_name=common,
         source_name=kind_name, note="\n".join(note_parts))
 
     new = dup = fail = 0
+    # 检查点提交：每 N 张提交一次，把「每张一次 fsync」降为「每 N 张一次」。
+    # 语义保持不变且是刻意选择——中途失败/中断时，已过检查点的照片仍在库里，
+    # 重跑时按内容指纹自动跳过，可继续导入（不整体回滚）。
     for position, img in enumerate(images, 1):
         # 全局照片级进度行：GUI 进度条按此刷新（种类内也保持细粒度反馈）
         if progress_total > 0:
             print(f"[进度] 照片 {progress_base + position}/{progress_total}",
                   flush=True)
         sha = _sha256_of_file(img)
-        seen_in_session.add(sha)
         if manager.has_photo_fingerprint(sha):
             dup += 1
             report_lines.append(

@@ -281,15 +281,21 @@ MAIN_DB_INDEXES: list[str] = [
 
 
 def _backup_corrupted_db(db_path: Path) -> None:
-    """如果数据库文件已存在但疑似损坏，则备份后删除。"""
+    """如果数据库文件已存在但疑似损坏，则备份后删除。
+
+    备份失败时必须留痕而不是静默通过：该函数会在数据库损坏时被调用，
+    一旦备份没做成又继续往下走，用户可能丢掉唯一的数据副本却毫无提示。
+    """
     if not db_path.exists() or db_path.stat().st_size == 0:
         return
     backup_path = db_path.with_suffix(f".db.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     try:
         shutil.copy2(db_path, backup_path)
         db_path.unlink(missing_ok=True)
-    except OSError:
-        pass
+        print(f"[警告] 数据库疑似损坏，已备份至 {backup_path} 并重建", flush=True)
+    except OSError as exc:
+        print(f"[警告] 数据库 {db_path.name} 疑似损坏，但备份失败（{exc}）；"
+              f"已保留原文件未删除，请手工确认后再运行", flush=True)
 
 
 def _init_single_db(db_path: Path, schema: list[tuple[str, str]], indexes: list[str]) -> None:

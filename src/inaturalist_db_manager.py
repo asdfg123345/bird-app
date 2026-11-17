@@ -125,18 +125,39 @@ class INaturalistDatabaseManager:
         """确保两个数据库已初始化。"""
         init_all_databases(self.raw_db_path, self.main_db_path)
 
+    @staticmethod
+    def _apply_pragmas(conn: sqlite3.Connection, label: str) -> None:
+        """统一设置连接级 PRAGMA（性能与并发安全，2026-11-17 新增）。
+
+        - foreign_keys=ON：保持原有的外键约束语义；
+        - journal_mode=WAL：写不阻塞读、读不阻塞写。界面「数据浏览/照片浏览」
+          与爬虫子进程共用同一个主库，原 rollback journal 模式下必然互相卡住
+          （表现为 database is locked 或界面假死）；
+        - synchronous=NORMAL：WAL 下的推荐档位，掉电最多丢最后一个事务，
+          换取每次提交不再强制 fsync，写入吞吐提升一个数量级；
+        - busy_timeout=5000：写锁冲突时最多等待 5 秒再报错，而不是立即失败。
+        """
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            # 只读介质/文件系统不支持 WAL 时保持原有 journal 模式，不影响功能
+            pass
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+
     def _get_raw_conn(self) -> sqlite3.Connection:
         """获取原始库连接。"""
         if self._raw_conn is None:
             self._raw_conn = sqlite3.connect(self.raw_db_path)
-            self._raw_conn.execute("PRAGMA foreign_keys = ON")
+            self._apply_pragmas(self._raw_conn, "raw")
         return self._raw_conn
 
     def _get_main_conn(self) -> sqlite3.Connection:
         """获取主库连接。"""
         if self._main_conn is None:
             self._main_conn = sqlite3.connect(self.main_db_path)
-            self._main_conn.execute("PRAGMA foreign_keys = ON")
+            self._apply_pragmas(self._main_conn, "main")
         return self._main_conn
 
     def close(self) -> None:
@@ -164,8 +185,13 @@ class INaturalistDatabaseManager:
         common_name: str,
         rank: str,
         label_cn: str = "",
+        commit: bool = True,
     ) -> None:
-        """登记或更新类群信息。"""
+        """登记或更新类群信息。
+
+        commit=False 时不在本方法内提交，由调用方的事务统一提交
+        （batch 写入场景下避免每行一次 fsync）。
+        """
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._get_main_conn()
         cursor = conn.cursor()
@@ -182,7 +208,8 @@ class INaturalistDatabaseManager:
             """,
             (taxon_id, scientific_name, common_name, rank, label_cn, now, now),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def upsert_taxon_tree_bulk(self, nodes: list[dict[str, Any]]) -> int:
         """批量登记类群生物学层级节点（来自 iNaturalist 官方 ancestry 链）。
@@ -338,8 +365,13 @@ class INaturalistDatabaseManager:
         self,
         batch_id: int,
         observation_id: int,
+        commit: bool = True,
     ) -> None:
-        """建立批次与观察记录的关联。"""
+        """建立批次与观察记录的关联。
+
+        commit=False 时由调用方事务统一提交；批量场景请优先使用
+        link_batch_observations_bulk（单事务 executemany）。
+        """
         conn = self._get_main_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -349,7 +381,8 @@ class INaturalistDatabaseManager:
             """,
             (batch_id, observation_id),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def delete_batch_run(self, batch_id: int) -> None:
         """删除批次运行记录及其关联行（batch_taxa / batch_observations）。
@@ -373,8 +406,12 @@ class INaturalistDatabaseManager:
         obs: dict[str, Any],
         raw_json: dict[str, Any],
         crawl_time: str,
+        commit: bool = True,
     ) -> None:
-        """写入原始观察记录（INSERT OR IGNORE）。"""
+        """写入原始观察记录（INSERT OR IGNORE）。
+
+        commit=False 时由调用方事务统一提交。
+        """
         # 原始层指纹：结合业务主键与原始 JSON，避免空 JSON 导致重复
         fingerprint = _json_fingerprint(
             {
@@ -434,15 +471,20 @@ class INaturalistDatabaseManager:
                 fingerprint,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def insert_raw_photo(
         self,
         photo: dict[str, Any],
         raw_json: dict[str, Any],
         crawl_time: str,
+        commit: bool = True,
     ) -> None:
-        """写入原始照片（INSERT OR IGNORE）。"""
+        """写入原始照片（INSERT OR IGNORE）。
+
+        commit=False 时由调用方事务统一提交。
+        """
         # 原始层指纹：结合业务主键与原始 JSON，避免空 JSON 导致重复
         fingerprint = _json_fingerprint(
             {
@@ -479,19 +521,30 @@ class INaturalistDatabaseManager:
                 fingerprint,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
-    def upsert_observation(self, obs: dict[str, Any]) -> None:
-        """写入或更新规范化观察记录（upsert）。"""
+    def upsert_observation(self, obs: dict[str, Any],
+                           commit: bool = True,
+                           ensure_taxon_row: bool = True) -> None:
+        """写入或更新规范化观察记录（upsert）。
+
+        参数：
+            commit: False 时不在本方法内提交，由调用方事务统一提交；
+            ensure_taxon_row: False 时跳过内联的类群登记。批量写入场景下
+                调用方已在页级做过一次去重登记，逐行再 upsert 同一类群
+                会产生大量冗余写与 fsync。
+        """
         # 如果观察记录带有类群信息，先确保类群已登记
         taxon_id = _to_int(obs.get("taxon_id"))
-        if taxon_id is not None:
+        if taxon_id is not None and ensure_taxon_row:
             self.ensure_taxon(
                 taxon_id=taxon_id,
                 scientific_name=obs.get("scientific_name", ""),
                 common_name=obs.get("common_name", ""),
                 rank=obs.get("taxon_rank", ""),
                 label_cn="",
+                commit=commit,
             )
         fingerprint = generate_observation_fingerprint(obs)
         now = datetime.now().isoformat(timespec="seconds")
@@ -581,10 +634,14 @@ class INaturalistDatabaseManager:
                 now,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
-    def upsert_photo(self, photo: dict[str, Any]) -> None:
-        """写入或更新规范化照片（upsert）。"""
+    def upsert_photo(self, photo: dict[str, Any], commit: bool = True) -> None:
+        """写入或更新规范化照片（upsert）。
+
+        commit=False 时由调用方事务统一提交。
+        """
         fingerprint = generate_photo_fingerprint(photo)
         now = datetime.now().isoformat(timespec="seconds")
         conn = self._get_main_conn()
@@ -629,7 +686,8 @@ class INaturalistDatabaseManager:
                 now,
             ),
         )
-        conn.commit()
+        if commit:
+            conn.commit()
 
     def write_page_data(
         self,
@@ -645,6 +703,14 @@ class INaturalistDatabaseManager:
             photo_rows: 规范化照片行列表
             raw_observations: 原始 API observation 对象列表（可选）
             crawl_time: 采集时间戳
+
+        事务语义（2026-11-17 改造）：
+            原实现逐行调用 *upsert* 且每个方法内各自 commit，一页 200 观察 +
+            400 照片会产生约 1600 次 fsync（实测 4.6 秒/页，约 7.7 ms/条）。
+            现改为「整页一个事务」：主库与原始库各自 with conn 包裹，全部行写入
+            完才提交一次，异常时整页回滚。语义上的唯一变化是——整页要么全写入
+            要么全不写入，不会再出现「写了一半」的中间态（对上层是更安全的行为：
+            调用方本来就是按页容错，重跑时 upsert 天然幂等）。
         """
         now = crawl_time or datetime.now().isoformat(timespec="seconds")
         raw_lookup: dict[int, dict[str, Any]] = {}
@@ -654,15 +720,63 @@ class INaturalistDatabaseManager:
                 if oid is not None:
                     raw_lookup[int(oid)] = raw
 
+        # 页级类群去重：同一页内同一类群只登记一次，避免逐行冗余 upsert
+        seen_taxa: set[int] = set()
+        taxon_rows: list[dict[str, Any]] = []
         for obs in observations:
-            self.upsert_observation(obs)
-            raw_json = raw_lookup.get(int(obs.get("observation_id") or 0), {})
-            self.insert_raw_observation(obs, raw_json, now)
+            tid = _to_int(obs.get("taxon_id"))
+            if tid is not None and tid not in seen_taxa:
+                seen_taxa.add(tid)
+                taxon_rows.append(obs)
 
-        for photo in photo_rows:
-            self.upsert_photo(photo)
-            raw_json = raw_lookup.get(int(photo.get("observation_id") or 0), {})
-            self.insert_raw_photo(photo, raw_json, now)
+        main_conn = self._get_main_conn()
+        raw_conn = self._get_raw_conn()
+        # 两个库分别一个事务；任一库失败时另一个库由 sqlite 自动回滚
+        with main_conn, raw_conn:
+            for obs in taxon_rows:
+                self.ensure_taxon(
+                    taxon_id=_to_int(obs.get("taxon_id")),
+                    scientific_name=obs.get("scientific_name", ""),
+                    common_name=obs.get("common_name", ""),
+                    rank=obs.get("taxon_rank", ""),
+                    label_cn="",
+                    commit=False,
+                )
+            for obs in observations:
+                # 类群已在页级登记过，逐行不再重复 upsert
+                self.upsert_observation(obs, commit=False, ensure_taxon_row=False)
+                raw_json = raw_lookup.get(int(obs.get("observation_id") or 0), {})
+                self.insert_raw_observation(obs, raw_json, now, commit=False)
+
+            for photo in photo_rows:
+                self.upsert_photo(photo, commit=False)
+                raw_json = raw_lookup.get(int(photo.get("observation_id") or 0), {})
+                self.insert_raw_photo(photo, raw_json, now, commit=False)
+
+    def link_batch_observations_bulk(
+        self,
+        batch_id: int,
+        observation_ids: list[int],
+    ) -> int:
+        """批量建立批次与观察记录的关联（单事务 executemany）。
+
+        原实现逐条调用 link_batch_observation，每条一次 commit；一页 200 条观察
+        即 200 次 fsync。返回实际传入的条数。
+        """
+        if not observation_ids:
+            return 0
+        conn = self._get_main_conn()
+        rows = [(batch_id, int(oid)) for oid in observation_ids
+                if oid is not None]
+        if not rows:
+            return 0
+        with conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO batch_observations (batch_id, observation_id) "
+                "VALUES (?, ?)",
+                rows,
+            )
+        return len(rows)
 
     # ------------------------------------------------------------------
     # 常用查询接口

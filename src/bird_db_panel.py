@@ -479,9 +479,20 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     @classmethod
     def _lookup_by_name(cls, name: str) -> Path | None:
-        """按文件名在数据目录中查找照片（首次调用时构建索引缓存）。"""
+        """按文件名在数据目录中查找照片。
+
+        先用「taxon_*/photos/<文件名>」定深度 glob 直接命中——只列类群目录
+        再查文件名，不递归枚举全部图片；命中失败才退回全盘索引。
+        这样绝大多数请求无需为一张图触发全盘扫描。
+        """
         if not name:
             return None
+        try:
+            for hit in cls.allow_root.glob(f"taxon_*/photos/{name}"):
+                if hit.is_file():
+                    return hit.resolve()
+        except OSError:
+            pass
         if cls.photo_index is None:
             index: dict = {}
             # 扫描数据目录下所有 photos 文件夹中的图片文件

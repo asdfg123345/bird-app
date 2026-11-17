@@ -23,6 +23,7 @@ import json
 import re
 import socket
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -249,13 +250,41 @@ def size_fallbacks(preferred: str) -> list[str]:
     return order[start:]
 
 
+# ------------------------------------------------------------
+# 照片下载的连接复用（2026-11-17 优化）
+# ------------------------------------------------------------
+# 原实现用模块级 requests.get(...)，每张图都会新建 Session → 新建连接池 →
+# 完整 TCP + TLS 握手，并重新做一次 DNS。3000 张图按单次握手 80~150 ms 计，
+# 纯握手就浪费 4~7 分钟，且压不住连接建立的开销。
+# 现按线程复用 Session（线程池里每个 worker 各持一个，避免跨线程共享连接池），
+# 并显式放大连接池上限，保证同线程连续下载始终命中 keep-alive 连接。
+_PHOTO_SESSION_LOCAL = threading.local()
+
+
+def _photo_session() -> requests.Session:
+    """获取本线程复用的照片下载 Session（首次调用时创建）。"""
+    session = getattr(_PHOTO_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=16,
+            max_retries=0,          # 重试逻辑由本模块统一控制
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": USER_AGENT})
+        _PHOTO_SESSION_LOCAL.session = session
+    return session
+
+
 def download_photo_file(url: str, dest: Path) -> bool:
     last_error: Exception | None = None
-    headers = {"User-Agent": USER_AGENT}
+    session = _photo_session()
     for attempt in range(1, MAX_RETRIES + 1):
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
-            with requests.get(url, timeout=PHOTO_TIMEOUT, stream=True, headers=headers) as response:
+            with session.get(url, timeout=PHOTO_TIMEOUT, stream=True) as response:
                 if response.status_code == 429:
                     time.sleep(float(response.headers.get("Retry-After", 3 * attempt)))
                     continue
@@ -780,8 +809,12 @@ def download_taxon_data(
                 crawl_time = datetime.now().isoformat(timespec="seconds")
                 db_manager.write_page_data(observation_rows, photo_rows, observations, crawl_time)
                 if db_batch_id is not None:
-                    for obs_row in observation_rows:
-                        db_manager.link_batch_observation(db_batch_id, obs_row["observation_id"])
+                    # 批量关联（单事务 executemany）：原先逐条调用各提交一次，
+                    # 一页 200 条观察即 200 次 fsync
+                    db_manager.link_batch_observations_bulk(
+                        db_batch_id,
+                        [r["observation_id"] for r in observation_rows],
+                    )
             except Exception as exc:
                 log(f"  数据库写入失败（page {page_index}）: {exc}")
 

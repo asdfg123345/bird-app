@@ -368,6 +368,11 @@ class BirdCrawlerGUI:
         self._poll_train_queue()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._bind_shortcuts()
+        # 照片文件名索引：启动后在后台线程预建。原先在首次浏览照片时于主线程
+        # 做 DATA_DIR.rglob("*") 全盘递归，图库上万级时界面会假死数秒到数十秒。
+        if not hasattr(self, "_photo_index_lock"):
+            self._photo_index_lock = threading.Lock()
+        threading.Thread(target=self._build_photo_index, daemon=True).start()
         # 启动早期检测 Pillow：缺失时弹窗提供一键安装（可跳过，不影响其余功能）
         if not HAS_PIL:
             root.after(300, self._prompt_pillow_install)
@@ -3484,6 +3489,27 @@ class BirdCrawlerGUI:
         except (ValueError, IndexError):
             return None
 
+    def _build_photo_index(self) -> None:
+        """后台线程：扫描 data 目录建立「文件名 → 绝对路径」索引。
+
+        仅在后台线程执行全盘递归，完成前 _resolve_photo_path 走定深度 glob
+        兜底，主线程永远不会被 rglob 阻塞。
+        """
+        index: dict = {}
+        try:
+            for item in DATA_DIR.rglob("*"):
+                if item.is_file() and item.suffix.lower() in (
+                        ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                    index.setdefault(item.name, item)
+        except OSError:
+            pass                        # 目录不可枚举时保留已收集部分
+        lock = getattr(self, "_photo_index_lock", None)
+        if lock is not None:
+            with lock:
+                self.photo_index = index
+        else:
+            self.photo_index = index
+
     def _resolve_photo_path(self, local_path: str) -> Path | None:
         """将数据库中的照片相对路径解析为实际文件（文件名索引缓存）。"""
         if not local_path:
@@ -3494,15 +3520,18 @@ class BirdCrawlerGUI:
         candidate = DATA_DIR / path
         if candidate.is_file():
             return candidate
-        # 相对类群文件夹的路径（photos\\obs_xxx.jpg）→ 按文件名全盘索引
-        if self.photo_index is None:
-            index: dict = {}
-            for item in DATA_DIR.rglob("*"):
-                if item.is_file() and item.suffix.lower() in (
-                        ".jpg", ".jpeg", ".png", ".webp", ".gif"):
-                    index.setdefault(item.name, item)
-            self.photo_index = index
-        return self.photo_index.get(path.name)
+        # 相对类群文件夹的路径（photos\obs_xxx.jpg）：优先查后台预建索引
+        index = self.photo_index
+        if index is not None:
+            return index.get(path.name)
+        # 索引尚未就绪：用定深度 glob 直接定位（taxon_*/photos/<文件名>），
+        # 只列类群目录再查文件名，不递归全部图片，主线程开销可忽略
+        try:
+            for hit in DATA_DIR.glob(f"taxon_*/photos/{path.name}"):
+                return hit
+        except OSError:
+            pass
+        return None
 
     # ================= 下载控制 =================
     def _start_download(self) -> None:

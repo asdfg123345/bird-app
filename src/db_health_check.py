@@ -235,12 +235,30 @@ def run_checks(data_dir: Path, main_db: Path, raw_db: Path) -> HealthReport:
 
 
 def _backup(db: Path) -> Path:
-    """修复前整库备份（同目录 backup 子目录，带时间戳）。"""
+    """修复前整库备份（同目录 backup 子目录，带时间戳）。
+
+    使用 SQLite 在线备份 API 而不是 shutil.copy2：
+    数据库已切换到 WAL 模式后，已提交但尚未 checkpoint 的事务数据仍在 <db>-wal
+    文件里，只复制 .db 主文件会得到一份「丢最近提交」甚至不一致的备份。
+    Connection.backup() 会把主库与 WAL 内容合并成一份自洽快照。
+    """
     bdir = db.parent / "backup"
     bdir.mkdir(exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dest = bdir / f"{db.stem}_{stamp}{db.suffix}"
-    shutil.copy2(db, dest)
+    try:
+        src = sqlite3.connect(db)
+        try:
+            dst = sqlite3.connect(dest)
+            try:
+                src.backup(dst)      # 一致性快照（含 WAL 中已提交事务）
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except sqlite3.Error:
+        # 备份 API 不可用时退回文件复制（至少保留主文件内容）
+        shutil.copy2(db, dest)
     return dest
 
 

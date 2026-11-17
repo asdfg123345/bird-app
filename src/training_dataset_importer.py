@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import sqlite3
 import sys
 import time
 import zipfile
@@ -50,6 +51,7 @@ from pathlib import Path
 # 复用拖入接口的名称解析、层级登记、指纹与尺寸工具，保证行为一致
 from drop_crawl_interface import (
     IMG_SUFFIXES,
+    IMPORT_COMMIT_EVERY,
     _image_size,
     _sha256_of_file,
     fetch_taxon_tree_nodes,
@@ -200,7 +202,7 @@ def _hash_images(images: list[Path], workers: int) -> list[tuple[Path, str]]:
 def import_one_class(class_name: str, split_map: dict[str, list[Path]],
                      manifest: dict[str, str],
                      manager: INaturalistDatabaseManager, batch_id: int,
-                     out_dir: Path, seen_in_session: set[str],
+                     out_dir: Path,
                      report_lines: list[str],
                      workers: int) -> tuple[int, int, int]:
     """导入一个类别在所有划分下的全部图片，汇入同一条本地观察。
@@ -243,7 +245,6 @@ def import_one_class(class_name: str, split_map: dict[str, list[Path]],
     for split in sorted(split_map):
         for img, sha in _hash_images(split_map[split], workers):
             position += 1
-            seen_in_session.add(sha)
             if manager.has_photo_fingerprint(sha):
                 dup += 1
                 continue  # 跨批次内容重复，跳过
@@ -260,20 +261,32 @@ def import_one_class(class_name: str, split_map: dict[str, list[Path]],
                 report_lines.append(f"    复制失败 {img.name}: {exc}")
                 continue
             width, height = _image_size(dest)
-            status = manager.upsert_local_photo(
-                photo_id=base_photo_id, observation_id=obs_id, content_sha=sha,
-                original_name=img.name,
-                dest_relative=str(Path("photos") / filename),
-                file_size=dest.stat().st_size,
-                width=width, height=height, position=position)
+            try:
+                status = manager.upsert_local_photo(
+                    photo_id=base_photo_id, observation_id=obs_id, content_sha=sha,
+                    original_name=img.name,
+                    dest_relative=str(Path("photos") / filename),
+                    file_size=dest.stat().st_size,
+                    width=width, height=height, position=position,
+                    commit=False)                # 由下方检查点统一提交
+            except sqlite3.IntegrityError as exc:
+                # 非「指纹重复」的完整性错误：单张计失败并记原因，不中断整批
+                fail += 1
+                dest.unlink(missing_ok=True)
+                report_lines.append(f"    入库失败 {img.name}: {exc}")
+                continue
             if status == "inserted":
                 new += 1
             else:  # 指纹唯一约束兜底：极小概率重复
                 dup += 1
                 dest.unlink(missing_ok=True)
+            # 检查点提交：保留「中途失败/中断时已入库部分不丢」的既有语义
+            if position % IMPORT_COMMIT_EVERY == 0:
+                manager.commit_all()
         report_lines.append(
             f"    [{split}] 共 {len(split_map[split])} 张处理完毕")
 
+    manager.commit_all()                       # 扫尾提交未满一批的部分
     manager.refresh_local_observation_stats(obs_id)
     manager.record_batch_taxon(
         batch_id=batch_id, taxon_id=taxon_id,
@@ -347,7 +360,6 @@ def run_import(args: argparse.Namespace) -> int:
         taxa_requested=len(grouped), quality_grade="local",
         photo_size="dataset", max_per_taxon=0,
         output_dir=str(root))
-    seen_in_session: set[str] = set()
     report_lines: list[str] = [
         f"# 训练数据集导入报告 {datetime.now().isoformat(timespec='seconds')}",
         f"- 数据集根目录: {root}",
@@ -363,7 +375,7 @@ def run_import(args: argparse.Namespace) -> int:
             print(f"[{index}/{len(grouped)}] {class_name} ({count} 张)")
             new, dup, fail = import_one_class(
                 class_name, grouped[class_name], manifest, manager,
-                batch_id, out_dir, seen_in_session, report_lines, args.workers)
+                batch_id, out_dir, report_lines, args.workers)
             total_new += new
             total_dup += dup
             total_fail += fail

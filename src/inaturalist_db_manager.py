@@ -104,6 +104,18 @@ def _to_bool_int(value: Any) -> int | None:
     return None
 
 
+def _is_fingerprint_conflict(exc: sqlite3.IntegrityError) -> bool:
+    """判断完整性错误是否为「照片内容指纹重复」。
+
+    SQLite 的 UNIQUE 冲突信息形如 `UNIQUE constraint failed: photos.fingerprint`；
+    外键冲突为 `FOREIGN KEY constraint failed`；主键/其它唯一列为对应列名。
+    只有指纹列冲突才等同于业务上的「同一张图重复导入」。
+    """
+    message = str(exc)
+    return ("UNIQUE constraint failed" in message
+            and "photos.fingerprint" in message)
+
+
 class INaturalistDatabaseManager:
     """iNaturalist 两层数据库管理器。"""
 
@@ -954,10 +966,22 @@ class INaturalistDatabaseManager:
         width: int | None = None,
         height: int | None = None,
         position: int = 0,
+        commit: bool = True,
     ) -> str:
         """登记本地导入照片，以文件内容 SHA-256 为指纹。
 
         返回 "inserted"（新入库）或 "duplicate"（内容指纹已存在）。
+
+        commit=False 时不提交，由调用方按检查点统一提交（commit_all）。
+        批量导入据此把「每张图一次 fsync」降为「每 N 张一次 fsync」，
+        同时保留「中途失败时已提交的部分不回滚」的既有语义。
+
+        异常语义（2026-11-17 修正）：
+            原实现把**任何** IntegrityError 都当作「指纹重复」返回 duplicate，
+            其中也包括外键失败（观察记录不存在）与 photo_id 冲突。后果是照片
+            没进库、调用方却按「重复跳过」计入正常，数据静默丢失。
+            现仅把 photos.fingerprint 的 UNIQUE 冲突视为重复；其余完整性错误
+            原样抛出，由调用方按「单张失败」记录并在报告中显示原因。
         """
         conn = self._get_main_conn()
         now = datetime.now().isoformat(timespec="seconds")
@@ -974,9 +998,13 @@ class INaturalistDatabaseManager:
                  width, height, file_size, f"local://{original_name}",
                  dest_relative, content_sha, now, now),
             )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            return "duplicate"
+            if commit:
+                conn.commit()
+        except sqlite3.IntegrityError as exc:
+            if _is_fingerprint_conflict(exc):
+                return "duplicate"           # 真正的内容重复：按既有语义跳过
+            # 外键失败 / photo_id 冲突等：不能当成「重复」，交给调用方处理
+            raise
         # 原始层同步留存
         local_photo = {
             "photo_id": photo_id,
@@ -992,8 +1020,21 @@ class INaturalistDatabaseManager:
             "local_path": dest_relative,
             "download_ok": 1,
         }
-        self.insert_raw_photo(local_photo, {"source": "local_import"}, now)
+        self.insert_raw_photo(local_photo, {"source": "local_import"}, now,
+                              commit=commit)
         return "inserted"
+
+    def commit_all(self) -> None:
+        """提交主库与原始库的挂起事务（批量导入的检查点提交）。
+
+        与 upsert_local_photo(commit=False) 配套：调用方按固定张数调用本方法，
+        使「每张图一次 fsync」变成「每 N 张一次」，同时保证中途失败时
+        已经过检查点的数据不会丢失（符合「保留已入库部分」的语义）。
+        """
+        if self._main_conn is not None:
+            self._main_conn.commit()
+        if self._raw_conn is not None:
+            self._raw_conn.commit()
 
     def refresh_local_observation_stats(self, observation_id: int) -> None:
         """按 photos 表刷新本地观察的 photo_count 与 local_photo_files。"""

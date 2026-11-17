@@ -53,6 +53,7 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
 import sys
 import time
 import urllib.parse
@@ -75,6 +76,11 @@ IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TEXT_SUFFIXES = {".txt"}
 # 常驻监视模式中文件夹处理完成后的标记文件名
 IMPORT_MARKER = "_已导入_指纹编码完成.txt"
+# 图片入库的检查点提交间隔（每 N 张提交一次）。
+# 逐张提交在万级图库下约 7.7ms/张的 fsync 开销；整批一次提交又会丢掉
+# 「中途失败保留已入库部分」的能力。50 是两者的折中：失败最多重做 49 张，
+# 且重跑按内容指纹自动跳过，不会重复入库。
+IMPORT_COMMIT_EVERY = 50
 
 # 数据集常见分割/功能目录名黑名单：这类名字不是物种名，禁止参与类群解析，
 # 避免「train」「test」等被 iNaturalist 接口模糊匹配到无关类群
@@ -416,7 +422,6 @@ def _image_size(path: Path) -> tuple[int | None, int | None]:
 
 def _import_images_for_kind(kind_name: str, images: list[Path],
                             manager, batch_id: int, out_dir: Path,
-                            seen_in_session: set[str],
                             report_lines: list[str],
                             rel_path: str = "",
                             texts: str = "",
@@ -533,12 +538,22 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
             report_lines.append(f"    [{position}] {img.name} → 复制失败: {exc}")
             continue
         width, height = _image_size(dest)
-        status = manager.upsert_local_photo(
-            photo_id=photo_id, observation_id=obs_id, content_sha=sha,
-            original_name=img.name,
-            dest_relative=str(Path("photos") / filename),
-            file_size=dest.stat().st_size,
-            width=width, height=height, position=position)
+        try:
+            status = manager.upsert_local_photo(
+                photo_id=photo_id, observation_id=obs_id, content_sha=sha,
+                original_name=img.name,
+                dest_relative=str(Path("photos") / filename),
+                file_size=dest.stat().st_size,
+                width=width, height=height, position=position,
+                commit=False)                # 由下方检查点统一提交
+        except sqlite3.IntegrityError as exc:
+            # 非「指纹重复」的完整性错误（外键失败 / photo_id 冲突）：
+            # 单张记为失败并在报告中给出原因，不中断整批导入
+            fail += 1
+            dest.unlink(missing_ok=True)
+            report_lines.append(
+                f"    [{position}] {img.name} → 入库失败: {exc}")
+            continue
         if status == "inserted":
             new += 1
             report_lines.append(
@@ -549,7 +564,10 @@ def _import_images_for_kind(kind_name: str, images: list[Path],
             dest.unlink(missing_ok=True)
             report_lines.append(
                 f"    [{position}] {img.name} → 指纹重复，跳过")
+        if position % IMPORT_COMMIT_EVERY == 0:
+            manager.commit_all()             # 检查点：已入库部分落盘
 
+    manager.commit_all()                     # 扫尾提交未满一批的部分
     manager.refresh_local_observation_stats(obs_id)
     manager.record_batch_taxon(
         batch_id=batch_id, taxon_id=taxon_id,
@@ -609,7 +627,6 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
     # 物种名在拖入根之外，作为回退解析的最后一级候选
     root_ancestors = _dragged_root_ancestors(path)
     try:
-        seen: set[str] = set()
         total_new = total_dup = total_fail = total_skip = 0
         # 全局照片总数：进度条的照片级分母（所有种类图片数之和）
         total_photos = sum(len(imgs) for _, imgs, _, _ in kinds)
@@ -619,7 +636,7 @@ def process_drop_folder(path: Path, out_dir: Path, db_dir: Path,
             print(f"[进度] 种类 {k}/{len(kinds)}「{kind_name}」", flush=True)
             report_lines.append(f"[{k}/{len(kinds)}] 种类「{kind_name}」共 {len(images)} 张")
             new, dup, fail, skip = _import_images_for_kind(
-                kind_name, images, manager, batch_id, out_dir, seen, report_lines,
+                kind_name, images, manager, batch_id, out_dir, report_lines,
                 rel_path=rel_path, texts=texts,
                 progress_base=photo_base, progress_total=total_photos,
                 root_ancestors=root_ancestors)
@@ -687,7 +704,6 @@ def process_drop_images(paths: list[Path], out_dir: Path, db_dir: Path,
         quality_grade="local_import", photo_size="original",
         output_dir=str(out_dir))
     try:
-        seen: set[str] = set()
         total_new = total_dup = total_fail = total_skip = 0
         # 全局照片总数：进度条的照片级分母（所有种类图片数之和）
         total_photos = sum(len(imgs) for _, imgs, _, _ in kinds)
@@ -697,7 +713,7 @@ def process_drop_images(paths: list[Path], out_dir: Path, db_dir: Path,
             print(f"[进度] 种类 {k}/{len(kinds)}「{kind_name}」", flush=True)
             report_lines.append(f"[{k}/{len(kinds)}] 种类「{kind_name}」共 {len(images)} 张")
             new, dup, fail, skip = _import_images_for_kind(
-                kind_name, images, manager, batch_id, out_dir, seen, report_lines,
+                kind_name, images, manager, batch_id, out_dir, report_lines,
                 rel_path=rel_path, texts=texts,
                 progress_base=photo_base, progress_total=total_photos)
             photo_base += len(images)

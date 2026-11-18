@@ -1,11 +1,19 @@
 # bird-app 鸟类
 
 iNaturalist 鸟类数据采集、训练与视觉分析桌面应用（Python / Tkinter）。
-> **小白快速上手**：无需 Git——前往 [Releases 页面](https://github.com/asdfg123345/bird-app/releases/latest)
-> 下载 `鸟类_v1.7.0_源码.zip`，解压后按包内《下载后先看我.txt》三步即可运行
-> （装 Python → 解压 → 命令行运行 `python main.py gui`）。
+> **安装包（推荐，v1.7.1）**：[`release/鸟类_v1.7.1/安装输出/鸟类_安装包_v1.7.1.exe`](release/鸟类_v1.7.1/安装输出/鸟类_安装包_v1.7.1.exe)
+> （19.4 MB，自带 Python 3.11 运行时，目标机**无需安装 Python**；双击安装即用，
+> 默认装到 `%LOCALAPPDATA%\Programs\鸟类`，安装/运行都不需要管理员权限）。
+> **首次运行若出现「Windows 已保护你的电脑 / 发布者未知」**：这是未签名安装包的
+> SmartScreen 信誉提示，点「仍要运行」即可；根治办法见
+> [代码签名与 SmartScreen 说明](docs/安装包_代码签名与SmartScreen说明.md)。
+>
+> **源码运行（无需安装包）**：下载 [Releases 页面](https://github.com/asdfg123345/bird-app/releases/latest)
+> 的源码包，解压后装 Python 3.10+ → 解压 → 命令行运行 `python main.py gui`。
 >
 > **完整操作手册**：[docs/操作手册_鸟类_v1.7.0_20261018_001.md](docs/操作手册_鸟类_v1.7.0_20261018_001.md)
+>
+> **安装包构建记录**：[docs/系统日志_安装包构建_鸟类_v1.7.1_20261118_001.md](docs/系统日志_安装包构建_鸟类_v1.7.1_20261118_001.md)
 
 ## 功能一览
 
@@ -17,8 +25,10 @@ iNaturalist 鸟类数据采集、训练与视觉分析桌面应用（Python / Tk
 
 ## 环境要求
 
-- Windows 10/11 + Python 3.10 及以上（安装时勾选 Add python.exe to PATH）
-- 模型训练需要含 PyTorch 的 Python 解释器（程序会自动探测本机常见位置，也可在训练页手动指定）
+- **安装包**：Windows 10/11（64 位），无需安装 Python 或任何第三方依赖。
+- **源码运行**：Windows 10/11 + Python 3.10 及以上（安装时勾选 Add python.exe to PATH）。
+- 模型训练/视觉分析需要另有一个含 PyTorch 的 Python 解释器（程序会自动探测本机常见位置，
+  也可在训练页手动指定）；下载、拖入导入、数据库、数据面板等主功能不依赖它。
 
 ## 使用说明
 
@@ -79,10 +89,31 @@ python -m venv .venv-train
 
 安装后在「模型训练」页把训练解释器指向 `.venv-train\Scripts\python.exe` 即可。
 
-### 打包发布（可选）
+### 打包发布（可复现）
 
-`packaging/` 目录提供完整打包链路：`准备打包源码*.py`（源码指纹水印注入）→
-`构建脚本*.ps1`（PyInstaller 构建）→ `鸟类.spec` → `封装脚本*.iss`（Inno Setup 安装包）。
+`packaging/` 目录提供一条可复现的发布链路（PyInstaller 冻结 + Inno Setup 安装包）：
+
+- `build_installer.py`：准备打包源码（冻结适配 + 源码指纹水印 + PE 版本资源 + Inno 脚本）
+  → PyInstaller onedir 冻结 → 部署源码形态组件（训练脚本/视觉系统/部位训练/启动 bat）
+  → 预置空库 → Inno Setup 编译 → 冒烟测试；
+- `verify_installer.py`：`smoke`（发布程序冒烟）、`installer`（静默安装→功能→卸载全链路）、
+  `payload`（受限环境下的安装载荷验证）三种模式。
+
+```powershell
+python packaging/build_installer.py                       # 完整构建 + 验证
+python packaging/build_installer.py --skip-build --skip-smoke  # 复用已有发布程序，只重编安装包
+python packaging/verify_installer.py installer "release/鸟类_v1.7.1/安装输出/鸟类_安装包_v1.7.1.exe"
+```
+
+带代码签名构建（需代码签名证书，消除 SmartScreen 提示）：
+
+```powershell
+python packaging/sign_release.py --list-certs             # 查看证书库
+python packaging/build_installer.py --sign-thumbprint <证书指纹>
+```
+
+产物：`release/鸟类_v1.7.1/安装输出/鸟类_安装包_v1.7.1.exe`；发布单元可直接运行：
+`release/鸟类_v1.7.1/发布程序/鸟类/鸟类.exe`。
 
 ## 目录结构
 
@@ -99,7 +130,8 @@ python -m venv .venv-train
 
 本项目按历代发布版本重建了完整 git 历史：从 2026-09-05 早期开发日志，到 v0.1.0
 （PyInstaller 爬虫初版）、v1.0.0（首个安装包）、v1.3.0（应用更名「鸟类」）、v1.7.0
-（混合加密发布版），运行 `git tag` 查看全部版本。
+（含部位模型训练）、v1.7.1（当前代码的最新安装包，含 v1.7.0 之后的性能与正确性修复），
+运行 `git tag` 查看全部版本。
 
 ## 许可
 

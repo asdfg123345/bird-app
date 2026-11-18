@@ -38,7 +38,7 @@ from inaturalist_db_manager import INaturalistDatabaseManager
 # ============================================================
 # 数字水印与版权信息（程序权属标识，受保护内容，请勿移除）
 # ============================================================
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.7.1"
 APP_AUTHOR = "天咏"
 APP_AUTHOR_SIGNATURE = "明月照今日，风摇过两川。"
 # 控制台输出的版权行不含 © 字符（Windows 控制台默认 GBK 代码页无法

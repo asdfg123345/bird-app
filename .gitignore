@@ -4,6 +4,8 @@ data/
 安装输出/
 发布程序/
 build_tmp/
+release/
+_tmp/
 程序_混合加密/
 *.exe
 *.db
